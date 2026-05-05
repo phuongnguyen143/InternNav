@@ -39,8 +39,8 @@ def eval_dual():
     depth = depth.astype(np.float32) / 10000.0
     print(f"read http data cost {time.time() - start_time}")
 
-    camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "Turn around and walk out of this office. Turn towards your slight right at the chair. Move forward to the walkway and go near the red bin. You can see an open door on your right side, go inside the open door. Stop at the computer monitor"
+    camera_pose = np.eye(4, dtype=np.float32)
+    instruction = args.instruction
     policy_init = data['reset']
     if policy_init:
         start_time = time.time()
@@ -89,6 +89,15 @@ if __name__ == '__main__':
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--plan_step_gap", type=int, default=4)
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default=(
+            "Turn around and walk out of this office. Turn towards your slight right at the chair. "
+            "Move forward to the walkway and go near the red bin. You can see an open door on your "
+            "right side, go inside the open door. Stop at the computer monitor"
+        ),
+    )
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
