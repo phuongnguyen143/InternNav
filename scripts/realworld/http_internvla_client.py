@@ -10,8 +10,8 @@ from enum import Enum
 import numpy as np
 import rclpy
 import requests
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry, Path as PathMsg
 from PIL import Image as PIL_Image
 from sensor_msgs.msg import Image
 
@@ -68,6 +68,27 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
     print(f"idx: {http_idx} after http {time.time() - start}")
 
     return json.loads(response.text)
+
+
+def response_trajectory_to_path_msg(trajectory, stamp, frame_id='base_link'):
+    path_msg = PathMsg()
+    path_msg.header.stamp = stamp
+    path_msg.header.frame_id = frame_id
+
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[1] < 2:
+        return path_msg
+
+    for point in trajectory:
+        pose_msg = PoseStamped()
+        pose_msg.header = path_msg.header
+        pose_msg.pose.position.x = float(point[0])
+        pose_msg.pose.position.y = float(point[1])
+        pose_msg.pose.position.z = 0.0
+        pose_msg.pose.orientation.w = 1.0
+        path_msg.poses.append(pose_msg)
+
+    return path_msg
 
 
 def control_thread():
@@ -150,6 +171,7 @@ def planning_thread():
             traj_len = 0.0
             if 'trajectory' in response:
                 trajectory = response['trajectory']
+                manager.publish_response_trajectory_path(trajectory)
                 trajs_in_world = []
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
@@ -211,6 +233,7 @@ class Go2Manager(Node):
 
         # publisher
         self.control_pub = self.create_publisher(Twist, '/cmd_vel_bridge', 5)
+        self.response_trajectory_path_pub = self.create_publisher(PathMsg, '/internvla_n1/trajectory_path', 5)
 
         # class member variable
         self.cv_bridge = CvBridge()
@@ -339,6 +362,11 @@ class Go2Manager(Node):
         request.angular.z = vyaw
 
         self.control_pub.publish(request)
+
+    def publish_response_trajectory_path(self, trajectory):
+        path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='base_link')
+        if path_msg.poses:
+            self.response_trajectory_path_pub.publish(path_msg)
 
 
 if __name__ == '__main__':
