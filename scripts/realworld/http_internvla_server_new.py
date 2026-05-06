@@ -41,6 +41,7 @@ def eval_dual():
 
     camera_pose = np.eye(4, dtype=np.float32)
     instruction = args.instruction
+    print(f"Instruction is {instruction}")
     policy_init = data['reset']
     if policy_init:
         start_time = time.time()
@@ -56,22 +57,23 @@ def eval_dual():
     t0 = time.time()
     dual_sys_output = {}
 
-    dual_sys_output = agent.step(
-        image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
-    )
-    if dual_sys_output.output_action is not None and dual_sys_output.output_action == [5]:
-        look_down = True
+    with torch.inference_mode():
         dual_sys_output = agent.step(
             image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
         )
+        if dual_sys_output.output_action is not None and dual_sys_output.output_action == [5]:
+            look_down = True
+            dual_sys_output = agent.step(
+                image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
+            )
 
-    json_output = {}
-    if dual_sys_output.output_action is not None:
-        json_output['discrete_action'] = dual_sys_output.output_action
-    else:
-        json_output['trajectory'] = dual_sys_output.output_trajectory.tolist()
-        if dual_sys_output.output_pixel is not None:
-            json_output['pixel_goal'] = dual_sys_output.output_pixel
+        json_output = {}
+        if dual_sys_output.output_action is not None:
+            json_output['discrete_action'] = dual_sys_output.output_action
+        else:
+            json_output['trajectory'] = dual_sys_output.output_trajectory.tolist()
+            if dual_sys_output.output_pixel is not None:
+                json_output['pixel_goal'] = dual_sys_output.output_pixel
 
     t1 = time.time()
     generate_time = t1 - t0
@@ -93,9 +95,7 @@ if __name__ == '__main__':
         "--instruction",
         type=str,
         default=(
-            "Turn around and walk out of this office. Turn towards your slight right at the chair. "
-            "Move forward to the walkway and go near the red bin. You can see an open door on your "
-            "right side, go inside the open door. Stop at the computer monitor"
+            "move forward, pass the door, then turn left"
         ),
     )
     args = parser.parse_args()
