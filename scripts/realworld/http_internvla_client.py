@@ -232,8 +232,8 @@ class Go2Manager(Node):
         self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base", self.odom_callback, qos_profile)
 
         # publisher
-        self.control_pub = self.create_publisher(Twist, '/cmd_vel_bridge', 5)
-        self.response_trajectory_path_pub = self.create_publisher(PathMsg, '/internvla_n1/trajectory_path', 5)
+        self.control_pub = self.create_publisher(Twist, '/cmd_vel/nav', 5)
+        self.response_trajectory_path_pub = self.create_publisher(PathMsg, '/vln_path', 5)
 
         # class member variable
         self.cv_bridge = CvBridge()
