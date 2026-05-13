@@ -95,13 +95,13 @@ if __name__ == '__main__':
         "--instruction",
         type=str,
         default=(
-            "move forward, pass the door, then turn left"
+            "Navigate through the office area. Pass between the two rows of computer desks, stay in the center aisle, and stop in front of the green plant."
         ),
     )
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
-        [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        [[365.76409912109375, 0.0, 476.19769287109375, 0.0], [0.0, 365.76409912109375, 309.35333251953125, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
     )
     agent = InternVLAN1AsyncAgent(args)
 
