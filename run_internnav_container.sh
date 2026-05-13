@@ -7,8 +7,7 @@ IMAGE="${INTERNNAV_IMAGE:-internnav}"
 CONTAINER_NAME="${INTERNNAV_CONTAINER_NAME:-internnav}"
 REPO_DIR="${INTERNNAV_REPO_DIR:-${SCRIPT_DIR}}"
 CONTAINER_REPO_DIR="${INTERNNAV_CONTAINER_REPO_DIR:-/root/InternNav}"
-NETWORK_MODE="${INTERNNAV_NETWORK:-bridge}"
-JUPYTER_PORT="${INTERNNAV_JUPYTER_PORT:-8888}"
+NETWORK_MODE="${INTERNNAV_NETWORK:-host}"
 XAUTH_DOCKER="${INTERNNAV_XAUTH_DOCKER:-/tmp/.docker.xauth-internnav}"
 
 DOCKER_ARGS=(
@@ -18,21 +17,12 @@ DOCKER_ARGS=(
     --ipc host
     --name "${CONTAINER_NAME}"
     --workdir "${CONTAINER_REPO_DIR}"
+    --network ${NETWORK_MODE}
     --volume "${REPO_DIR}:${CONTAINER_REPO_DIR}"
-    --env "JUPYTER_CONFIG_DIR=${CONTAINER_REPO_DIR}/.jupyter"
-    --env "JUPYTER_PORT=${JUPYTER_PORT}"
     --env "NVIDIA_DRIVER_CAPABILITIES=all"
     --env "PYTHONPATH=${CONTAINER_REPO_DIR}:${CONTAINER_REPO_DIR}/third_party/diffusion-policy:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages"
 )
 
-if [[ "${NETWORK_MODE}" == "host" ]]; then
-    DOCKER_ARGS+=(--network host)
-else
-    DOCKER_ARGS+=(
-        --network "${NETWORK_MODE}"
-        --publish "${JUPYTER_PORT}:${JUPYTER_PORT}"
-    )
-fi
 
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
     touch "${XAUTH_DOCKER}"
