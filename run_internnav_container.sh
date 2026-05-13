@@ -21,8 +21,10 @@ DOCKER_ARGS=(
     --volume "${REPO_DIR}:${CONTAINER_REPO_DIR}"
     --env "NVIDIA_DRIVER_CAPABILITIES=all"
     --env "PYTHONPATH=${CONTAINER_REPO_DIR}:${CONTAINER_REPO_DIR}/third_party/diffusion-policy:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages"
+    -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    -v "$(pwd)/cyclonedds_config.xml:/etc/cyclonedds.xml"
+    -e CYCLONEDDS_URI=file:///etc/cyclonedds.xml 
 )
-
 
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
     touch "${XAUTH_DOCKER}"
