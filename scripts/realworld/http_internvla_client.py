@@ -12,7 +12,7 @@ import rclpy
 import requests
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path as PathMsg
-from PIL import Image as PIL_Image
+from PIL import Image as PIL_Image, ImageDraw
 from sensor_msgs.msg import Image
 
 frame_data = {}
@@ -74,32 +74,96 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
     return response_json
 
 
-def annotate_pixel_goal(image, pixel_goal, radius=6):
+def annotate_inference_image(image, pixel_goal=None, trajectory=None):
     if image is None:
-        return None
-
-    pixel_goal = np.asarray(pixel_goal, dtype=np.int32).reshape(-1)
-    if pixel_goal.size < 2:
         return None
 
     annotated = np.ascontiguousarray(np.asarray(image).copy())
     if annotated.ndim != 3 or annotated.shape[2] < 3:
         return None
+    annotated = np.ascontiguousarray(annotated[:, :, :3])
 
+    pil_image = PIL_Image.fromarray(annotated)
+    draw = ImageDraw.Draw(pil_image)
+    if trajectory is not None:
+        draw_topdown_trajectory_label(draw, pil_image.size, trajectory)
+    if pixel_goal is not None:
+        draw_pixel_goal(draw, pil_image.size, pixel_goal)
+    return np.ascontiguousarray(np.asarray(pil_image))
+
+
+def draw_pixel_goal(draw, image_size, pixel_goal, radius=6):
+    pixel_goal = np.asarray(pixel_goal, dtype=np.int32).reshape(-1)
+    if pixel_goal.size < 2:
+        return
+
+    width, height = image_size
     y, x = int(pixel_goal[0]), int(pixel_goal[1])
-    height, width = annotated.shape[:2]
     if x < 0 or x >= width or y < 0 or y >= height:
-        return annotated
+        return
 
-    yy, xx = np.ogrid[:height, :width]
-    circle = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
-    annotated[circle, :3] = [255, 0, 0]
+    draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 0, 0), outline=(255, 255, 255))
+    draw.line((x - radius * 2, y, x + radius * 2, y), fill=(255, 0, 0), width=2)
+    draw.line((x, y - radius * 2, x, y + radius * 2), fill=(255, 0, 0), width=2)
 
-    x_min, x_max = max(0, x - radius * 2), min(width, x + radius * 2 + 1)
-    y_min, y_max = max(0, y - radius * 2), min(height, y + radius * 2 + 1)
-    annotated[y, x_min:x_max, :3] = [255, 0, 0]
-    annotated[y_min:y_max, x, :3] = [255, 0, 0]
-    return annotated
+
+def draw_topdown_trajectory_label(draw, image_size, trajectory, margin=12):
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[1] < 2:
+        return
+
+    points = trajectory[:, :2]
+    points = points[np.isfinite(points).all(axis=1)]
+    if points.size == 0:
+        return
+
+    width, height = image_size
+    inset_size = min(180, max(120, min(width, height) // 3), width - margin * 2, height - margin * 2)
+    if inset_size < 80:
+        return
+
+    left, top = margin, margin
+    right, bottom = left + inset_size, top + inset_size
+    draw.rectangle((left, top, right, bottom), fill=(18, 24, 30), outline=(240, 240, 240), width=2)
+    draw.text((left + 8, top + 5), "top-down traj", fill=(240, 240, 240))
+
+    plot_left = left + 14
+    plot_top = top + 26
+    plot_right = right - 12
+    plot_bottom = bottom - 12
+    plot_width = max(1, plot_right - plot_left)
+    plot_height = max(1, plot_bottom - plot_top)
+
+    points = np.vstack((np.zeros((1, 2), dtype=np.float32), points))
+    forward = points[:, 0]
+    lateral = points[:, 1]
+    min_forward, max_forward = min(0.0, float(np.min(forward))), max(0.0, float(np.max(forward)))
+    min_lateral, max_lateral = min(0.0, float(np.min(lateral))), max(0.0, float(np.max(lateral)))
+
+    forward_span = max(max_forward - min_forward, 0.5)
+    lateral_span = max(max_lateral - min_lateral, 0.5)
+    min_forward -= forward_span * 0.1
+    max_forward += forward_span * 0.1
+    min_lateral -= lateral_span * 0.1
+    max_lateral += lateral_span * 0.1
+
+    def to_plot(point):
+        forward_m, lateral_m = float(point[0]), float(point[1])
+        x = plot_left + (max_lateral - lateral_m) / (max_lateral - min_lateral) * plot_width
+        y = plot_bottom - (forward_m - min_forward) / (max_forward - min_forward) * plot_height
+        return int(round(x)), int(round(y))
+
+    origin = to_plot((0.0, 0.0))
+    draw.line((plot_left, origin[1], plot_right, origin[1]), fill=(70, 82, 92), width=1)
+    draw.line((origin[0], plot_top, origin[0], plot_bottom), fill=(70, 82, 92), width=1)
+
+    plot_points = [to_plot(point) for point in points]
+    if len(plot_points) > 1:
+        draw.line(plot_points, fill=(0, 220, 255), width=3)
+    draw.ellipse((origin[0] - 4, origin[1] - 4, origin[0] + 4, origin[1] + 4), fill=(70, 255, 120))
+    goal = plot_points[-1]
+    draw.ellipse((goal[0] - 4, goal[1] - 4, goal[0] + 4, goal[1] + 4), fill=(255, 190, 40))
+    draw.text((plot_left, plot_top), "front", fill=(180, 190, 200))
 
 
 def response_trajectory_to_path_msg(trajectory, stamp, frame_id='base_link'):
@@ -198,8 +262,12 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
             response = dual_sys_eval(rgb_bytes, depth_bytes, None)
-            if 'pixel_goal' in response:
-                manager.publish_pixel_goal_image(infer_rgb, response['pixel_goal'])
+            if 'pixel_goal' in response or 'trajectory' in response:
+                manager.publish_annotated_image(
+                    infer_rgb,
+                    pixel_goal=response.get('pixel_goal'),
+                    trajectory=response.get('trajectory'),
+                )
 
             global current_control_mode
             traj_len = 0.0
@@ -403,8 +471,8 @@ class Go2Manager(Node):
         if path_msg.poses:
             self.response_trajectory_path_pub.publish(path_msg)
 
-    def publish_pixel_goal_image(self, image, pixel_goal):
-        annotated = annotate_pixel_goal(image, pixel_goal)
+    def publish_annotated_image(self, image, pixel_goal=None, trajectory=None):
+        annotated = annotate_inference_image(image, pixel_goal=pixel_goal, trajectory=trajectory)
         if annotated is None:
             return
 
