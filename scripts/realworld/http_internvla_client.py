@@ -50,7 +50,7 @@ mpc_rw_lock = ReadWriteLock()
 
 
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
-    global policy_init, http_idx, first_running_time
+    global policy_init, http_idx, first_running_time, last_pixel_goal
     data = {"reset": policy_init, "idx": http_idx}
     json_data = json.dumps(data)
 
@@ -67,7 +67,39 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
         first_running_time = time.time()
     print(f"idx: {http_idx} after http {time.time() - start}")
 
-    return json.loads(response.text)
+    response_json = json.loads(response.text)
+    if 'pixel_goal' in response_json:
+        last_pixel_goal = response_json['pixel_goal']
+
+    return response_json
+
+
+def annotate_pixel_goal(image, pixel_goal, radius=6):
+    if image is None:
+        return None
+
+    pixel_goal = np.asarray(pixel_goal, dtype=np.int32).reshape(-1)
+    if pixel_goal.size < 2:
+        return None
+
+    annotated = np.ascontiguousarray(np.asarray(image).copy())
+    if annotated.ndim != 3 or annotated.shape[2] < 3:
+        return None
+
+    y, x = int(pixel_goal[0]), int(pixel_goal[1])
+    height, width = annotated.shape[:2]
+    if x < 0 or x >= width or y < 0 or y >= height:
+        return annotated
+
+    yy, xx = np.ogrid[:height, :width]
+    circle = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
+    annotated[circle, :3] = [255, 0, 0]
+
+    x_min, x_max = max(0, x - radius * 2), min(width, x + radius * 2 + 1)
+    y_min, y_max = max(0, y - radius * 2), min(height, y + radius * 2 + 1)
+    annotated[y, x_min:x_max, :3] = [255, 0, 0]
+    annotated[y_min:y_max, x, :3] = [255, 0, 0]
+    return annotated
 
 
 def response_trajectory_to_path_msg(trajectory, stamp, frame_id='base_link'):
@@ -166,6 +198,8 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
             response = dual_sys_eval(rgb_bytes, depth_bytes, None)
+            if 'pixel_goal' in response:
+                manager.publish_pixel_goal_image(infer_rgb, response['pixel_goal'])
 
             global current_control_mode
             traj_len = 0.0
@@ -222,7 +256,7 @@ class Go2Manager(Node):
     def __init__(self):
         super().__init__('go2_manager')
 
-        rgb_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/left/image_rect_color")
+        rgb_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/left/image_rect_color/raw")
         depth_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/depth/depth_registered")
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
@@ -234,6 +268,7 @@ class Go2Manager(Node):
         # publisher
         self.control_pub = self.create_publisher(Twist, '/cmd_vel/nav', 5)
         self.response_trajectory_path_pub = self.create_publisher(PathMsg, '/vln_path', 5)
+        self.pixel_goal_image_pub = self.create_publisher(Image, '/internvla_n1/pixel_goal_image', 5)
 
         # class member variable
         self.cv_bridge = CvBridge()
@@ -367,6 +402,15 @@ class Go2Manager(Node):
         path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='base_link')
         if path_msg.poses:
             self.response_trajectory_path_pub.publish(path_msg)
+
+    def publish_pixel_goal_image(self, image, pixel_goal):
+        annotated = annotate_pixel_goal(image, pixel_goal)
+        if annotated is None:
+            return
+
+        image_msg = self.cv_bridge.cv2_to_imgmsg(annotated, encoding='rgb8')
+        image_msg.header.stamp = self.get_clock().now().to_msg()
+        self.pixel_goal_image_pub.publish(image_msg)
 
 
 if __name__ == '__main__':
