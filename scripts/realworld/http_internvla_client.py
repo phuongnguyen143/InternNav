@@ -262,7 +262,7 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
             response = dual_sys_eval(rgb_bytes, depth_bytes, None)
-            if 'pixel_goal' in response:
+            if manager.debug_publish_visualization and 'pixel_goal' in response:
                 manager.publish_annotated_image(
                     infer_rgb,
                     pixel_goal=last_pixel_goal,
@@ -273,7 +273,8 @@ def planning_thread():
             traj_len = 0.0
             if 'trajectory' in response:
                 trajectory = response['trajectory']
-                manager.publish_response_trajectory_path(trajectory)
+                if manager.debug_publish_visualization:
+                    manager.publish_response_trajectory_path(trajectory)
                 trajs_in_world = []
                 odom = odom_infer
                 traj_len = np.linalg.norm(trajectory[-1][:2])
@@ -323,6 +324,7 @@ def planning_thread():
 class Go2Manager(Node):
     def __init__(self):
         super().__init__('go2_manager')
+        self.debug_publish_visualization = bool(self.declare_parameter('debug_publish_visualization', True).value)
 
         rgb_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/left/image_rect_color/raw")
         depth_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/depth/depth_registered")
