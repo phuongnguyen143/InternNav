@@ -262,10 +262,10 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
             response = dual_sys_eval(rgb_bytes, depth_bytes, None)
-            if 'pixel_goal' in response or 'trajectory' in response:
+            if 'pixel_goal' in response:
                 manager.publish_annotated_image(
                     infer_rgb,
-                    pixel_goal=response.get('pixel_goal'),
+                    pixel_goal=last_pixel_goal,
                     trajectory=response.get('trajectory'),
                 )
 
