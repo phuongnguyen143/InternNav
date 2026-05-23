@@ -166,7 +166,7 @@ def draw_topdown_trajectory_label(draw, image_size, trajectory, margin=12):
     draw.text((plot_left, plot_top), "front", fill=(180, 190, 200))
 
 
-def response_trajectory_to_path_msg(trajectory, stamp, frame_id='base_link'):
+def response_trajectory_to_path_msg(trajectory, stamp, frame_id='egocentric_frame'):
     path_msg = PathMsg()
     path_msg.header.stamp = stamp
     path_msg.header.frame_id = frame_id
@@ -469,7 +469,7 @@ class Go2Manager(Node):
         self.control_pub.publish(request)
 
     def publish_response_trajectory_path(self, trajectory):
-        path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='base_link')
+        path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='egocentric_frame')
         if path_msg.poses:
             self.response_trajectory_path_pub.publish(path_msg)
 
