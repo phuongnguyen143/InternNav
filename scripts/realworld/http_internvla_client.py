@@ -48,6 +48,8 @@ rgb_depth_rw_lock = ReadWriteLock()
 odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
 
+offset_x = 0.3
+offset_y = 0.3
 
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
     global policy_init, http_idx, first_running_time, last_pixel_goal
@@ -292,7 +294,7 @@ def planning_thread():
                             [0.0, 0.0, 0.0, 1.0],
                         ]
                     )
-                    w_P = (w_T_b @ (np.array([traj[0], traj[1], 0.0, 1.0])).T)[:2]
+                    w_P = (w_T_b @ (np.array([traj[0] + offset_x, traj[1] + offset_y, 0.0, 1.0])).T)[:2]
                     trajs_in_world.append(w_P)
                 trajs_in_world = np.array(trajs_in_world)
                 print(f"{time.time()} update traj")
