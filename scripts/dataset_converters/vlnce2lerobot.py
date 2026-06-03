@@ -15,17 +15,21 @@ import torch
 import torchvision
 import tqdm
 from datasets import concatenate_datasets
-from lerobot.common.datasets.compute_stats import (
+import sys
+sys.path.insert(0, "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot/src")
+
+# now all imports work as normal
+from lerobot.datasets.compute_stats import (
     aggregate_stats,
     auto_downsample_height_width,
     get_feature_stats,
     sample_indices,
 )
-from lerobot.common.datasets.lerobot_dataset import (
+from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
-from lerobot.common.datasets.utils import (
+from lerobot.datasets.utils import (
     check_timestamps_sync,
     embed_images,
     get_episode_data_index,
@@ -36,7 +40,7 @@ from lerobot.common.datasets.utils import (
     write_episode_stats,
     write_info,
 )
-from lerobot.common.datasets.video_utils import get_safe_default_codec
+from lerobot.datasets.video_utils import get_safe_default_codec
 from loguru import logger
 
 LEROBOT_HOME = Path(os.environ.get("LEROBOT_HOME", "/shared/smartbot_new/liuyu/"))

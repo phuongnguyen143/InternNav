@@ -85,11 +85,14 @@ huggingface-cli download Qwen/Qwen2-72B-Instruct-AWQ \
 Launch the ROS2 node while the robot is navigating:
 
 ```bash
-ros2 run instruction_generator keyframe_extractor \
-    --ros-args \
-    -p rgb_topic:=/camera/camera/color/image_raw/compressed \
-    -p odom_topic:=/odom_txt/xy_yaw \
-    -p output_dir:=./keyframe_output
+ros2 bag play bkhn_round2 --rate 3
+python depth_republish.py
+ros2 run image_transport republish compressed raw \
+  --ros-args \
+  --remap in/compressed:=/camera/camera/color/image_raw/compressed \
+  --remap out:=/camera/camera/color/image_raw/raw
+python odometry_publisher.py /home/lenguyen1/hoangpqn/GaussTrace/dataset/raw/scenes/BKHN_data/bkhn_round1/odometry_bkhn_round2_point2plane.txt
+python extract_keyframe.py
 ```
 
 Press `Ctrl+C` to stop recording. The node will automatically run `finalize()` to extract keyframes and build episodes.

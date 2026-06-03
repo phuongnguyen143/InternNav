@@ -4,57 +4,32 @@ import torch
 
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import BitsAndBytesConfig
-# ============================================================
-# CONFIG
-# ============================================================
+from prompt.summarize_prompt_v1 import SUMMARIZE_PROMPT
 
 QWEN_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/Qwen2-72B-Instruct-AWQ"
 
-SUMMARIZE_PROMPT_TEMPLATE = """You are a navigation instruction summarizer.
-
-Below are sequential navigation instructions describing parts of a single trajectory:
-{instructions}
-
-Summarize all of them into ONE fluent, long-horizon navigation instruction.
-- Cover the full path from start to end
-- Mention key landmarks and turns in order
-- Natural language, one sentence or two at most
-- No bullet points, no numbering
-
-Output only the final instruction, nothing else.
-"""
-
-# ============================================================
-# QWEN MODEL
-# ============================================================
 
 class QwenLocal:
-
     def __init__(self, model_path: str = QWEN_MODEL_PATH):
-        print(f"[Qwen] Loading from: {model_path}")
-
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
+            local_files_only=True,
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            # quantization_config=BitsAndBytesConfig(
-            #     load_in_4bit=True,
-            #     bnb_4bit_compute_dtype=torch.float16,
-            # ),
-            device_map="cuda:0",
+            torch_dtype=torch.float16,
+            device_map="auto",
             trust_remote_code=True,
             local_files_only=True,
         )
         self.model.eval()
-        print("[Qwen] Loaded.")
+        print("Model loaded")
 
     @torch.inference_mode()
     def summarize(self, instructions: list[str]) -> str:
         numbered = "\n".join(f"{i+1}. {x}" for i, x in enumerate(instructions))
-        prompt = SUMMARIZE_PROMPT_TEMPLATE.format(instructions=numbered)
+        prompt = SUMMARIZE_PROMPT.format(instructions=numbered)
 
         messages = [{"role": "user", "content": prompt}]
         text = self.tokenizer.apply_chat_template(
@@ -62,74 +37,103 @@ class QwenLocal:
             tokenize=False,
             add_generation_prompt=True,
         )
-
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
-
         output_ids = self.model.generate(
             **inputs,
             max_new_tokens=128,
             do_sample=False,
             pad_token_id=self.tokenizer.eos_token_id,
         )
-
         input_len = inputs["input_ids"].shape[1]
-        return self.tokenizer.decode(
-            output_ids[0][input_len:], skip_special_tokens=True
-        ).strip()
+        return self.tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
 
-# ============================================================
-# MAIN
-# ============================================================
+
+def process_txt(txt_path: Path, qwen: QwenLocal):
+    """Summarize a single instructions.txt and save summary.txt next to it."""
+    instructions = [line.strip() for line in txt_path.read_text().splitlines() if line.strip()]
+
+    if not instructions:
+        print(f"  [SKIP] No instructions found in {txt_path}")
+        return
+
+    print(f"  Loaded {len(instructions)} instructions")
+    for i, inst in enumerate(instructions):
+        print(f"    {i+1}. {inst}")
+
+    summary = qwen.summarize(instructions)
+
+    print(f"  Summary: {summary}")
+
+    save_path = txt_path.parent / "summary.txt"
+    save_path.write_text(summary)
+    print(f"  Saved: {save_path}")
+
 
 if __name__ == "__main__":
 
     if len(sys.argv) < 2:
-        print("Usage: python summarize_instructions.py <path/to/instructions_raw.txt>")
-        print("       python summarize_instructions.py <path/to/episode_folder/>")
+        print("Usage:")
+        print("  # single txt file")
+        print("  python summarize_instructions.py /path/to/instructions.txt")
+        print("  # single episode folder")
+        print("  python summarize_instructions.py /path/to/episode_0001/")
+        print("  # folder containing many episode_ subdirs")
+        print("  python summarize_instructions.py /path/to/episodes/")
         sys.exit(1)
 
     input_path = Path(sys.argv[1])
-
-    # Accept either a .txt file or an episode folder
-    if input_path.is_dir():
-        txt_path = input_path / "instructions_raw.txt"
-    else:
-        txt_path = input_path
-
-    if not txt_path.exists():
-        print(f"Error: file not found: {txt_path}")
+    if not input_path.exists():
+        print(f"Error: path not found: {input_path}")
         sys.exit(1)
 
-    # Read instructions (one per line, skip blank lines)
-    instructions = [
-        line.strip()
-        for line in txt_path.read_text().splitlines()
-        if line.strip()
-    ]
+    # collect all txt files to process
+    txt_files = []
 
-    if not instructions:
-        print("Error: no instructions found in file.")
+    if input_path.is_file():
+        # direct txt file
+        txt_files.append(input_path)
+
+    elif input_path.is_dir():
+        # check if it contains episode_ subdirs
+        episode_dirs = sorted([
+            x for x in input_path.iterdir()
+            if x.is_dir() and x.name.startswith("episode_")
+        ])
+
+        if episode_dirs:
+            # folder of many episodes
+            for ep in episode_dirs:
+                txt = ep / "instructions.txt"
+                if txt.exists():
+                    txt_files.append(txt)
+                else:
+                    print(f"  [WARN] No instructions.txt in {ep.name}, skipping.")
+        else:
+            # treat as a single episode folder
+            txt = input_path / "instructions.txt"
+            if txt.exists():
+                txt_files.append(txt)
+            else:
+                print(f"Error: no instructions.txt found in {input_path}")
+                sys.exit(1)
+
+    if not txt_files:
+        print("Error: no instructions.txt files found.")
         sys.exit(1)
 
-    print(f"Loaded {len(instructions)} instructions from: {txt_path}")
-    for i, inst in enumerate(instructions):
-        print(f"  {i+1}. {inst}")
+    print(f"Found {len(txt_files)} instruction file(s) to summarize")
 
-    # Summarize
+    # load model once, run all episodes
     qwen = QwenLocal()
-    summary = qwen.summarize(instructions)
 
-    print(f"\n{'='*60}")
-    print("Summary:")
-    print(f"  {summary}")
-    print('='*60)
+    for txt_path in txt_files:
+        print(f"\n{'='*60}")
+        print(f"Episode: {txt_path.parent.name}")
+        try:
+            process_txt(txt_path, qwen)
+        except Exception as e:
+            print(f"  FAILED: {e}")
 
-    # Save next to the input file
-    save_path = txt_path.parent / "instructions.txt"
-    save_path.write_text(summary)
-    print(f"\nSaved: {save_path}")
-
-    # Cleanup
     del qwen
     torch.cuda.empty_cache()
     gc.collect()

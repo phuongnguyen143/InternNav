@@ -252,7 +252,7 @@ def planning_thread():
         # odom_time = manager.odom_timestamp
         odom_rw_lock.release_read()
 
-        if odom_infer is not None and rgb_bytes is not None and depth_bytes is not None:
+        if rgb_bytes is not None and depth_bytes is not None:
             global frame_data
             frame_data[http_idx] = {
                 'infer_rgb': copy.deepcopy(infer_rgb),
@@ -271,47 +271,47 @@ def planning_thread():
 
             global current_control_mode
             traj_len = 0.0
-            if 'trajectory' in response:
-                trajectory = response['trajectory']
-                if manager.debug_publish_visualization:
-                    manager.publish_response_trajectory_path(trajectory)
-                trajs_in_world = []
-                odom = odom_infer
-                traj_len = np.linalg.norm(trajectory[-1][:2])
-                print(f"traj len {traj_len}")
-                for i, traj in enumerate(trajectory):
-                    if i < 3:
-                        continue
-                    x_, y_, yaw_ = odom[0], odom[1], odom[2]
+            # if 'trajectory' in response:
+            #     trajectory = response['trajectory']
+            #     if manager.debug_publish_visualization:
+            #         manager.publish_response_trajectory_path(trajectory)
+            #     trajs_in_world = []
+            #     odom = odom_infer
+            #     traj_len = np.linalg.norm(trajectory[-1][:2])
+            #     print(f"traj len {traj_len}")
+            #     for i, traj in enumerate(trajectory):
+            #         if i < 3:
+            #             continue
+            #         x_, y_, yaw_ = odom[0], odom[1], odom[2]
 
-                    w_T_b = np.array(
-                        [
-                            [np.cos(yaw_), -np.sin(yaw_), 0, x_],
-                            [np.sin(yaw_), np.cos(yaw_), 0, y_],
-                            [0.0, 0.0, 1.0, 0],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ]
-                    )
-                    w_P = (w_T_b @ (np.array([traj[0], traj[1], 0.0, 1.0])).T)[:2]
-                    trajs_in_world.append(w_P)
-                trajs_in_world = np.array(trajs_in_world)
-                print(f"{time.time()} update traj")
+            #         w_T_b = np.array(
+            #             [
+            #                 [np.cos(yaw_), -np.sin(yaw_), 0, x_],
+            #                 [np.sin(yaw_), np.cos(yaw_), 0, y_],
+            #                 [0.0, 0.0, 1.0, 0],
+            #                 [0.0, 0.0, 0.0, 1.0],
+            #             ]
+            #         )
+            #         w_P = (w_T_b @ (np.array([traj[0], traj[1], 0.0, 1.0])).T)[:2]
+            #         trajs_in_world.append(w_P)
+            #     trajs_in_world = np.array(trajs_in_world)
+            #     print(f"{time.time()} update traj")
 
-                manager.last_trajs_in_world = trajs_in_world
-                mpc_rw_lock.acquire_write()
-                global mpc
-                if mpc is None:
-                    mpc = Mpc_controller(np.array(trajs_in_world))
-                else:
-                    mpc.update_ref_traj(np.array(trajs_in_world))
-                manager.request_cnt += 1
-                mpc_rw_lock.release_write()
-                current_control_mode = ControlMode.MPC_Mode
-            elif 'discrete_action' in response:
-                actions = response['discrete_action']
-                if actions != [5] and actions != [9]:
-                    manager.incremental_change_goal(actions)
-                    current_control_mode = ControlMode.PID_Mode
+            #     manager.last_trajs_in_world = trajs_in_world
+            #     mpc_rw_lock.acquire_write()
+            #     global mpc
+            #     if mpc is None:
+            #         mpc = Mpc_controller(np.array(trajs_in_world))
+            #     else:
+            #         mpc.update_ref_traj(np.array(trajs_in_world))
+            #     manager.request_cnt += 1
+            #     mpc_rw_lock.release_write()
+            #     current_control_mode = ControlMode.MPC_Mode
+            # elif 'discrete_action' in response:
+            #     actions = response['discrete_action']
+            #     if actions != [5] and actions != [9]:
+            #         manager.incremental_change_goal(actions)
+            #         current_control_mode = ControlMode.PID_Mode
         else:
             print(
                 f"skip planning. odom_infer: {odom_infer is not None} rgb_bytes: {rgb_bytes is not None} depth_bytes: {depth_bytes is not None}"
@@ -326,14 +326,14 @@ class Go2Manager(Node):
         super().__init__('go2_manager')
         self.debug_publish_visualization = bool(self.declare_parameter('debug_publish_visualization', True).value)
 
-        rgb_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/left/image_rect_color/raw")
-        depth_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/depth/depth_registered")
+        rgb_down_sub = Subscriber(self, Image, "/camera/camera/color/image_raw/raw")
+        depth_down_sub = Subscriber(self, Image, "/camera/camera/aligned_depth_to_color/image_raw/raw_depth")
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
-        self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base_filtered", self.odom_callback, qos_profile)
+        # self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base_filtered", self.odom_callback, qos_profile)
 
         # publisher
         self.control_pub = self.create_publisher(Twist, '/cmd_vel/nav', 5)

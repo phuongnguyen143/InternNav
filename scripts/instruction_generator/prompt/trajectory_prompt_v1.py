@@ -3,7 +3,7 @@ TRAJECTORY_PROMPT_BEFORE = "Assume you are a robot designed for navigation. You 
 TRAJECTORY_PROMPT_AFTER = """Based on this image sequence, please describe the navigation trajectory of the robot.
 
 ** Important instructions **:
-- The instruction should be a single, fluent paragraph describing the trajectory from start to end.
+- The instruction is ONE sentence or two at most, but should cover the full path from start to end.
 - Mention key landmarks, turns, and actions in order.
 - Do NOT use bullet points or numbering.
 

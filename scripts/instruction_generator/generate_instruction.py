@@ -19,9 +19,7 @@ BASEPATH = os.path.dirname(os.path.abspath(__file__))
 print(BASEPATH)
 
 MAX_NEW_TOKENS = 96
-TEMPERATURE = 0.0
-SUBCLIPS_PER_INSTRUCTION = 2
-FRAMES_PER_SUBCLIP = 4
+WINDOW_SIZE = 8  # how many frames per chunk
 
 ROOT_DIR = Path("/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes")
 
@@ -40,7 +38,7 @@ class LlavaOnevisionLocal:
             torch_dtype=torch.float16,
             device_map="cuda:0",
             local_files_only=True,
-            attn_implementation="flash_attention_2"
+            attn_implementation="flash_attention_2",
         )
         self.model.eval()
 
@@ -72,17 +70,11 @@ class LlavaOnevisionLocal:
         )
 
         input_len = inputs["input_ids"].shape[1]
-        response = self.processor.batch_decode(output_ids[:, input_len:], skip_special_tokens=True)[0].strip()
+        response = self.processor.batch_decode(
+            output_ids[:, input_len:], skip_special_tokens=True
+        )[0].strip()
 
         return response
-
-
-def sample_frames(frame_paths, max_frames):
-    if len(frame_paths) <= max_frames:
-        return frame_paths
-    indices = torch.linspace(0, len(frame_paths) - 1, steps=max_frames).long()
-
-    return [frame_paths[i] for i in indices]
 
 
 def load_images(image_paths):
@@ -97,120 +89,110 @@ def load_images(image_paths):
     return images
 
 
-def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal):
-
+def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int = WINDOW_SIZE):
     print(f"\n{'='*80}")
     print(f"EPISODE: {episode_dir.name}")
 
-    subclip_dirs = sorted([x for x in episode_dir.iterdir() if x.is_dir() and x.name.startswith("subclip_")])
+    frame_paths = sorted(episode_dir.glob("kf_*.jpg"))
+    if len(frame_paths) == 0:
+        frame_paths = sorted(episode_dir.glob("kf_*.png"))
 
-    if len(subclip_dirs) == 0:
-        print("No subclips found.")
+    if len(frame_paths) == 0:
+        print("No keyframe images found, skipping.")
         return
 
-    print(f"Found {len(subclip_dirs)} subclips")
+    print(f"Found {len(frame_paths)} keyframe images, window_size={window_size}")
 
-    instructions = []
+    # chunk into non-overlapping windows: [0:6], [6:12], [12:18], ...
+    chunks = [frame_paths[i: i + window_size] for i in range(0, len(frame_paths), window_size)]
+    print(f"Total chunks: {len(chunks)}")
 
-    grouped_subclips = [
-        subclip_dirs[i : i + SUBCLIPS_PER_INSTRUCTION] for i in range(0, len(subclip_dirs), SUBCLIPS_PER_INSTRUCTION)
-    ]
+    results = []
 
-    for group_idx, group in enumerate(grouped_subclips):
+    for chunk_idx, chunk_paths in enumerate(chunks):
+        start = chunk_idx * window_size
+        end = start + len(chunk_paths) - 1
+        print(f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)")
 
-        print(f"\n[{group_idx+1}/{len(grouped_subclips)}] " f"Processing subclips:")
-
-        all_images = []
-
-        group_metadata = []
-
-        for subclip_dir in group:
-
-            print(f"  - {subclip_dir.name}")
-
-            frame_paths = sorted(subclip_dir.glob("*.jpg"))
-
-            if len(frame_paths) == 0:
-                frame_paths = sorted(subclip_dir.glob("*.png"))
-
-            sampled_paths = sample_frames(frame_paths, FRAMES_PER_SUBCLIP)
-
-            images = load_images(sampled_paths)
-
-            all_images.extend(images)
-
-            meta_path = subclip_dir / "metadata.json"
-
-            if meta_path.exists():
-                with open(meta_path, "r") as f:
-                    group_metadata.append(json.load(f))
-
-        if len(all_images) == 0:
-            print("  No valid images.")
+        images = load_images(chunk_paths)
+        if len(images) == 0:
+            print("  No valid images, skipping chunk.")
             continue
 
         try:
+            instruction = llava.generate(images=images)
+            print(f"  → {instruction}")
 
-            instruction = llava.generate(images=all_images)
-
-            print(f"\nInstruction:")
-            print(instruction)
-
-            result = {
-                "group_idx": group_idx,
-                "subclips": [x.name for x in group],
+            results.append({
+                "chunk_idx": chunk_idx,
+                "frame_range": f"{start}-{end}",
+                "frames": [p.name for p in chunk_paths],
                 "instruction": instruction,
-                "metadata": group_metadata,
-            }
-
-            instructions.append(result)
+            })
 
         except Exception as e:
-
-            print(f"FAILED: {e}")
+            print(f"  FAILED: {e}")
 
         torch.cuda.empty_cache()
         gc.collect()
 
+    if not results:
+        print("No instructions generated.")
+        return
+
+    # save JSON with all chunk results
     save_json = episode_dir / "instructions.json"
-
     with open(save_json, "w") as f:
-        json.dump(instructions, f, indent=2)
+        json.dump(results, f, indent=2)
 
+    # save TXT with one instruction per line, ready for summarization
     save_txt = episode_dir / "instructions.txt"
-
     with open(save_txt, "w") as f:
+        for item in results:
+            f.write(f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n")
 
-        for item in instructions:
-
-            f.write(f"[{item['group_idx']:04d}] " f"{item['instruction']}\n")
-
-    print(f"\nSaved:")
+    print(f"\nSaved {len(results)} chunk instructions:")
     print(f"  {save_json}")
     print(f"  {save_txt}")
 
 
 if __name__ == "__main__":
-    llava = LlavaOnevisionLocal(model_path="/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf")
+    llava = LlavaOnevisionLocal(
+        model_path="/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
+    )
+
+    window_size = int(sys.argv[2]) if len(sys.argv) > 2 else WINDOW_SIZE
+
     if len(sys.argv) > 1:
-        ep = Path(sys.argv[1])
-        if not ep.is_absolute():
-            ep = ROOT_DIR / ep
-        if not ep.is_dir():
-            print(f"Error: {ep} is not a directory")
+        input_path = Path(sys.argv[1])
+        if not input_path.is_absolute():
+            input_path = ROOT_DIR / input_path
+        if not input_path.is_dir():
+            print(f"Error: {input_path} is not a directory")
             sys.exit(1)
 
-        run_episode(ep, llava)
+        # if the given dir contains episode_ subdirs → run all of them
+        # if the given dir IS an episode (has kf_* images) → run it directly
+        episode_dirs = sorted([x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")])
+
+        if episode_dirs:
+            print(f"Found {len(episode_dirs)} episodes in {input_path}")
+            for ep in episode_dirs:
+                try:
+                    run_episode(ep, llava, window_size=window_size)
+                except Exception as e:
+                    print(f"Episode failed: {ep.name} — {e}")
+        else:
+            # treat the path itself as a single episode
+            run_episode(input_path, llava, window_size=window_size)
+
     else:
-
-        episode_dirs = sorted([x for x in ROOT_DIR.iterdir() if x.is_dir() and x.name.startswith("episode_")])
-
-        print(f"Found {len(episode_dirs)} episodes")
-
+        episode_dirs = sorted(
+            [x for x in ROOT_DIR.iterdir() if x.is_dir() and x.name.startswith("episode_")]
+        )
+        print(f"Found {len(episode_dirs)} episodes in ROOT_DIR")
         for ep in episode_dirs:
-
             try:
-                run_episode(ep, llava)
-
+                run_episode(ep, llava, window_size=window_size)
             except Exception as e:
                 print(f"Episode failed: {ep.name} — {e}")

@@ -86,7 +86,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:1")
-    parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1-DualVLN")
+    parser.add_argument("--model_path", type=str, default="/home/lenguyen1/hoangpqn/InternNav/scripts/notebooks/checkpoints/InternVLA-N1-DualVLN")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
@@ -95,7 +95,7 @@ if __name__ == '__main__':
         "--instruction",
         type=str,
         default=(
-            "Navigate through the office area. Pass between the two rows of computer desks, stay in the center aisle, and stop in front of the green plant."
+            "Go straight forward and avoid the obstacles."
         ),
     )
     args = parser.parse_args()

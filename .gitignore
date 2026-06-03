@@ -152,3 +152,6 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+scripts/dataset_converters/lerobot
+scripts/instruction_generator/keyframe_output
+scripts/instruction_generator/lerobot_out
