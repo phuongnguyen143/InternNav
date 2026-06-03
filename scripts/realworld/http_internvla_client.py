@@ -22,7 +22,7 @@ from controllers import Mpc_controller, PID_controller
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from thread_utils import ReadWriteLock
 
 
@@ -49,7 +49,7 @@ odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
 
 offset_x = 0.3
-offset_y = 0.3
+offset_y = 0.1
 
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
     global policy_init, http_idx, first_running_time, last_pixel_goal
@@ -328,11 +328,12 @@ class Go2Manager(Node):
         super().__init__('go2_manager')
         self.debug_publish_visualization = bool(self.declare_parameter('debug_publish_visualization', True).value)
 
-        rgb_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/left/image_rect_color/raw")
-        depth_down_sub = Subscriber(self, Image, "/camera_on_belly/zed_node/depth/depth_registered")
+        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5, durability=DurabilityPolicy.VOLATILE)
 
-        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        rgb_down_sub = Subscriber(self, Image, "/camera/waist_front_zed_stream/left/color/rect/image", qos_profile=qos_profile)
+        depth_down_sub = Subscriber(self, Image, "/camera/waist_front_zed_stream/depth/depth_registered", qos_profile=qos_profile)
 
+        
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
         self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base_filtered", self.odom_callback, qos_profile)
