@@ -12,20 +12,21 @@ XAUTH_DOCKER="${INTERNNAV_XAUTH_DOCKER:-/tmp/.docker.xauth-internnav}"
 
 DOCKER_ARGS=(
     --rm
-    -it
+    -dit
     --gpus all
     --ipc host
     --name "${CONTAINER_NAME}"
     --workdir "${CONTAINER_REPO_DIR}"
-    --network ${NETWORK_MODE}
+    --network "${NETWORK_MODE}"
     --volume "${REPO_DIR}:${CONTAINER_REPO_DIR}"
     --env "NVIDIA_DRIVER_CAPABILITIES=all"
     --env "PYTHONPATH=${CONTAINER_REPO_DIR}:${CONTAINER_REPO_DIR}/third_party/diffusion-policy:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages"
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     -v "$(pwd)/cyclonedds_config.xml:/etc/cyclonedds.xml"
-    -e CYCLONEDDS_URI=file:///etc/cyclonedds.xml 
-    -e CODEX_HOME=/tmp/codex-home/.codex 
+    -e CYCLONEDDS_URI=file:///etc/cyclonedds.xml
+    -e CODEX_HOME=/tmp/codex-home/.codex
     -v "$HOME/.codex_internnav:/tmp/codex-home/.codex"
+    -v "$HOME/vln_bags:/tmp/bags"
 )
 
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
@@ -52,7 +53,20 @@ if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
 fi
 
 if [[ $# -eq 0 ]]; then
-    exec docker run "${DOCKER_ARGS[@]}" "${IMAGE}" /bin/bash
+    CONTAINER_ID="$(docker run "${DOCKER_ARGS[@]}" "${IMAGE}")"
+else
+    CONTAINER_ID="$(docker run "${DOCKER_ARGS[@]}" "${IMAGE}" "$@")"
 fi
 
-exec docker run "${DOCKER_ARGS[@]}" "${IMAGE}" "$@"
+RUNNING="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+
+if [[ "${RUNNING}" == "true" ]]; then
+    echo "InternNav container '${CONTAINER_NAME}' started successfully in detached mode."
+    echo "Container ID: ${CONTAINER_ID}"
+    echo "Open a shell with: docker exec -it ${CONTAINER_NAME} /bin/bash"
+    echo "Stop it with: docker stop ${CONTAINER_NAME}"
+else
+    echo "InternNav container '${CONTAINER_NAME}' was created but is not running." >&2
+    echo "Check logs with: docker logs ${CONTAINER_NAME}" >&2
+    exit 1
+fi
