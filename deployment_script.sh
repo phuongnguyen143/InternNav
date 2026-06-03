@@ -129,7 +129,7 @@ initial_stop_signal() {
     local label="$1"
 
     case "${label}" in
-        http_internvla_server)
+        http_internvla_server|plotjuggler)
             echo "TERM"
             ;;
         *)
