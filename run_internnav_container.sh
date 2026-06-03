@@ -24,6 +24,8 @@ DOCKER_ARGS=(
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     -v "$(pwd)/cyclonedds_config.xml:/etc/cyclonedds.xml"
     -e CYCLONEDDS_URI=file:///etc/cyclonedds.xml 
+    -e CODEX_HOME=/tmp/codex-home/.codex 
+    -v "$HOME/.codex_internnav:/tmp/codex-home/.codex"
 )
 
 if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
