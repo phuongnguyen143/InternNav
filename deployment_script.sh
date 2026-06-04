@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONTAINER_NAME="${INTERNNAV_CONTAINER_NAME:-internnav}"
 CONTAINER_REPO_DIR="${INTERNNAV_CONTAINER_REPO_DIR:-/root/InternNav}"
-BAGS_DIR="${INTERNNAV_BAGS_DIR:-/tmp/bags}"
+BAGS_DIR="${INTERNNAV_BAGS_DIR:-bags}"
 RUN_NAME="${INTERNNAV_RUN_NAME:-internnav_$(date +%Y%m%d_%H%M%S)}"
 BAG_OUTPUT="${BAGS_DIR}/${RUN_NAME}"
 LOG_DIR="${BAGS_DIR}/${RUN_NAME}_logs"
