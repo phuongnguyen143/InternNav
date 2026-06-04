@@ -26,7 +26,6 @@ DEPTH_TOPIC="/camera/waist_front_zed_stream/depth/depth_registered"
 POINT_CLOUD_TOPIC="/camera_on_back_ob/zed_node/point_cloud/cloud_registered"
 
 TOPICS=(
-    "${RGB_TOPIC}"
     "${COMPRESSED_RGB_TOPIC}"
     "${CAMERA_INFO_TOPIC}"
     "${DEPTH_TOPIC}"
@@ -261,13 +260,6 @@ wait_for_http_server() {
 ensure_container_running
 
 run_in_container_detached \
-    rosbag_record \
-    ros2 bag record -o "${BAG_OUTPUT}" "${TOPICS[@]}"
-
-sleep "${PROCESS_START_DELAY}"
-verify_process rosbag_record "ros2 bag record"
-
-run_in_container_detached \
     http_internvla_server \
     python3 scripts/realworld/http_internvla_server_new.py
 
@@ -281,6 +273,13 @@ run_in_container_detached \
 
 sleep "${PROCESS_START_DELAY}"
 verify_process http_internvla_client "http_internvla_client.py"
+
+run_in_container_detached \
+    rosbag_record \
+    ros2 bag record -o "${BAG_OUTPUT}" "${TOPICS[@]}"
+
+sleep "${PROCESS_START_DELAY}"
+verify_process rosbag_record "ros2 bag record"
 
 run_in_container_detached \
     plotjuggler \
