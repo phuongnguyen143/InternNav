@@ -4,7 +4,7 @@ import torch
 
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from prompt.summarize_prompt_v1 import SUMMARIZE_PROMPT
+from prompts import SUMMARIZE_PROMPT
 
 QWEN_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/Qwen2-72B-Instruct-AWQ"
 
@@ -86,22 +86,18 @@ if __name__ == "__main__":
         print(f"Error: path not found: {input_path}")
         sys.exit(1)
 
-    # collect all txt files to process
     txt_files = []
 
     if input_path.is_file():
-        # direct txt file
         txt_files.append(input_path)
 
     elif input_path.is_dir():
-        # check if it contains episode_ subdirs
         episode_dirs = sorted([
             x for x in input_path.iterdir()
             if x.is_dir() and x.name.startswith("episode_")
         ])
 
         if episode_dirs:
-            # folder of many episodes
             for ep in episode_dirs:
                 txt = ep / "instructions.txt"
                 if txt.exists():
@@ -109,7 +105,6 @@ if __name__ == "__main__":
                 else:
                     print(f"  [WARN] No instructions.txt in {ep.name}, skipping.")
         else:
-            # treat as a single episode folder
             txt = input_path / "instructions.txt"
             if txt.exists():
                 txt_files.append(txt)
@@ -123,7 +118,6 @@ if __name__ == "__main__":
 
     print(f"Found {len(txt_files)} instruction file(s) to summarize")
 
-    # load model once, run all episodes
     qwen = QwenLocal()
 
     for txt_path in txt_files:

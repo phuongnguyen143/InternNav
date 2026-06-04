@@ -1,8 +1,10 @@
-from pathlib import Path
-import shutil
-import numpy as np
+"""Keyframe detection from floor embodiment poses."""
+
+from dataclasses import dataclass
+
 import cv2
-from dataclasses import dataclass, field
+import numpy as np
+
 
 @dataclass
 class KeyframeConfig:
@@ -12,6 +14,7 @@ class KeyframeConfig:
     max_dist_between_keyframes: float = 6.0
     min_dist_between_keyframes: float = 3.0
     merge_window_frames: int = 10
+
 
 @dataclass
 class KeyframeResult:
@@ -23,37 +26,6 @@ class KeyframeResult:
     accumulated_yaw_deg: float = 0.0
     dist_from_last: float = 0.0
 
-
-def split_keyframes_into_episodes(keyframe_dir, output_dir=None, images_per_episode=40):
-    """
-    Split thousands of keyframe images into episodes.
-    """
-    keyframe_dir = Path(keyframe_dir)
-    if output_dir is None:
-        output_dir = keyframe_dir.parent / "episodes"
-    else:
-        output_dir = Path(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = sorted([p for p in keyframe_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
-    total_images = len(image_paths)
-
-    print(f"Found {total_images} images")
-    if total_images == 0:
-        print("No images found")
-        return
-
-    num_episodes = 0
-    for start_idx in range(0, total_images, images_per_episode):
-        end_idx = min(start_idx + images_per_episode, total_images) # ensure we don't go out of bounds
-        episode_images = image_paths[start_idx:end_idx]
-        episode_dir = output_dir / (f"episode_{num_episodes:04d}")
-        episode_dir.mkdir(parents=True, exist_ok=True)
-        for local_idx, src_path in enumerate(episode_images):
-            dst_path = episode_dir / (f"{local_idx:06d}{src_path.suffix.lower()}")
-            shutil.copy2(src_path, dst_path)
-        print(f"[Episode {num_episodes:04d}] {len(episode_images)} images")
-        num_episodes += 1
 
 def normalize_angle(rad):
     return (rad + np.pi) % (2 * np.pi) - np.pi
@@ -90,12 +62,14 @@ def merge_close_keyframes(keyframes, window):
 
     return merged
 
+
 def get_frame_from_video(cap, frame_idx):
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
     if not ok:
         return None
     return frame
+
 
 def extract_keyframes(poses, config: KeyframeConfig):
     if len(poses) < 2:
@@ -105,7 +79,6 @@ def extract_keyframes(poses, config: KeyframeConfig):
     keyframes.append(KeyframeResult(frame_idx=poses[0]['frame_idx'], reason='start', pose=poses[0]))
     last_kf_pose = poses[0]
 
-    # precompute per-frame delta yaws
     delta_yaws = [0.0]
     for i in range(1, len(poses)):
         dyaw = delta_yaw_deg(poses[i - 1]['yaw'], poses[i]['yaw'])
@@ -121,17 +94,14 @@ def extract_keyframes(poses, config: KeyframeConfig):
         reasons = []
         abs_delta = abs(delta_yaws[i])
 
-        # sharp turn
         if abs_delta >= config.sharp_turn_thresh_deg:
             reasons.append(('sharp_turn', abs_delta))
 
-        # curvature over a local window
         window_start = max(0, i - config.curvature_window)
         accum = sum(abs(delta_yaws[j]) for j in range(window_start, i + 1))
         if accum >= config.curvature_thresh_deg:
             reasons.append(('curvature', accum))
 
-        # max distance
         if dist >= config.max_dist_between_keyframes:
             reasons.append(('distance', dist))
 
@@ -162,8 +132,3 @@ def extract_keyframes(poses, config: KeyframeConfig):
     print(f"[KF] Total keyframes after merge: {len(keyframes)}")
 
     return keyframes
-
-def rosbag2lerobot():
-    pass
-if __name__ == "__main__":
-    split_keyframes_into_episodes("/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/keyframe_")

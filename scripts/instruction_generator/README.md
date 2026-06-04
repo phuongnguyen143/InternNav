@@ -23,15 +23,26 @@ Keyframe Extraction  →  Subclip Division  →  Instruction Generation  →  Su
 
 ```
 scripts/instruction_generator/
-├── keyframe_extractor.py       # Stage 1 — ROS2 node for keyframe extraction
-├── generate_instruction.py     # Stage 2+3 — Subclip instruction generation (LLaVA)
-├── summarize_instructions.py   # Stage 4 — Long-horizon summarization (Qwen2-72B)
-└── sample_frames.py            # Utility — downsample frames in a folder
+├── constants.py                  # Shared filenames, ROS topics, robot extrinsics
+├── geometry_utils.py             # Vendored floor-estimation helpers (from GaussTrace)
+├── floor_estimator.py            # Vendored FloorEstimator (local, no GaussTrace import)
+├── floor_pose.py                 # Floor plane math, calibration, cam2base projection
+├── trajectory_io.py              # Camera/floor trajectory txt parse + timestamp matching
+├── trajectory_publishers.py      # ROS2 publishers (floor + camera odom txt)
+├── keyframe_selection.py         # KeyframeConfig and extract_keyframes()
+├── keyframe_extractor.py         # Stage 1 — ROS2 node for keyframe extraction
+├── precompute_floor_trajectory.py  # Offline floor plane + floor_trajectory.txt
+├── generate_instruction.py       # Stage 2+3 — instruction generation (LLaVA)
+├── summarize_instructions.py     # Stage 4 — long-horizon summarization (Qwen2-72B)
+├── prompts.py                    # LLM prompt templates
+└── run.sh                        # tmux launcher for bag playback
 
 keyframe_output/
 ├── all_frames/                 # All raw frames saved during recording
 ├── keyframes/                  # Labelled keyframe images
 ├── keyframes.json              # Keyframe metadata (position, yaw, timestamp)
+├── floor_calibration.json      # Floor plane (copy from precompute output_dir)
+├── poses.json                  # Floor x,y,yaw + camera_matrix + action_matrix per frame
 ├── trajectory.png              # Top-down trajectory visualization
 └── episodes/
     ├── episodes.json           # Episode and subclip metadata
@@ -82,30 +93,58 @@ huggingface-cli download Qwen/Qwen2-72B-Instruct-AWQ \
 
 ### Stage 1 — Keyframe Extraction
 
-Launch the ROS2 node while the robot is navigating:
+Camera odometry (`T_world_cam`) and embodiment trajectory on the floor are **different**:
+
+| Data | Source | Used for |
+|------|--------|----------|
+| Camera pose | `odometry_*.txt` | `poses.json` → `camera_matrix` → LeRobot `observation.camera_extrinsic` |
+| Floor embodiment | `floor_trajectory.txt` (precomputed) | `poses.json` x,y,yaw → keyframes; `action_matrix` → LeRobot `action` |
+
+Floor estimation is **offline** (slow on large PCDs). Do not run it inside ROS nodes during bag play.
+
+#### Step 0 — Precompute (once per scene)
 
 ```bash
-ros2 bag play bkhn_round2 --rate 3
-python depth_republish.py
-ros2 run image_transport republish compressed raw \
-  --ros-args \
-  --remap in/compressed:=/camera/camera/color/image_raw/compressed \
-  --remap out:=/camera/camera/color/image_raw/raw
-python odometry_publisher.py /home/lenguyen1/hoangpqn/GaussTrace/dataset/raw/scenes/BKHN_data/bkhn_round1/odometry_bkhn_round2_point2plane.txt
-python extract_keyframe.py
+python precompute_floor_trajectory.py \
+  --pcd /path/to/scene.pcd \
+  --camera_odom /path/to/odometry_camera.txt \
+  --output_dir /path/to/scene_dir/
 ```
 
-Press `Ctrl+C` to stop recording. The node will automatically run `finalize()` to extract keyframes and build episodes.
+Writes `floor_calibration.json` and `floor_trajectory.txt` (timestamp + `x y yaw z` per line).
+Large clouds use coarser patch stride automatically; override with `--stride` / `--patch_radius`.
 
-**Tuning keyframe density** (edit `KeyframeConfig` in `keyframe_extractor.py`):
+Requires `open3d` in the `internnav` conda environment.
+
+#### Step 1 — Live bag + keyframes
+
+```bash
+./run.sh <bag_path> <camera_odom.txt> <floor_trajectory.txt>
+```
+
+- Pane 1: `trajectory_publishers.py floor` (loads txt only, no PCD at startup)
+- Pane 2: `keyframe_extractor.py` merges camera odom at `finalize()` into `poses.json`
+
+Press `Ctrl+B` then `S` to stop and save.
+
+#### LeRobot conversion (pose vs action split)
+
+```bash
+python ../dataset_converters/rosbag2lerobot.py --keyframe_root ./keyframe_output
+```
+
+- `observation.camera_extrinsic` ← `camera_matrix` (camera in world)
+- `action` ← `action_matrix` (base on floor), never from camera pose
+
+**Tuning keyframe density** (edit `KeyframeConfig` in `keyframe_selection.py`; episode size in `constants.py`):
 
 | Parameter | Default | Effect |
 |---|---|---|
 | `sharp_turn_thresh_deg` | 25.0 | Lower = more keyframes on turns |
 | `curvature_thresh_deg` | 25.0 | Lower = more keyframes on curves |
-| `max_dist_between_keyframes` | 5.0 m | Lower = denser keyframes |
-| `min_dist_between_keyframes` | 2.0 m | Higher = fewer keyframes |
-| `keyframes_per_episode` | 30 | Keyframes per episode |
+| `max_dist_between_keyframes` | 6.0 m | Lower = denser keyframes |
+| `min_dist_between_keyframes` | 3.0 m | Higher = fewer keyframes |
+| `DEFAULT_KEYFRAMES_PER_EPISODE` | 30 | Keyframes per episode |
 
 ---
 
@@ -213,3 +252,4 @@ Tested on:
 - 2× NVIDIA GeForce RTX 4090 (24GB each)
 - Ubuntu 22.04, ROS2 Humble
 - Python 3.10, PyTorch 2.x, Transformers ≥ 4.51.3
+

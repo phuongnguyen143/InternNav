@@ -1,3 +1,4 @@
+import argparse
 import gc
 import json
 import sys
@@ -13,19 +14,79 @@ from transformers import (
     LlavaOnevisionProcessor,
 )
 
-from prompt.trajectory_prompt_v1 import TRAJECTORY_PROMPT_BEFORE, TRAJECTORY_PROMPT_AFTER
+from prompts import TRAJECTORY_PROMPT_BEFORE, TRAJECTORY_PROMPT_AFTER
 
-BASEPATH = os.path.dirname(os.path.abspath(__file__))
-print(BASEPATH)
 
-MAX_NEW_TOKENS = 96
-WINDOW_SIZE = 8  # how many frames per chunk
+DEFAULT_MAX_NEW_TOKENS = 96
+DEFAULT_WINDOW_SIZE = 8
+DEFAULT_REPETITION_PENALTY = 1.1
+DEFAULT_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
+DEFAULT_ROOT_DIR = Path(
+    "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes"
+)
+DEFAULT_DEVICE = "cuda:0"
 
-ROOT_DIR = Path("/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate navigation instructions from keyframe images using LLaVA-OneVision.",
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default=None,
+        help=(
+            "Episode directory or parent directory containing episode_* subdirs. "
+            "If omitted, all episodes under --root-dir are processed."
+        ),
+    )
+    parser.add_argument(
+        "--root-dir",
+        type=Path,
+        default=DEFAULT_ROOT_DIR,
+        help=f"Base directory for relative episode paths (default: {DEFAULT_ROOT_DIR})",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=DEFAULT_MODEL_PATH,
+        help=f"Local path to LLaVA-OneVision model (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_WINDOW_SIZE,
+        help=f"Number of keyframe images per chunk (default: {DEFAULT_WINDOW_SIZE})",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help=f"Maximum tokens to generate per chunk (default: {DEFAULT_MAX_NEW_TOKENS})",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=DEFAULT_REPETITION_PENALTY,
+        help=f"Repetition penalty during generation (default: {DEFAULT_REPETITION_PENALTY})",
+    )
+    parser.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+        help=f"CUDA device for inference (default: {DEFAULT_DEVICE})",
+    )
+    return parser.parse_args()
 
 
 class LlavaOnevisionLocal:
-    def __init__(self, model_path: str = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"):
+    def __init__(
+        self,
+        model_path: str = DEFAULT_MODEL_PATH,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        device: str = DEFAULT_DEVICE,
+    ):
+        self.max_new_tokens = max_new_tokens
+        self.repetition_penalty = repetition_penalty
 
         self.processor = LlavaOnevisionProcessor.from_pretrained(model_path, local_files_only=True, use_fast=True)
         self.processor.tokenizer.padding_side = "left"
@@ -36,7 +97,7 @@ class LlavaOnevisionLocal:
                 bnb_4bit_compute_dtype=torch.float16,
             ),
             torch_dtype=torch.float16,
-            device_map="cuda:0",
+            device_map=device,
             local_files_only=True,
             attn_implementation="flash_attention_2",
         )
@@ -60,11 +121,11 @@ class LlavaOnevisionLocal:
 
         output_ids = self.model.generate(
             **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
+            max_new_tokens=self.max_new_tokens,
             do_sample=False,
             temperature=None,
             top_p=None,
-            repetition_penalty=1.1,
+            repetition_penalty=self.repetition_penalty,
             use_cache=False,
             pad_token_id=self.processor.tokenizer.eos_token_id,
         )
@@ -89,7 +150,7 @@ def load_images(image_paths):
     return images
 
 
-def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int = WINDOW_SIZE):
+def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int):
     print(f"\n{'='*80}")
     print(f"EPISODE: {episode_dir.name}")
 
@@ -103,7 +164,7 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int 
 
     print(f"Found {len(frame_paths)} keyframe images, window_size={window_size}")
 
-    # chunk into non-overlapping windows: [0:6], [6:12], [12:18], ...
+    # chunk into non-overlapping windows: [0:8], [8:16], [16:24], ...
     chunks = [frame_paths[i: i + window_size] for i in range(0, len(frame_paths), window_size)]
     print(f"Total chunks: {len(chunks)}")
 
@@ -156,43 +217,51 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int 
     print(f"  {save_txt}")
 
 
-if __name__ == "__main__":
-    llava = LlavaOnevisionLocal(
-        model_path="/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
-    )
+def resolve_input_path(input_arg: str | None, root_dir: Path) -> Path | None:
+    if input_arg is None:
+        return None
 
-    window_size = int(sys.argv[2]) if len(sys.argv) > 2 else WINDOW_SIZE
+    input_path = Path(input_arg)
+    if not input_path.is_absolute():
+        input_path = root_dir / input_path
+    if not input_path.is_dir():
+        print(f"Error: {input_path} is not a directory")
+        sys.exit(1)
+    return input_path
 
-    if len(sys.argv) > 1:
-        input_path = Path(sys.argv[1])
-        if not input_path.is_absolute():
-            input_path = ROOT_DIR / input_path
-        if not input_path.is_dir():
-            print(f"Error: {input_path} is not a directory")
-            sys.exit(1)
 
-        # if the given dir contains episode_ subdirs → run all of them
-        # if the given dir IS an episode (has kf_* images) → run it directly
-        episode_dirs = sorted([x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")])
-
-        if episode_dirs:
-            print(f"Found {len(episode_dirs)} episodes in {input_path}")
-            for ep in episode_dirs:
-                try:
-                    run_episode(ep, llava, window_size=window_size)
-                except Exception as e:
-                    print(f"Episode failed: {ep.name} — {e}")
-        else:
-            # treat the path itself as a single episode
-            run_episode(input_path, llava, window_size=window_size)
-
+def run_episodes(input_path: Path | None, llava: LlavaOnevisionLocal, window_size: int, root_dir: Path):
+    if input_path is None:
+        episode_dirs = sorted(
+            [x for x in root_dir.iterdir() if x.is_dir() and x.name.startswith("episode_")]
+        )
+        print(f"Found {len(episode_dirs)} episodes in {root_dir}")
     else:
         episode_dirs = sorted(
-            [x for x in ROOT_DIR.iterdir() if x.is_dir() and x.name.startswith("episode_")]
+            [x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")]
         )
-        print(f"Found {len(episode_dirs)} episodes in ROOT_DIR")
-        for ep in episode_dirs:
-            try:
-                run_episode(ep, llava, window_size=window_size)
-            except Exception as e:
-                print(f"Episode failed: {ep.name} — {e}")
+        if episode_dirs:
+            print(f"Found {len(episode_dirs)} episodes in {input_path}")
+        else:
+            run_episode(input_path, llava, window_size=window_size)
+            return
+
+    for ep in episode_dirs:
+        try:
+            run_episode(ep, llava, window_size=window_size)
+        except Exception as e:
+            print(f"Episode failed: {ep.name} — {e}")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    llava = LlavaOnevisionLocal(
+        model_path=args.model_path,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=args.repetition_penalty,
+        device=args.device,
+    )
+
+    input_path = resolve_input_path(args.input, args.root_dir)
+    run_episodes(input_path, llava, window_size=args.window_size, root_dir=args.root_dir)
