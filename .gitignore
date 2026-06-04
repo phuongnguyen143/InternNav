@@ -152,3 +152,6 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+bags/
+test_data/
+assets/
