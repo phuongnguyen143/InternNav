@@ -95,7 +95,7 @@ if __name__ == '__main__':
         "--instruction",
         type=str,
         default=(
-            "Navigate through the office area. Pass between the two rows of computer desks, stay in the center aisle, and stop in front of the green plant."
+            "Go forward to the green plan then turn right and then go straight to green plant on the table. Stop at the green plant."
         ),
     )
     args = parser.parse_args()
