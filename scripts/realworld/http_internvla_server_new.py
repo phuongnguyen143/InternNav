@@ -86,7 +86,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:1")
-    parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1-DualVLN")
+    parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1-w-NavDP")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
