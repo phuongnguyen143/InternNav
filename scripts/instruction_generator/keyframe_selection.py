@@ -13,7 +13,7 @@ class KeyframeConfig:
     curvature_window: int = 10
     max_dist_between_keyframes: float = 6.0
     min_dist_between_keyframes: float = 3.0
-    merge_window_frames: int = 10
+    merge_window_frames: int = 5
 
 
 @dataclass
@@ -36,7 +36,7 @@ def delta_yaw_deg(a, b):
 
 
 def euclidean_dist(a, b):
-    return np.sqrt((a['x'] - b['x']) ** 2 + (a['y'] - b['y']) ** 2)
+    return np.sqrt((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2)
 
 
 def merge_close_keyframes(keyframes, window):
@@ -44,11 +44,11 @@ def merge_close_keyframes(keyframes, window):
         return keyframes
 
     priority = {
-        'start': 0,
-        'end': 0,
-        'sharp_turn': 1,
-        'curvature': 2,
-        'distance': 3,
+        "start": 0,
+        "end": 0,
+        "sharp_turn": 1,
+        "curvature": 2,
+        "distance": 3,
     }
 
     merged = [keyframes[0]]
@@ -76,12 +76,14 @@ def extract_keyframes(poses, config: KeyframeConfig):
         return []
 
     keyframes = []
-    keyframes.append(KeyframeResult(frame_idx=poses[0]['frame_idx'], reason='start', pose=poses[0]))
+    keyframes.append(
+        KeyframeResult(frame_idx=poses[0]["frame_idx"], reason="start", pose=poses[0])
+    )
     last_kf_pose = poses[0]
 
     delta_yaws = [0.0]
     for i in range(1, len(poses)):
-        dyaw = delta_yaw_deg(poses[i - 1]['yaw'], poses[i]['yaw'])
+        dyaw = delta_yaw_deg(poses[i - 1]["yaw"], poses[i]["yaw"])
         delta_yaws.append(dyaw)
 
     for i in range(1, len(poses) - 1):
@@ -95,25 +97,25 @@ def extract_keyframes(poses, config: KeyframeConfig):
         abs_delta = abs(delta_yaws[i])
 
         if abs_delta >= config.sharp_turn_thresh_deg:
-            reasons.append(('sharp_turn', abs_delta))
+            reasons.append(("sharp_turn", abs_delta))
 
         window_start = max(0, i - config.curvature_window)
         accum = sum(abs(delta_yaws[j]) for j in range(window_start, i + 1))
         if accum >= config.curvature_thresh_deg:
-            reasons.append(('curvature', accum))
+            reasons.append(("curvature", accum))
 
         if dist >= config.max_dist_between_keyframes:
-            reasons.append(('distance', dist))
+            reasons.append(("distance", dist))
 
         if reasons:
-            priority_order = ['sharp_turn', 'curvature', 'distance']
+            priority_order = ["sharp_turn", "curvature", "distance"]
             best_reason = next(
                 (p for p in priority_order for r, _ in reasons if r == p),
                 reasons[0][0],
             )
 
             kf = KeyframeResult(
-                frame_idx=pose['frame_idx'],
+                frame_idx=pose["frame_idx"],
                 reason=best_reason,
                 pose=pose,
                 delta_yaw_deg=delta_yaws[i],
@@ -127,7 +129,9 @@ def extract_keyframes(poses, config: KeyframeConfig):
                 f"dist={dist:.2f} dyaw={delta_yaws[i]:.1f} accum={accum:.1f}"
             )
 
-    keyframes.append(KeyframeResult(frame_idx=poses[-1]['frame_idx'], reason='end', pose=poses[-1]))
+    keyframes.append(
+        KeyframeResult(frame_idx=poses[-1]["frame_idx"], reason="end", pose=poses[-1])
+    )
     keyframes = merge_close_keyframes(keyframes, config.merge_window_frames)
     print(f"[KF] Total keyframes after merge: {len(keyframes)}")
 

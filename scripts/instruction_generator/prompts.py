@@ -1,8 +1,7 @@
 """LLM prompt templates for instruction generation and summarization."""
 
 TRAJECTORY_PROMPT_BEFORE = (
-    "Assume you are a robot designed for navigation. "
-    "You are provided with captured image sequences:"
+    "Assume you are a robot designed for navigation. " "You are provided with captured image sequences:"
 )
 
 TRAJECTORY_PROMPT_AFTER = """Based on this image sequence, please describe the navigation trajectory of the robot.

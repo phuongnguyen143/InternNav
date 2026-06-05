@@ -12,9 +12,7 @@ CAMERA_PITCH_RAD = 0.0
 
 # ROS topic defaults
 DEFAULT_RGB_TOPIC = "/camera/camera/color/image_raw/compressed"
-DEFAULT_DEPTH_TOPIC = (
-    "/camera/camera/aligned_depth_to_color/image_raw/compressedDepth"
-)
+DEFAULT_DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw/compressedDepth"
 DEFAULT_ODOM_MATCHED_TOPIC = "/odom_txt/matched"
 DEFAULT_FRAME_ID = "map"
 DEFAULT_CHILD_FRAME_ID = "base_link"
@@ -22,7 +20,7 @@ DEFAULT_MAX_TIME_DIFF = 0.05
 
 # Keyframe extractor
 COMPRESSED_DEPTH_HEADER_SIZE = 12
-DEFAULT_KEYFRAMES_PER_EPISODE = 30
+DEFAULT_KEYFRAMES_PER_EPISODE = 10
 DEFAULT_RECORD_FPS = 10.0
 DEFAULT_DEPTH_VIS_SCALE = 10000.0
 DEFAULT_SYNC_SLOP_SEC = 0.05

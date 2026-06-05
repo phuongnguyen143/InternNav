@@ -33,9 +33,7 @@ def _auto_patch_params(num_points: int) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Precompute floor plane and floor embodiment trajectory txt."
-    )
+    parser = argparse.ArgumentParser(description="Precompute floor plane and floor embodiment trajectory txt.")
     parser.add_argument("--pcd", required=True, help="Scene point cloud (.ply/.pcd)")
     parser.add_argument(
         "--camera_odom",
@@ -79,10 +77,7 @@ def main() -> None:
         voxel_size=args.voxel_size,
         **patch_kw,
     )
-    print(
-        f"[precompute] Floor plane {floor_plane} | inliers={len(inliers):,} | "
-        f"elapsed={time.time() - t0:.1f}s"
-    )
+    print(f"[precompute] Floor plane {floor_plane} | inliers={len(inliers):,} | " f"elapsed={time.time() - t0:.1f}s")
 
     save_floor_calibration(
         output_dir,
@@ -102,9 +97,7 @@ def main() -> None:
 
     for entry in tqdm(camera_entries, desc="Project camera odom to floor"):
         x, y, yaw, z, _ = camera_matrix_to_floor_pose(entry.matrix, floor_plane)
-        floor_entries.append(
-            FloorEntry(timestamp=entry.timestamp, x=x, y=y, yaw=yaw, z=z)
-        )
+        floor_entries.append(FloorEntry(timestamp=entry.timestamp, x=x, y=y, yaw=yaw, z=z))
 
     traj_path = output_dir / FLOOR_TRAJECTORY_FILENAME
     write_floor_trajectory_txt(traj_path, floor_entries)

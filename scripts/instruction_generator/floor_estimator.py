@@ -70,9 +70,7 @@ class FloorEstimator:
         scene_points = points
         up_axis = best_u
 
-        self._print_results(
-            raw_points, floor_plane, floor_normal, inlier_points, scene_points
-        )
+        self._print_results(raw_points, floor_plane, floor_normal, inlier_points, scene_points)
         return (
             floor_plane,
             floor_normal,
@@ -96,8 +94,9 @@ class FloorEstimator:
 
         # 2. Project xuống mặt phẳng XY (vuông góc với up axis)
         # Tìm 2 trục nằm ngang
-        arb = np.array([1., 0., 0.]) if abs(up[0]) < 0.9 else np.array([0., 1., 0.])
-        x_ax = np.cross(arb, up); x_ax /= np.linalg.norm(x_ax)
+        arb = np.array([1.0, 0.0, 0.0]) if abs(up[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        x_ax = np.cross(arb, up)
+        x_ax /= np.linalg.norm(x_ax)
         y_ax = np.cross(up, x_ax)
 
         coords_2d = np.stack([points @ x_ax, points @ y_ax], axis=1)  # (N, 2)
@@ -110,12 +109,12 @@ class FloorEstimator:
         cy = np.arange(y_min + patch_radius, y_max, stride)
 
         all_inliers = []
-        all_planes  = []  # (a,b,c,d) mỗi patch
+        all_planes = []  # (a,b,c,d) mỗi patch
 
         for pcx in cx:
             for pcy in cy:
                 # 4. Lấy điểm trong patch (hình tròn bán kính patch_radius)
-                dist2 = (coords_2d[:, 0] - pcx)**2 + (coords_2d[:, 1] - pcy)**2
+                dist2 = (coords_2d[:, 0] - pcx) ** 2 + (coords_2d[:, 1] - pcy) ** 2
                 mask = dist2 <= patch_radius**2
                 patch_pts = points[mask]
 
@@ -142,7 +141,8 @@ class FloorEstimator:
                     continue
 
                 a, b, c, d = plane
-                n = np.array([a, b, c]); n /= np.linalg.norm(n) + 1e-12
+                n = np.array([a, b, c])
+                n /= np.linalg.norm(n) + 1e-12
                 angle = np.degrees(np.arccos(np.clip(abs(np.dot(n, up)), -1, 1)))
 
                 # 7. Lọc: chỉ giữ patch gần nằm ngang
@@ -167,7 +167,8 @@ class FloorEstimator:
             num_iterations=1000,
         )
         a, b, c, d = global_plane
-        global_normal = np.array([a, b, c]); global_normal /= np.linalg.norm(global_normal)
+        global_normal = np.array([a, b, c])
+        global_normal /= np.linalg.norm(global_normal)
         floor_point = merged_inliers.mean(axis=0)
 
         return global_plane, global_normal, floor_point, merged_inliers, points, up
@@ -191,9 +192,7 @@ class FloorEstimator:
         R = np.column_stack([x_new, y_new, z_new])  # shape (3,3)
 
         if abs(np.linalg.det(R) - 1.0) > 1e-6:
-            raise ValueError(
-                f"Rotation matrix determinant = {np.linalg.det(R):.6f}, expected ~1.0"
-            )
+            raise ValueError(f"Rotation matrix determinant = {np.linalg.det(R):.6f}, expected ~1.0")
 
         R_new_from_old = R.T  # (3,3)
 
@@ -210,9 +209,7 @@ class FloorEstimator:
 
     def to_floor_frame(self, scene_points: np.ndarray, T: np.ndarray) -> np.ndarray:
         """Return scene_points transformed into the floor coordinate frame."""
-        points_hom = np.hstack(
-            [scene_points, np.ones((len(scene_points), 1))]
-        )
+        points_hom = np.hstack([scene_points, np.ones((len(scene_points), 1))])
         points_floor = (T @ points_hom.T).T[:, :3]
         return points_floor
 

@@ -92,10 +92,7 @@ if __name__ == "__main__":
         txt_files.append(input_path)
 
     elif input_path.is_dir():
-        episode_dirs = sorted([
-            x for x in input_path.iterdir()
-            if x.is_dir() and x.name.startswith("episode_")
-        ])
+        episode_dirs = sorted([x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")])
 
         if episode_dirs:
             for ep in episode_dirs:

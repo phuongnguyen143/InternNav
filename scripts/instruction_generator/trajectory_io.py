@@ -142,10 +142,7 @@ def parse_odom_txt(filepath: str) -> list[OdomEntry]:
             break
 
         try:
-            matrix = np.array([
-                [float(v) for v in row.split()]
-                for row in matrix_lines
-            ])
+            matrix = np.array([[float(v) for v in row.split()] for row in matrix_lines])
         except ValueError:
             i += 1
             continue
@@ -162,16 +159,22 @@ def parse_odom_txt(filepath: str) -> list[OdomEntry]:
         entry = OdomEntry(
             timestamp=timestamp,
             matrix=matrix,
-            x=tx, y=ty, z=tz,
-            qx=quat[0], qy=quat[1], qz=quat[2], qw=quat[3],
+            x=tx,
+            y=ty,
+            z=tz,
+            qx=quat[0],
+            qy=quat[1],
+            qz=quat[2],
+            qw=quat[3],
             yaw=yaw,
         )
         entries.append(entry)
         i += 6
 
-    print(f"[OdomParser] Loaded {len(entries)} entries "
-          f"from {filepath}")
-    print(f"  Time range: {entries[0].timestamp:.3f} → "
-          f"{entries[-1].timestamp:.3f} "
-          f"({entries[-1].timestamp - entries[0].timestamp:.1f}s)")
+    print(f"[OdomParser] Loaded {len(entries)} entries " f"from {filepath}")
+    print(
+        f"  Time range: {entries[0].timestamp:.3f} → "
+        f"{entries[-1].timestamp:.3f} "
+        f"({entries[-1].timestamp - entries[0].timestamp:.1f}s)"
+    )
     return entries

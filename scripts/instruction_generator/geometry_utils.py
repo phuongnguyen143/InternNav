@@ -35,9 +35,7 @@ def estimate_up_axis_voting(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd_down = pcd.voxel_down_sample(voxel_size=0.3)
 
-    pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30)
-    )
+    pcd_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
     normals = np.asarray(pcd_down.normals)
 
     pts_centered = points - points.mean(axis=0)

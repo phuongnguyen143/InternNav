@@ -38,6 +38,13 @@ from keyframe_selection import KeyframeConfig, extract_keyframes, get_frame_from
 from trajectory_io import OdomMatcher, parse_odom_txt
 
 
+def _clear_episode_dir(episode_dir: Path) -> None:
+    """Remove stale keyframes and videos from a previous extraction run."""
+    for pattern in ("kf_*.jpg", "kf_*.png", "rgb.mp4", "depth.mp4"):
+        for path in episode_dir.glob(pattern):
+            path.unlink(missing_ok=True)
+
+
 class KeyframeExtractor(Node):
     def __init__(self):
         super().__init__("keyframe_extractor")
@@ -112,9 +119,7 @@ class KeyframeExtractor(Node):
             self.odom_topic,
             qos_profile=qos,
         )
-        self.get_logger().info(
-            f"Keyframe extractor ready (odom sync via {self.odom_topic})"
-        )
+        self.get_logger().info(f"Keyframe extractor ready (odom sync via {self.odom_topic})")
 
         self.sync = ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub, self.odom_sub],
@@ -146,14 +151,10 @@ class KeyframeExtractor(Node):
             has_depth_header = data[12:16] == b"\x89PNG"
 
         if has_depth_header:
-            depth_quant_a, depth_quant_b, _ = struct.unpack(
-                "<fff", data[:COMPRESSED_DEPTH_HEADER_SIZE]
-            )
+            depth_quant_a, depth_quant_b, _ = struct.unpack("<fff", data[:COMPRESSED_DEPTH_HEADER_SIZE])
             image_data = data[COMPRESSED_DEPTH_HEADER_SIZE:]
 
-        depth = cv2.imdecode(
-            np.frombuffer(image_data, np.uint8), cv2.IMREAD_ANYDEPTH
-        )
+        depth = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_ANYDEPTH)
         if depth is None:
             return None
 
@@ -162,9 +163,7 @@ class KeyframeExtractor(Node):
             depth = depth.astype(np.float32)
             valid = depth != 0
             depth_out = np.zeros_like(depth, dtype=np.float32)
-            depth_out[valid] = depth_quant_a / (
-                depth[valid].astype(np.float32) - depth_quant_b
-            )
+            depth_out[valid] = depth_quant_a / (depth[valid].astype(np.float32) - depth_quant_b)
             depth = depth_out
 
         return depth
@@ -200,13 +199,10 @@ class KeyframeExtractor(Node):
             camera_entries = parse_odom_txt(self.camera_odom_file)
             camera_matcher = OdomMatcher(camera_entries, max_dt=DEFAULT_OFFLINE_MATCH_MAX_DT)
             self.get_logger().info(
-                f"Merging camera odom from {self.camera_odom_file} "
-                f"({len(camera_entries)} entries)"
+                f"Merging camera odom from {self.camera_odom_file} " f"({len(camera_entries)} entries)"
             )
         else:
-            self.get_logger().warn(
-                "camera_odom_file not set; poses.json will lack camera_matrix."
-            )
+            self.get_logger().warn("camera_odom_file not set; poses.json will lack camera_matrix.")
 
         merged = 0
         for pose in self.poses:
@@ -257,12 +253,8 @@ class KeyframeExtractor(Node):
             h, w = rgb.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-            self.rgb_writer = cv2.VideoWriter(
-                str(self.tmp_rgb_video), fourcc, self.fps, (w, h)
-            )
-            self.depth_writer = cv2.VideoWriter(
-                str(self.tmp_depth_video), fourcc, self.fps, (w, h)
-            )
+            self.rgb_writer = cv2.VideoWriter(str(self.tmp_rgb_video), fourcc, self.fps, (w, h))
+            self.depth_writer = cv2.VideoWriter(str(self.tmp_depth_video), fourcc, self.fps, (w, h))
 
             if not self.rgb_writer.isOpened():
                 raise RuntimeError(f"Cannot open RGB writer: {self.tmp_rgb_video}")
@@ -330,12 +322,11 @@ class KeyframeExtractor(Node):
         height = int(rgb_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-        for episode_start_idx in range(
-            0, len(keyframes) - 1, self.keyframes_per_episode
-        ):
+        for episode_start_idx in range(0, len(keyframes) - 1, self.keyframes_per_episode):
             episode_id = episode_start_idx // self.keyframes_per_episode
             episode_dir = episodes_dir / f"episode_{episode_id:04d}"
             episode_dir.mkdir(exist_ok=True)
+            _clear_episode_dir(episode_dir)
 
             episode_keyframes = keyframes[
                 episode_start_idx : min(
@@ -347,16 +338,10 @@ class KeyframeExtractor(Node):
             start_frame = episode_keyframes[0].frame_idx
             end_frame = episode_keyframes[-1].frame_idx
 
-            self.get_logger().info(
-                f"Creating episode {episode_id} frames [{start_frame}, {end_frame}]"
-            )
+            self.get_logger().info(f"Creating episode {episode_id} frames [{start_frame}, {end_frame}]")
 
-            rgb_writer = cv2.VideoWriter(
-                str(episode_dir / "rgb.mp4"), fourcc, self.fps, (width, height)
-            )
-            depth_writer = cv2.VideoWriter(
-                str(episode_dir / "depth.mp4"), fourcc, self.fps, (width, height)
-            )
+            rgb_writer = cv2.VideoWriter(str(episode_dir / "rgb.mp4"), fourcc, self.fps, (width, height))
+            depth_writer = cv2.VideoWriter(str(episode_dir / "depth.mp4"), fourcc, self.fps, (width, height))
 
             rgb_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             depth_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -374,20 +359,11 @@ class KeyframeExtractor(Node):
             rgb_writer.release()
             depth_writer.release()
 
-            try:
-                self.tmp_rgb_video.unlink(missing_ok=True)
-                self.tmp_depth_video.unlink(missing_ok=True)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to remove temp videos: {e}")
-
             for local_idx, kf in enumerate(episode_keyframes):
                 frame = get_frame_from_video(rgb_cap, kf.frame_idx)
                 if frame is None:
                     continue
-                dst = (
-                    episode_dir
-                    / f"kf_{local_idx:04d}_{kf.reason}_{kf.frame_idx:06d}.jpg"
-                )
+                dst = episode_dir / f"kf_{local_idx:04d}_{kf.reason}_{kf.frame_idx:06d}.jpg"
                 cv2.imwrite(str(dst), frame)
 
         metadata = []
@@ -415,6 +391,12 @@ class KeyframeExtractor(Node):
         rgb_cap.release()
         depth_cap.release()
 
+        try:
+            self.tmp_rgb_video.unlink(missing_ok=True)
+            self.tmp_depth_video.unlink(missing_ok=True)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to remove temp videos: {e}")
+
         json_path = self.output_dir / "keyframes.json"
         with open(json_path, "w") as f:
             json.dump(metadata, f, indent=2)
@@ -440,9 +422,7 @@ class KeyframeExtractor(Node):
 
         for kf in keyframes:
             color = color_map.get(kf.reason, "white")
-            plt.scatter(
-                kf.pose["x"], kf.pose["y"], c=color, s=80, zorder=5, label=kf.reason
-            )
+            plt.scatter(kf.pose["x"], kf.pose["y"], c=color, s=80, zorder=5, label=kf.reason)
 
         handles, labels = plt.gca().get_legend_handles_labels()
         by_label = dict(zip(labels, handles))

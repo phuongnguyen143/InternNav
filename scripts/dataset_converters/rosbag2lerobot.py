@@ -1,133 +1,140 @@
+"""
+Convert keyframe_output episodes to LeRobot v2.1 NavDP format (1LXtFkjw3qL-style).
+
+Output layout:
+  {lerobot_out}/{scene_id}/
+    meta/info.json, episodes.jsonl, tasks.jsonl, episodes_stats.jsonl
+    data/chunk-*/episode_*.parquet
+    videos/chunk-*/observation.images.rgb/episode_*.mp4
+"""
+
+import argparse
 import json
+import shutil
 import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import datasets
 import numpy as np
 import torch
-import shutil
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import datasets
-
-from PIL import Image
 from datasets import concatenate_datasets
-import sys
 from loguru import logger
+from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot/src")
+_INSTR_GEN = Path(__file__).resolve().parents[1] / "instruction_generator"
+sys.path.insert(0, str(_INSTR_GEN))
+
+from floor_pose import (  # noqa: E402
+    FLOOR_CALIBRATION_FILENAME,
+    floor_2d_pose_to_action_matrix,
+    load_floor_calibration,
+)
 
 from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
+    EPISODES_PATH,
+    EPISODES_STATS_PATH,
+    TASKS_PATH,
+    append_jsonlines,
     check_timestamps_sync,
-    embed_images,
     get_episode_data_index,
     hf_transform_to_torch,
     validate_episode_buffer,
-    validate_frame,
-    write_episode,
-    write_episode_stats,
     write_info,
 )
 from lerobot.datasets.video_utils import get_safe_default_codec
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 KEYFRAME_ROOT = Path("./keyframe_output")
-LEROBOT_OUT   = Path("./lerobot_data")
-REPO_NAME     = "nav_keyframes"
+LEROBOT_OUT = Path("./lerobot_data")
+SCENE_ID = "1LXtFkjw3qL"
 
-VIDEO_FPS         = 30    # native FPS of your episode videos
-IMAGE_EXTRACT_FPS = 5     # FPS at which frames are saved into observation.images.*
-                          # e.g. 5 means 1 frame every 0.2 s  (change freely)
-DATASET_FPS       = IMAGE_EXTRACT_FPS   # LeRobot dataset FPS = extracted image FPS
-
-# Target resolution for all stored frames / videos
+DATASET_FPS = 30
 TGT_W, TGT_H = 640, 480
+DEFAULT_CAMERA_INTRINSIC = np.array(
+    [[585.0, 0.0, 320.0], [0.0, 585.0, 240.0], [0.0, 0.0, 1.0]],
+    dtype=np.float32,
+)
+DEFAULT_CAMERA_EXTRINSIC = np.eye(4, dtype=np.float32)
 
 
-def get_features() -> Dict:
-    """
-    Four observation keys, all saved under videos/chunk-XXX/:
-      observation.images.rgb    → folder of PNGs  (extracted at IMAGE_EXTRACT_FPS)
-      observation.images.depth  → folder of PNGs  (extracted at IMAGE_EXTRACT_FPS)
-      observation.video.rgb     → episode_NNNNNN.mp4  (full video)
-      observation.video.depth   → episode_NNNNNN.mp4  (full video)
-    """
-    def _img_info(is_depth: bool) -> dict:
-        return {
-            "video.fps": IMAGE_EXTRACT_FPS,
-            "video.codec": "png",           # images stored as PNG files
-            "video.pix_fmt": "rgb24",
-            "video.is_depth_map": is_depth,
-            "has_audio": False,
-        }
+def get_features(fps: int, include_depth_video: bool = True) -> Dict:
+    """Parquet + optional video keys aligned with InternData-N1 / NavDP."""
+    vid_info = {
+        "video.fps": fps,
+        "video.codec": "libx264",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": False,
+        "has_audio": False,
+    }
+    depth_vid_info = {**vid_info, "video.is_depth_map": True}
 
-    def _vid_info(is_depth: bool) -> dict:
-        return {
-            "video.fps": VIDEO_FPS,
-            "video.codec": "libx264",
-            "video.pix_fmt": "yuv420p",
-            "video.is_depth_map": is_depth,
-            "has_audio": False,
-        }
-
-    return {
-        "observation.images.rgb": {
-            "dtype": "video",          # LeRobot treats image folders as "video"
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": _img_info(False),
-        },
-        "observation.images.depth": {
-            "dtype": "video",
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": _img_info(True),
-        },
-        "observation.video.rgb": {
-            "dtype": "video",
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": _vid_info(False),
-        },
-        "observation.video.depth": {
-            "dtype": "video",
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": _vid_info(True),
-        },
-        "observation.state": {
+    features = {
+        "observation.camera_intrinsic": {
             "dtype": "float32",
-            "shape": (3,),
-            "names": ["x", "y", "yaw"],
+            "shape": (3, 3),
+        },
+        "observation.camera_extrinsic": {
+            "dtype": "float32",
+            "shape": (4, 4),
         },
         "action": {
             "dtype": "float32",
-            "shape": (3,),
-            "names": ["dx", "dy", "dyaw"],
+            "shape": (4, 4),
+        },
+        "observation.images.rgb": {
+            "dtype": "video",
+            "shape": (TGT_H, TGT_W, 3),
+            "names": ["height", "width", "channel"],
+            "info": vid_info,
         },
     }
+    if include_depth_video:
+        features["observation.images.depth"] = {
+            "dtype": "video",
+            "shape": (TGT_H, TGT_W, 3),
+            "names": ["height", "width", "channel"],
+            "info": depth_vid_info,
+        }
+    return features
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def load_keyframes_json(keyframe_root: Path) -> Dict[int, Dict]:
-    json_path = keyframe_root / "keyframes.json"
-    if not json_path.exists():
-        print(f"[WARN] keyframes.json not found at {json_path}, poses will be zero.")
-        return {}
-    with open(json_path) as f:
+def pose_xyyaw_to_matrix(x: float, y: float, yaw: float, z: float = 0.0) -> np.ndarray:
+    rot = Rotation.from_euler("z", yaw).as_matrix().astype(np.float32)
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = rot
+    T[0, 3] = float(x)
+    T[1, 3] = float(y)
+    T[2, 3] = float(z)
+    return T
+
+
+def load_poses_json(keyframe_root: Path) -> Dict[int, Dict]:
+    poses_path = keyframe_root / "poses.json"
+    if not poses_path.exists():
+        raise FileNotFoundError(
+            f"poses.json not found at {poses_path}. Run extract_keyframe first."
+        )
+    with open(poses_path) as f:
         data = json.load(f)
-    return {entry["frame_idx"]: entry for entry in data}
+    return {int(p["frame_idx"]): p for p in data}
 
 
 def parse_frame_idx_from_name(stem: str) -> int:
     return int(stem.split("_")[-1])
 
 
-def normalize_angle(rad: float) -> float:
-    return (rad + np.pi) % (2 * np.pi) - np.pi
-
-
-def delta_yaw(a: float, b: float) -> float:
-    return normalize_angle(b - a)
+def get_episode_frame_range(episode_dir: Path) -> Tuple[int, int]:
+    kf_paths = sorted(episode_dir.glob("kf_*.jpg")) or sorted(episode_dir.glob("kf_*.png"))
+    if not kf_paths:
+        return 0, -1
+    idxs = [parse_frame_idx_from_name(p.stem) for p in kf_paths]
+    return min(idxs), max(idxs)
 
 
 def get_instruction(episode_dir: Path, episode_name: str) -> str:
@@ -156,7 +163,7 @@ def get_instruction(episode_dir: Path, episode_name: str) -> str:
 
     instr_txt = episode_dir / "instructions.txt"
     if instr_txt.exists():
-        lines = [l.strip() for l in instr_txt.read_text().splitlines() if l.strip()]
+        lines = [line.strip() for line in instr_txt.read_text().splitlines() if line.strip()]
         if lines:
             return " ".join(lines)
 
@@ -164,78 +171,161 @@ def get_instruction(episode_dir: Path, episode_name: str) -> str:
     return f"Navigate through {episode_name}"
 
 
-# ── VIDEO UTILITIES ───────────────────────────────────────────────────────────
+def load_camera_intrinsic(path: Optional[str]) -> np.ndarray:
+    if path is None:
+        return DEFAULT_CAMERA_INTRINSIC.copy()
+    p = Path(path)
+    if p.suffix == ".json":
+        data = json.loads(p.read_text())
+        return np.array(data, dtype=np.float32).reshape(3, 3)
+    vals = [float(x) for x in path.replace(",", " ").split()]
+    if len(vals) != 9:
+        raise ValueError("camera_intrinsic must be 9 floats or a JSON file")
+    return np.array(vals, dtype=np.float32).reshape(3, 3)
+
+
+def get_video_frame_count(video_path: Path) -> int:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return n
+
+
 def reencode_video(
     src: Path,
     dst: Path,
+    fps: int,
     resize_wh: Optional[Tuple[int, int]] = None,
 ) -> None:
-    """Re-encode src → dst as libx264/yuv420p, optionally resizing."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     vf_parts = []
     if resize_wh:
         vf_parts.append(f"scale={resize_wh[0]}:{resize_wh[1]}")
-
     cmd = ["ffmpeg", "-y", "-i", str(src)]
     if vf_parts:
         cmd += ["-vf", ",".join(vf_parts)]
-    cmd += ["-vcodec", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast", str(dst)]
-
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        logger.warning(f"Re-encode failed for {src}, falling back to copy.\n"
-                       f"{result.stderr.decode()[:300]}")
-        shutil.copyfile(src, dst)
-
-
-def extract_frames_at_fps(
-    video_path: Path,
-    out_dir: Path,
-    extract_fps: int,
-    ep_index: int,
-    resize_wh: Optional[Tuple[int, int]] = None,
-) -> List[Path]:
-    """
-    Extract frames from video_path at extract_fps into out_dir.
-    Files are named: episode_NNNNNN_FFFFFF.png  (episode index + frame index).
-    Returns sorted list of written PNG paths.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    vf_parts = [f"fps={extract_fps}"]
-    if resize_wh:
-        vf_parts.append(f"scale={resize_wh[0]}:{resize_wh[1]}")
-
-    # Use a temp pattern then rename to the correct naming convention
-    tmp_pattern = str(out_dir / "tmp_%06d.png")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-vf", ",".join(vf_parts),
-        "-q:v", "1",           # highest PNG quality
-        tmp_pattern,
+    cmd += [
+        "-r", str(fps),
+        "-vcodec", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        "-preset", "fast",
+        str(dst),
     ]
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg frame extraction failed for {video_path}:\n"
-            f"{result.stderr.decode()}"
+        logger.warning(
+            f"Re-encode failed for {src}, falling back to copy.\n"
+            f"{result.stderr.decode()[:300]}"
+        )
+        shutil.copyfile(src, dst)
+
+
+def _pose_to_camera_extrinsic(
+    pose: Dict,
+    default_extrinsic: np.ndarray,
+    camera_height: float,
+    warned: list,
+) -> np.ndarray:
+    """Observation camera pose (T_world_cam) — never from floor x,y,yaw."""
+    if "camera_matrix" in pose:
+        return np.array(pose["camera_matrix"], dtype=np.float32).reshape(4, 4)
+
+    if "camera_x" in pose:
+        return pose_xyyaw_to_matrix(
+            float(pose["camera_x"]),
+            float(pose["camera_y"]),
+            float(pose["camera_yaw"]),
+            z=float(pose.get("camera_z", camera_height)),
         )
 
-    # Rename tmp_NNNNNN.png → episode_EEEEEE_FFFFFF.png
-    tmp_files = sorted(out_dir.glob("tmp_*.png"))
-    final_paths = []
-    for frame_idx, tmp_file in enumerate(tmp_files):
-        final_name = f"episode_{ep_index:06d}_{frame_idx:06d}.png"
-        final_path = out_dir / final_name
-        tmp_file.rename(final_path)
-        final_paths.append(final_path)
-
-    return final_paths
+    if not warned[0]:
+        logger.warning(
+            "poses.json missing camera_matrix; using default camera_extrinsic."
+        )
+        warned[0] = True
+    return default_extrinsic.copy()
 
 
-# ── STATS ─────────────────────────────────────────────────────────────────────
+def _pose_to_action_matrix(
+    pose: Dict,
+    floor_plane: Optional[tuple],
+    camera_height: float,
+    warned: list,
+) -> np.ndarray:
+    """NavDP action: floor embodiment only — never from camera_matrix."""
+    if "action_matrix" in pose:
+        return np.array(pose["action_matrix"], dtype=np.float32).reshape(4, 4)
+
+    x = float(pose["x"])
+    y = float(pose["y"])
+    yaw = float(pose["yaw"])
+    z = float(pose.get("z", 0.0))
+    pose_frame = pose.get("pose_frame", "floor")
+
+    if pose_frame == "floor" and floor_plane is not None:
+        return floor_2d_pose_to_action_matrix(x, y, yaw, z, floor_plane)
+
+    if not warned[0]:
+        logger.warning(
+            "poses.json missing action_matrix; building action from floor x,y,yaw "
+            "(legacy fallback)."
+        )
+        warned[0] = True
+    if pose_frame == "floor":
+        z = 0.0
+    else:
+        z = camera_height if z == 0.0 and camera_height != 0.0 else z
+    return pose_xyyaw_to_matrix(x, y, yaw, z=z)
+
+
+def build_frame_records(
+    n_frames: int,
+    start_frame: int,
+    poses_by_frame_idx: Dict[int, Dict],
+    camera_intrinsic: np.ndarray,
+    camera_extrinsic: np.ndarray,
+    camera_height: float,
+    fps: int,
+    floor_plane: Optional[tuple] = None,
+) -> List[Dict]:
+    intrinsic = camera_intrinsic.astype(np.float32)
+    default_extrinsic = camera_extrinsic.astype(np.float32)
+    records = []
+    last_pose = None
+    cam_warn = [False]
+    act_warn = [False]
+
+    for i in range(n_frames):
+        global_idx = start_frame + i
+        pose = poses_by_frame_idx.get(global_idx)
+        if pose is None:
+            if last_pose is None:
+                pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "z": 0.0, "pose_frame": "floor"}
+            else:
+                pose = last_pose
+        else:
+            last_pose = pose
+
+        cam_ext = _pose_to_camera_extrinsic(
+            pose, default_extrinsic, camera_height, cam_warn
+        )
+        action = _pose_to_action_matrix(
+            pose, floor_plane, camera_height, act_warn
+        )
+
+        records.append({
+            "observation.camera_intrinsic": intrinsic.copy(),
+            "observation.camera_extrinsic": cam_ext,
+            "action": action,
+            "timestamp": float(i) / fps,
+        })
+
+    return records
+
+
 def compute_episode_stats(episode_data: dict, features: dict) -> dict:
     ep_stats = {}
     for key, data in episode_data.items():
@@ -243,9 +333,7 @@ def compute_episode_stats(episode_data: dict, features: dict) -> dict:
             continue
         ft = features[key]
         if ft["dtype"] in ("string", "video"):
-            # video keys are stored as path strings — skip array stats
             continue
-        # scalar features
         ep_ft_array = np.array(data)
         if ep_ft_array.ndim == 1:
             if key == "episode_index":
@@ -262,54 +350,105 @@ def compute_episode_stats(episode_data: dict, features: dict) -> dict:
     return ep_stats
 
 
-# ── METADATA SUBCLASS ─────────────────────────────────────────────────────────
 class NavDatasetMetadata(LeRobotDatasetMetadata):
+    @classmethod
+    def create(
+        cls,
+        repo_id: str,
+        fps: int,
+        features: dict,
+        robot_type: str | None = None,
+        root: str | Path | None = None,
+        use_videos: bool = True,
+    ) -> "NavDatasetMetadata":
+        obj = super().create(
+            repo_id=repo_id,
+            fps=fps,
+            features=features,
+            robot_type=robot_type,
+            root=root,
+            use_videos=use_videos,
+        )
+        obj._next_task_index = 0
+        obj._global_image_index = 0
+        return obj
+
     def get_data_file_path(self, ep_index: int) -> Path:
         chunk = self.get_episode_chunk(ep_index)
         return Path("data") / f"chunk-{chunk:03d}" / f"episode_{ep_index:06d}.parquet"
 
     def get_video_file_path(self, ep_index: int, key: str) -> Path:
-        """
-        Full-video keys   (observation.video.*)   → videos/chunk-000/<key>/episode_NNNNNN.mp4
-        Image-folder keys (observation.images.*)  → videos/chunk-000/<key>/   (a directory)
-        """
         chunk = self.get_episode_chunk(ep_index)
-        if key.startswith("observation.video."):
-            return Path("videos") / f"chunk-{chunk:03d}" / key / f"episode_{ep_index:06d}.mp4"
-        else:
-            # image folder — return the directory path (no filename)
-            return Path("videos") / f"chunk-{chunk:03d}" / key
+        return Path("videos") / f"chunk-{chunk:03d}" / key / f"episode_{ep_index:06d}.mp4"
+
+    def register_task_dict(self, task: dict) -> int:
+        task_index = self._next_task_index
+        self._next_task_index += 1
+        self.info["total_tasks"] = self._next_task_index
+        append_jsonlines({"task_index": task_index, "task": task}, self.root / TASKS_PATH)
+        return task_index
 
     def save_episode(
         self,
         episode_index: int,
         episode_length: int,
-        episode_tasks: list,
+        instruction: str,
         episode_stats: dict,
     ) -> None:
         self.info["total_episodes"] += 1
-        self.info["total_frames"]   += episode_length
+        self.info["total_frames"] += episode_length
         chunk = self.get_episode_chunk(episode_index)
         if chunk >= self.total_chunks:
             self.info["total_chunks"] += 1
         self.info["splits"] = {"train": f"0:{self.info['total_episodes']}"}
-        self.info["total_videos"] += len(self.video_keys)
-        if self.video_keys:
-            self.update_video_info()
         write_info(self.info, self.root)
+
+        last_frame = max(0, episode_length - 1)
+        sub_task = {
+            "sub_instruction": instruction,
+            "sub_indexes": [0, last_frame],
+            "revised_sub_instruction": instruction,
+        }
+        sum_task = {
+            "sum_instruction": instruction,
+            "sum_indexes": [0, last_frame],
+        }
+        task_idx_sub = self.register_task_dict(sub_task)
+        task_idx_sum = self.register_task_dict(sum_task)
+
         episode_dict = {
             "episode_index": episode_index,
-            "tasks":  episode_tasks,
+            "tasks": [
+                {**sub_task},
+                {**sum_task},
+            ],
             "length": episode_length,
         }
         self.episodes[episode_index] = episode_dict
-        write_episode(episode_dict, self.root)
+        append_jsonlines(episode_dict, self.root / EPISODES_PATH)
+
+        image_min = self._global_image_index
+        image_max = self._global_image_index + max(0, episode_length - 1)
+        stats_entry = {
+            "episode_index": episode_index,
+            "task_index": {
+                "min": min(task_idx_sub, task_idx_sum),
+                "max": max(task_idx_sub, task_idx_sum),
+                "count": 2,
+            },
+            "image_index": {
+                "min": image_min,
+                "max": image_max,
+                "count": episode_length,
+            },
+        }
+        append_jsonlines(stats_entry, self.root / EPISODES_STATS_PATH)
+        self._global_image_index += episode_length
+
         self.episodes_stats[episode_index] = episode_stats
         self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
-        write_episode_stats(episode_index, episode_stats, self.root)
 
 
-# ── DATASET SUBCLASS ──────────────────────────────────────────────────────────
 class NavDataset(LeRobotDataset):
     @classmethod
     def create(
@@ -332,19 +471,19 @@ class NavDataset(LeRobotDataset):
             root=root,
             use_videos=use_videos,
         )
-        obj.repo_id            = obj.meta.repo_id
-        obj.root               = obj.meta.root
-        obj.revision           = None
-        obj.tolerance_s        = tolerance_s
-        obj.image_writer       = None
-        obj.episode_buffer     = obj.create_episode_buffer()
-        obj.episodes           = None
-        obj.hf_dataset         = obj.create_hf_dataset()
-        obj.image_transforms   = None
-        obj.delta_timestamps   = None
-        obj.delta_indices      = None
+        obj.repo_id = obj.meta.repo_id
+        obj.root = obj.meta.root
+        obj.revision = None
+        obj.tolerance_s = tolerance_s
+        obj.image_writer = None
+        obj.episode_buffer = obj.create_episode_buffer()
+        obj.episodes = None
+        obj.hf_dataset = obj.create_hf_dataset()
+        obj.image_transforms = None
+        obj.delta_timestamps = None
+        obj.delta_indices = None
         obj.episode_data_index = None
-        obj.video_backend      = video_backend or get_safe_default_codec()
+        obj.video_backend = video_backend or get_safe_default_codec()
         return obj
 
     def add_frame(self, frame: dict, task: str, timestamp: float | None = None) -> None:
@@ -371,17 +510,6 @@ class NavDataset(LeRobotDataset):
         self.episode_buffer["size"] += 1
 
     def save_episode(self, files: dict) -> None:
-        """
-        files = {
-            # Full MP4 videos — copied as-is to videos/chunk/observation.video.*/episode_N.mp4
-            "observation.video.rgb":   Path("…/rgb.mp4"),
-            "observation.video.depth": Path("…/depth.mp4"),
-
-            # Image folders — contents copied to videos/chunk/observation.images.*/
-            "observation.images.rgb":   Path("…/rgb_frames/"),
-            "observation.images.depth": Path("…/depth_frames/"),
-        }
-        """
         if not self.episode_buffer:
             return
 
@@ -389,9 +517,9 @@ class NavDataset(LeRobotDataset):
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
         episode_length = episode_buffer.pop("size")
-        tasks          = episode_buffer.pop("task")
-        episode_tasks  = list(set(tasks))
-        episode_index  = episode_buffer["episode_index"]
+        tasks = episode_buffer.pop("task")
+        episode_index = episode_buffer["episode_index"]
+        instruction = tasks[0] if tasks else ""
 
         episode_buffer["index"] = np.arange(
             self.meta.total_frames,
@@ -399,53 +527,35 @@ class NavDataset(LeRobotDataset):
         )
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
-        for task in episode_tasks:
-            if self.meta.get_task_index(task) is None:
-                self.meta.add_task(task)
-        episode_buffer["task_index"] = np.array([self.meta.get_task_index(t) for t in tasks])
+        if self.meta.get_task_index(instruction) is None:
+            self.meta.add_task(instruction)
+        episode_buffer["task_index"] = np.full(
+            (episode_length,), self.meta.get_task_index(instruction)
+        )
 
-        # Stack scalar features
         for key, ft in self.features.items():
             if key in ("index", "episode_index", "task_index") or ft["dtype"] == "video":
                 continue
-            episode_buffer[key] = np.stack(episode_buffer[key]).squeeze()
+            episode_buffer[key] = np.stack(episode_buffer[key])
 
-        # ── Handle all four video/image-folder keys ───────────────────────
         for key, src in files.items():
             src = Path(src)
-            ft  = self.features.get(key, {})
-            if ft.get("dtype") != "video":
+            if self.features.get(key, {}).get("dtype") != "video":
                 continue
-
+            if not src.exists():
+                logger.warning(f"Video not found, skipping: {src}")
+                continue
             dst_rel = self.meta.get_video_file_path(episode_index, key)
-            dst     = self.root / dst_rel
-
-            if key.startswith("observation.video."):
-                # ── Full video: copy MP4 file ─────────────────────────────
-                if not src.exists():
-                    logger.warning(f"Video not found, skipping: {src}")
-                    continue
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(src, dst)
-                # store relative path string for parquet
-                episode_buffer[key] = str(dst_rel)
-
-            elif key.startswith("observation.images."):
-                # ── Image folder: copy all PNGs into dst directory ────────
-                if not src.is_dir():
-                    logger.warning(f"Image dir not found, skipping: {src}")
-                    continue
-                dst.mkdir(parents=True, exist_ok=True)
-                for png in sorted(src.glob("*.png")):
-                    shutil.copy2(png, dst / png.name)
-                # store the relative directory path for parquet
-                episode_buffer[key] = str(dst_rel)
+            dst = self.root / dst_rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            episode_buffer[key] = str(dst_rel)
 
         ep_stats = compute_episode_stats(episode_buffer, self.features)
         self._save_episode_table(episode_buffer, episode_index)
-        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
+        self.meta.save_episode(episode_index, episode_length, instruction, ep_stats)
 
-        ep_data_index    = get_episode_data_index(self.meta.episodes, [episode_index])
+        ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
         check_timestamps_sync(
             episode_buffer["timestamp"],
@@ -458,7 +568,9 @@ class NavDataset(LeRobotDataset):
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
         episode_dict = {key: episode_buffer[key] for key in self.hf_features}
-        ep_dataset   = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
+        ep_dataset = datasets.Dataset.from_dict(
+            episode_dict, features=self.hf_features, split="train"
+        )
         self.hf_dataset = concatenate_datasets([self.hf_dataset, ep_dataset])
         self.hf_dataset.set_transform(hf_transform_to_torch)
         ep_data_path = self.root / self.meta.get_data_file_path(ep_index=episode_index)
@@ -466,176 +578,158 @@ class NavDataset(LeRobotDataset):
         ep_dataset.to_parquet(ep_data_path)
 
 
-# ── POSE LOADING ──────────────────────────────────────────────────────────────
-def load_keyframe_poses(
-    episode_dir: Path,
-    pose_by_frame_idx: Dict[int, Dict],
-    instruction: str,
-    n_frames: int,
-    extract_fps: int = IMAGE_EXTRACT_FPS,
-    video_fps: int   = VIDEO_FPS,
-) -> List[Dict]:
-    """
-    Build one metadata dict per extracted frame.
-    Maps each extracted frame → nearest keyframe in keyframes.json for pose.
-    """
-    kf_paths = sorted(episode_dir.glob("kf_*.jpg")) or sorted(episode_dir.glob("kf_*.png"))
-    kf_idxs  = [parse_frame_idx_from_name(p.stem) for p in kf_paths]
-
-    frames = []
-    for i in range(n_frames):
-        # extracted frame i corresponds to video time i / extract_fps
-        video_frame_idx = int(i * video_fps / extract_fps)
-        nearest_kf      = min(kf_idxs, key=lambda k: abs(k - video_frame_idx)) if kf_idxs else 0
-        meta            = pose_by_frame_idx.get(nearest_kf, {})
-        state = np.array(
-            [meta.get("x", 0.0), meta.get("y", 0.0), meta.get("yaw", 0.0)],
-            dtype=np.float32,
-        )
-        frames.append({
-            "state":       state,
-            "timestamp":   float(i) / extract_fps,
-            "instruction": instruction,
-        })
-
-    # Action = delta pose to next frame
-    for i in range(len(frames)):
-        if i < len(frames) - 1:
-            c = frames[i]["state"]
-            n = frames[i + 1]["state"]
-            action = np.array(
-                [n[0] - c[0], n[1] - c[1], delta_yaw(c[2], n[2])],
-                dtype=np.float32,
-            )
-        else:
-            action = np.zeros(3, dtype=np.float32)
-        frames[i]["action"] = action
-
-    return frames
+def write_navdp_info_json(root: Path, fps: int, total_episodes: int, total_frames: int, total_tasks: int):
+    """Finalize meta/info.json to match 1LXtFkjw3qL sample schema."""
+    info = {
+        "codebase_version": "v2.1",
+        "robot_type": "unknown",
+        "total_episodes": total_episodes,
+        "total_frames": total_frames,
+        "total_tasks": total_tasks,
+        "total_videos": total_episodes,
+        "total_chunks": max(1, (total_episodes - 1) // 1000 + 1) if total_episodes else 1,
+        "chunks_size": 1000,
+        "fps": fps,
+        "splits": {"train": f"0:{total_episodes}"},
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "features": {
+            "observation.camera_intrinsic": {"dtype": "float32", "shape": [3, 3]},
+            "observation.camera_extrinsic": {"dtype": "float32", "shape": [4, 4]},
+            "action": {"dtype": "float32", "shape": [4, 4]},
+        },
+    }
+    write_info(info, root)
 
 
-# ── EPISODE CONVERSION ────────────────────────────────────────────────────────
 def convert_episode(
     episode_dir: Path,
-    pose_by_frame_idx: Dict[int, Dict],
+    poses_by_frame_idx: Dict[int, Dict],
     lerobot_dataset: NavDataset,
+    camera_intrinsic: np.ndarray,
+    camera_extrinsic: np.ndarray,
+    camera_height: float,
+    fps: int,
+    floor_plane: Optional[tuple] = None,
 ) -> bool:
-    """
-    episode_dir/rgb.mp4   ──► videos/chunk-000/observation.images.rgb/   (PNGs @ IMAGE_EXTRACT_FPS)
-                          ──► videos/chunk-000/observation.video.rgb/episode_N.mp4
-    episode_dir/depth.mp4 ──► videos/chunk-000/observation.images.depth/ (PNGs @ IMAGE_EXTRACT_FPS)
-                          ──► videos/chunk-000/observation.video.depth/episode_N.mp4
-    """
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
-    src_rgb   = episode_dir / "rgb.mp4"
+    src_rgb = episode_dir / "rgb.mp4"
     src_depth = episode_dir / "depth.mp4"
-
     if not src_rgb.exists():
         print(f"  [SKIP] No rgb.mp4 in {episode_dir.name}")
         return False
 
     instruction = get_instruction(episode_dir, episode_dir.name)
-    ep_index    = lerobot_dataset.meta.total_episodes
-    resize      = (TGT_W, TGT_H)
+    ep_index = lerobot_dataset.meta.total_episodes
+    start_frame, end_frame = get_episode_frame_range(episode_dir)
+    resize = (TGT_W, TGT_H)
 
     tmp_dir = lerobot_dataset.root / "_tmp" / episode_dir.name
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ── 1. Re-encode videos → consistent codec & resolution ───────────
-        tmp_rgb_vid   = tmp_dir / "rgb.mp4"
-        tmp_depth_vid = tmp_dir / "depth.mp4"
-
-        print(f"  Re-encoding rgb.mp4 …",   end=" ", flush=True)
-        reencode_video(src_rgb, tmp_rgb_vid, resize_wh=resize)
+        tmp_rgb = tmp_dir / "rgb.mp4"
+        print("  Re-encoding rgb.mp4 …", end=" ", flush=True)
+        reencode_video(src_rgb, tmp_rgb, fps=fps, resize_wh=resize)
         print("done")
 
         has_depth = src_depth.exists()
+        tmp_depth = None
         if has_depth:
-            print(f"  Re-encoding depth.mp4 …", end=" ", flush=True)
-            reencode_video(src_depth, tmp_depth_vid, resize_wh=resize)
+            tmp_depth = tmp_dir / "depth.mp4"
+            print("  Re-encoding depth.mp4 …", end=" ", flush=True)
+            reencode_video(src_depth, tmp_depth, fps=fps, resize_wh=resize)
             print("done")
+
+        n_video = get_video_frame_count(tmp_rgb)
+        if end_frame >= start_frame:
+            n_pose_span = end_frame - start_frame + 1
         else:
-            print(f"  [WARN] No depth.mp4 found.")
+            n_pose_span = n_video
+            start_frame, end_frame = 0, n_video - 1
+            print(f"  [WARN] No keyframes in {episode_dir.name}, using frame range 0..{end_frame}")
 
-        # ── 2. Extract frames at IMAGE_EXTRACT_FPS into tmp dirs ──────────
-        tmp_rgb_frames   = tmp_dir / "rgb_frames"
-        tmp_depth_frames = tmp_dir / "depth_frames"
-
-        print(f"  Extracting RGB frames at {IMAGE_EXTRACT_FPS} fps …", end=" ", flush=True)
-        rgb_frame_paths = extract_frames_at_fps(
-            tmp_rgb_vid, tmp_rgb_frames, IMAGE_EXTRACT_FPS, ep_index, resize_wh=resize
-        )
-        n_frames = len(rgb_frame_paths)
-        print(f"{n_frames} frames")
-
-        depth_frame_paths: List[Path] = []
-        if has_depth:
-            print(f"  Extracting depth frames at {IMAGE_EXTRACT_FPS} fps …", end=" ", flush=True)
-            depth_frame_paths = extract_frames_at_fps(
-                tmp_depth_vid, tmp_depth_frames, IMAGE_EXTRACT_FPS, ep_index, resize_wh=resize
+        n_frames = min(n_video, n_pose_span)
+        if n_video != n_pose_span:
+            print(
+                f"  [WARN] Video frames ({n_video}) != pose span ({n_pose_span}), "
+                f"using {n_frames} frames"
             )
-            print(f"{len(depth_frame_paths)} frames")
 
         if n_frames == 0:
-            print(f"  [SKIP] No frames extracted.")
+            print("  [SKIP] No frames.")
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return False
 
-        # ── 3. Build pose metadata (one entry per extracted frame) ────────
-        frame_metas = load_keyframe_poses(
-            episode_dir, pose_by_frame_idx, instruction, n_frames
+        frame_records = build_frame_records(
+            n_frames,
+            start_frame,
+            poses_by_frame_idx,
+            camera_intrinsic,
+            camera_extrinsic,
+            camera_height,
+            fps,
+            floor_plane=floor_plane,
         )
 
-        # ── 4. Add scalar frames to the episode buffer ────────────────────
-        #    NOTE: video/image keys are NOT added via add_frame — they go via files={}
-        print(f"  Adding {n_frames} frames to buffer …", end=" ", flush=True)
-        for meta in frame_metas:
+        print(f"  Adding {n_frames} frames …", end=" ", flush=True)
+        for rec in frame_records:
             lerobot_dataset.add_frame(
                 frame={
-                    "observation.state": meta["state"],
-                    "action":            meta["action"],
+                    "observation.camera_intrinsic": rec["observation.camera_intrinsic"],
+                    "observation.camera_extrinsic": rec["observation.camera_extrinsic"],
+                    "action": rec["action"],
                 },
-                task=meta["instruction"],
-                timestamp=meta["timestamp"],
+                task=instruction,
+                timestamp=rec["timestamp"],
             )
         print("done")
 
-        # ── 5. Save episode — pass all four paths ─────────────────────────
-        files = {
-            # Full videos → observation.video.*
-            "observation.video.rgb":    tmp_rgb_vid,
-            # Extracted image folders → observation.images.*
-            "observation.images.rgb":   tmp_rgb_frames,
-        }
-        if has_depth:
-            files["observation.video.depth"]   = tmp_depth_vid
-            files["observation.images.depth"]  = tmp_depth_frames
+        files = {"observation.images.rgb": tmp_rgb}
+        if has_depth and tmp_depth is not None:
+            files["observation.images.depth"] = tmp_depth
 
         lerobot_dataset.save_episode(files=files)
-
-        # ── 6. Clean up tmp ───────────────────────────────────────────────
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
         ep_idx = lerobot_dataset.meta.total_episodes - 1
         print(
-            f"  ✓ {episode_dir.name} → lerobot episode {ep_idx:06d}"
-            f"  ({n_frames} extracted frames @ {IMAGE_EXTRACT_FPS} fps, {TGT_W}×{TGT_H})"
+            f"  ✓ {episode_dir.name} → episode {ep_idx:06d} "
+            f"({n_frames} frames @ {fps} fps, global frames {start_frame}-{start_frame + n_frames - 1})"
         )
         return True
 
-    except Exception as e:
+    except Exception:
         lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise e
+        raise
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+def resolve_floor_plane(
+    keyframe_root: Path,
+    floor_calibration: Optional[Path],
+) -> Optional[tuple]:
+    cal_path = floor_calibration
+    if cal_path is None:
+        cal_path = keyframe_root / FLOOR_CALIBRATION_FILENAME
+    if not cal_path.exists():
+        return None
+    cal = load_floor_calibration(cal_path)
+    print(f"Loaded floor calibration from {cal_path}")
+    return cal["floor_plane"]
+
+
 def main(
-    keyframe_root: Path = KEYFRAME_ROOT,
-    lerobot_out:   Path = LEROBOT_OUT,
-    repo_name:     str  = REPO_NAME,
+    keyframe_root: Path,
+    lerobot_out: Path,
+    scene_id: str,
+    fps: int,
+    camera_intrinsic: np.ndarray,
+    camera_extrinsic: np.ndarray,
+    camera_height: float,
+    overwrite: bool,
+    floor_calibration: Optional[Path] = None,
 ) -> None:
     episodes_dir = keyframe_root / "episodes"
     if not episodes_dir.exists():
@@ -648,57 +742,117 @@ def main(
     if not episode_dirs:
         raise FileNotFoundError(f"No episode_ folders in {episodes_dir}")
 
+    scene_root = lerobot_out / scene_id
+    if scene_root.exists():
+        if overwrite:
+            shutil.rmtree(scene_root)
+        else:
+            raise FileExistsError(
+                f"Output exists: {scene_root}. Pass --overwrite to replace."
+            )
+
     print(f"Found {len(episode_dirs)} episodes")
-    print(f"Image extract FPS : {IMAGE_EXTRACT_FPS}  (change IMAGE_EXTRACT_FPS in CONFIG)")
-    print(f"Video native FPS  : {VIDEO_FPS}")
-    print(f"Target resolution : {TGT_W}×{TGT_H}")
+    print(f"Scene ID          : {scene_id}")
+    print(f"FPS               : {fps}")
+    print(f"Resolution        : {TGT_W}×{TGT_H}")
+    print(f"Output            : {scene_root}")
 
-    pose_by_frame_idx = load_keyframes_json(keyframe_root)
-    print(f"Loaded pose metadata for {len(pose_by_frame_idx)} keyframes")
+    poses_by_frame_idx = load_poses_json(keyframe_root)
+    print(f"Loaded {len(poses_by_frame_idx)} poses from poses.json")
 
+    floor_plane = resolve_floor_plane(keyframe_root, floor_calibration)
+    if floor_plane is not None:
+        print(
+            "Pose/action split: camera_extrinsic <- camera_matrix, "
+            "action <- action_matrix (floor embodiment)"
+        )
+    else:
+        print(
+            "No floor_calibration.json — action fallback from floor x,y,yaw; "
+            "set camera_odom_file in extract_keyframe for camera_extrinsic"
+        )
+
+    features = get_features(fps, include_depth_video=True)
     lerobot_dataset = NavDataset.create(
-        repo_id=repo_name,
-        root=lerobot_out / repo_name,
-        robot_type="mobile_robot",
-        fps=DATASET_FPS,
+        repo_id=scene_id,
+        root=scene_root,
+        robot_type="unknown",
+        fps=fps,
         use_videos=True,
-        features=get_features(),
+        features=features,
     )
 
     success = 0
     for ep_dir in episode_dirs:
         print(f"\n[{ep_dir.name}]")
         try:
-            ok = convert_episode(ep_dir, pose_by_frame_idx, lerobot_dataset)
-            if ok:
+            if convert_episode(
+                ep_dir,
+                poses_by_frame_idx,
+                lerobot_dataset,
+                camera_intrinsic,
+                camera_extrinsic,
+                camera_height,
+                fps,
+                floor_plane=floor_plane,
+            ):
                 success += 1
         except Exception as e:
             print(f"  ✗ FAILED: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+
+            traceback.print_exc()
+
+    meta = lerobot_dataset.meta
+    write_navdp_info_json(
+        scene_root,
+        fps=fps,
+        total_episodes=meta.total_episodes,
+        total_frames=meta.total_frames,
+        total_tasks=getattr(meta, "_next_task_index", meta.info.get("total_tasks", 0)),
+    )
 
     sep = "=" * 60
     print(f"\n{sep}")
     print(f"Converted {success}/{len(episode_dirs)} episodes")
-    print(f"Output → {lerobot_out / repo_name}")
+    print(f"Output → {scene_root}")
     print(sep)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Convert episode videos to LeRobot format")
-    parser.add_argument("--keyframe_root",     type=str, default=str(KEYFRAME_ROOT))
-    parser.add_argument("--lerobot_out",       type=str, default=str(LEROBOT_OUT))
-    parser.add_argument("--repo_name",         type=str, default=REPO_NAME)
-    parser.add_argument("--image_extract_fps", type=int, default=IMAGE_EXTRACT_FPS,
-                        help="FPS at which frames are saved into observation.images.* folders")
+    parser = argparse.ArgumentParser(
+        description="Convert keyframe episodes to LeRobot NavDP format (1LXtFkjw3qL-style)"
+    )
+    parser.add_argument("--keyframe_root", type=str, default=str(KEYFRAME_ROOT))
+    parser.add_argument("--lerobot_out", type=str, default=str(LEROBOT_OUT))
+    parser.add_argument("--scene_id", type=str, default=SCENE_ID)
+    parser.add_argument("--fps", type=int, default=DATASET_FPS)
+    parser.add_argument(
+        "--camera_intrinsic",
+        type=str,
+        default=None,
+        help="9 comma-separated floats or path to JSON 3x3 matrix",
+    )
+    parser.add_argument("--camera_height", type=float, default=0.0)
+    parser.add_argument(
+        "--floor_calibration",
+        type=str,
+        default=None,
+        help="Path to floor_calibration.json (default: <keyframe_root>/floor_calibration.json)",
+    )
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    IMAGE_EXTRACT_FPS = args.image_extract_fps
-    DATASET_FPS       = IMAGE_EXTRACT_FPS
+    floor_cal = Path(args.floor_calibration) if args.floor_calibration else None
 
     main(
         keyframe_root=Path(args.keyframe_root),
         lerobot_out=Path(args.lerobot_out),
-        repo_name=args.repo_name,
+        scene_id=args.scene_id,
+        fps=args.fps,
+        camera_intrinsic=load_camera_intrinsic(args.camera_intrinsic),
+        camera_extrinsic=DEFAULT_CAMERA_EXTRINSIC.copy(),
+        camera_height=args.camera_height,
+        overwrite=args.overwrite,
+        floor_calibration=floor_cal,
     )

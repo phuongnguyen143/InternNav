@@ -73,7 +73,7 @@ tmux split-window -v -t $SESSION:0.1
 tmux select-layout -t $SESSION even-vertical
 
 tmux send-keys -t $SESSION:0.0 \
-  "$CONDA_INIT && ros2 bag play $BAG_PATH --rate 3" Enter
+  "$CONDA_INIT && ros2 bag play $BAG_PATH --rate 5" Enter
 
 tmux send-keys -t $SESSION:0.1 \
   "$CONDA_INIT && cd $WORK_DIR && python3 trajectory_publishers.py floor --ros-args -p floor_trajectory_file:=$FLOOR_TRAJ" Enter

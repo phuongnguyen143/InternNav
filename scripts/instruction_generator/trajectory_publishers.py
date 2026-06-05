@@ -57,14 +57,14 @@ class OdomTxtPublisher(Node):
         self.declare_parameter('enable_timer_playback', False)
         self.declare_parameter('timer_loop', False)
         self.declare_parameter('rgb_topic', DEFAULT_RGB_TOPIC)
-        odom_file   = self.get_parameter('odom_file').value
-        self.frame_id       = self.get_parameter('frame_id').value
+        odom_file = self.get_parameter('odom_file').value
+        self.frame_id = self.get_parameter('frame_id').value
         self.child_frame_id = self.get_parameter('child_frame_id').value
-        publish_rate        = self.get_parameter('publish_rate_hz').value
-        max_dt              = self.get_parameter('max_time_diff').value
-        self.enable_timer    = self.get_parameter('enable_timer_playback').value
-        self.timer_loop      = self.get_parameter('timer_loop').value
-        rgb_topic           = self.get_parameter('rgb_topic').value
+        publish_rate = self.get_parameter('publish_rate_hz').value
+        max_dt = self.get_parameter('max_time_diff').value
+        self.enable_timer = self.get_parameter('enable_timer_playback').value
+        self.timer_loop = self.get_parameter('timer_loop').value
+        rgb_topic = self.get_parameter('rgb_topic').value
 
         if not odom_file:
             self.get_logger().error('odom_file parameter is required!')
@@ -77,10 +77,10 @@ class OdomTxtPublisher(Node):
 
         qos = make_qos_best_effort()
 
-        self.odom_pub    = self.create_publisher(Odometry, '/odom_txt/odometry', 10)
-        self.path_pub    = self.create_publisher(PathMsg, '/odom_txt/path', 10)
+        self.odom_pub = self.create_publisher(Odometry, '/odom_txt/odometry', 10)
+        self.path_pub = self.create_publisher(PathMsg, '/odom_txt/path', 10)
         self.matched_pub = self.create_publisher(Odometry, '/odom_txt/matched', 10)
-        self.xy_yaw_pub  = self.create_publisher(Pose2D, '/odom_txt/xy_yaw', 10)
+        self.xy_yaw_pub = self.create_publisher(Pose2D, '/odom_txt/xy_yaw', 10)
         self.xy_yaw_timer_pub = self.create_publisher(Pose2D, '/odom_txt/xy_yaw_timer', 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
@@ -93,21 +93,14 @@ class OdomTxtPublisher(Node):
         if self.enable_timer:
             period = 1.0 / publish_rate
             self.timer = self.create_timer(period, self._timer_callback)
-            self.get_logger().info(
-                f'Timer playback enabled at {publish_rate:.1f} Hz '
-                f'(loop={self.timer_loop})'
-            )
+            self.get_logger().info(f'Timer playback enabled at {publish_rate:.1f} Hz ' f'(loop={self.timer_loop})')
         else:
-            self.get_logger().info(
-                'Timer playback disabled; /odom_txt/xy_yaw is RGB-matched only'
-            )
+            self.get_logger().info('Timer playback disabled; /odom_txt/xy_yaw is RGB-matched only')
 
         self._matched_count = 0
-        self._missed_count  = 0
+        self._missed_count = 0
 
-        self.get_logger().info(
-            f'OdomTxtPublisher ready. '
-            f'{len(self.entries)} entries loaded.')
+        self.get_logger().info(f'OdomTxtPublisher ready. ' f'{len(self.entries)} entries loaded.')
 
     def _build_path_msg(self) -> PathMsg:
         msg = PathMsg()
@@ -129,9 +122,9 @@ class OdomTxtPublisher(Node):
         msg = Odometry()
         if stamp is None:
             stamp = self.get_clock().now().to_msg()
-        msg.header.stamp    = stamp
+        msg.header.stamp = stamp
         msg.header.frame_id = self.frame_id
-        msg.child_frame_id  = self.child_frame_id
+        msg.child_frame_id = self.child_frame_id
 
         msg.pose.pose.position.x = entry.x
         msg.pose.pose.position.y = entry.y
@@ -144,9 +137,9 @@ class OdomTxtPublisher(Node):
 
     def _broadcast_tf(self, entry: OdomEntry, stamp):
         t = TransformStamped()
-        t.header.stamp    = stamp
+        t.header.stamp = stamp
         t.header.frame_id = self.frame_id
-        t.child_frame_id  = self.child_frame_id
+        t.child_frame_id = self.child_frame_id
         t.transform.translation.x = x
         t.transform.translation.y = y
         t.transform.translation.z = z
@@ -188,10 +181,7 @@ class OdomTxtPublisher(Node):
         if matched is None:
             self._missed_count += 1
             if self._missed_count % 10 == 1:
-                self.get_logger().warn(
-                    f'No odom match for RGB ts={rgb_ts:.3f} '
-                    f'(missed={self._missed_count})'
-                )
+                self.get_logger().warn(f'No odom match for RGB ts={rgb_ts:.3f} ' f'(missed={self._missed_count})')
             return
 
         self._matched_count += 1
@@ -258,13 +248,10 @@ class FloorTrajectoryPublisher(Node):
         self.path_pub = self.create_publisher(PathMsg, "/odom_txt/path", 10)
         self.path_msg = self._build_path_msg()
 
-        self.rgb_sub = self.create_subscription(
-            CompressedImage, rgb_topic, self._rgb_callback, qos
-        )
+        self.rgb_sub = self.create_subscription(CompressedImage, rgb_topic, self._rgb_callback, qos)
 
         self.get_logger().info(
-            f"FloorTrajectoryPublisher ready: {len(self.entries)} entries, "
-            f"no PCD estimation at startup."
+            f"FloorTrajectoryPublisher ready: {len(self.entries)} entries, " f"no PCD estimation at startup."
         )
 
     @staticmethod
@@ -313,9 +300,7 @@ class FloorTrajectoryPublisher(Node):
         if matched is None:
             self._missed_count += 1
             if self._missed_count % 10 == 1:
-                self.get_logger().warn(
-                    f"No floor match for RGB ts={rgb_ts:.3f} (missed={self._missed_count})"
-                )
+                self.get_logger().warn(f"No floor match for RGB ts={rgb_ts:.3f} (missed={self._missed_count})")
             return
 
         self._matched_count += 1

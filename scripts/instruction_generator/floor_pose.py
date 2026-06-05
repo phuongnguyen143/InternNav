@@ -271,13 +271,8 @@ def init_floor_from_pcd(
     """
     pcd_path = Path(pcd_path)
     print(f"[floor] Estimating floor from {pcd_path} ...")
-    floor_plane, floor_normal, floor_point, inliers, up_axis = estimate_floor_local(
-        pcd_path
-    )
-    print(
-        f"[floor] plane={floor_plane} | inliers={len(inliers):,} | "
-        f"normal={floor_normal}"
-    )
+    floor_plane, floor_normal, floor_point, inliers, up_axis = estimate_floor_local(pcd_path)
+    print(f"[floor] plane={floor_plane} | inliers={len(inliers):,} | " f"normal={floor_normal}")
 
     cal_path = None
     if calibration_dir is not None:

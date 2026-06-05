@@ -1,9 +1,9 @@
 import argparse
 import gc
 import json
+import re
 import sys
 import torch
-import os
 
 from pathlib import Path
 from PIL import Image
@@ -16,15 +16,50 @@ from transformers import (
 
 from prompts import TRAJECTORY_PROMPT_BEFORE, TRAJECTORY_PROMPT_AFTER
 
-
 DEFAULT_MAX_NEW_TOKENS = 96
-DEFAULT_WINDOW_SIZE = 8
+DEFAULT_WINDOW_SIZE = 4
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
 DEFAULT_ROOT_DIR = Path(
     "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes"
 )
 DEFAULT_DEVICE = "cuda:0"
+
+_KEYFRAME_FRAME_IDX_RE = re.compile(r"_(\d{6})\.(?:jpg|png)$", re.IGNORECASE)
+
+
+def parse_keyframe_frame_idx(path: Path) -> int | None:
+    match = _KEYFRAME_FRAME_IDX_RE.search(path.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def collect_keyframe_paths(episode_dir: Path) -> list[Path]:
+    """Return keyframe images sorted by global frame index, deduplicated."""
+    paths = list(episode_dir.glob("kf_*.jpg")) + list(episode_dir.glob("kf_*.png"))
+    by_frame_idx: dict[int, Path] = {}
+    skipped = 0
+
+    for path in paths:
+        frame_idx = parse_keyframe_frame_idx(path)
+        if frame_idx is None:
+            skipped += 1
+            continue
+        by_frame_idx[frame_idx] = path
+
+    if skipped:
+        print(f"  Warning: skipped {skipped} keyframe file(s) with unparseable names")
+
+    if len(paths) > len(by_frame_idx):
+        dropped = len(paths) - len(by_frame_idx) - skipped
+        if dropped:
+            print(
+                f"  Warning: deduplicated {dropped} duplicate keyframe(s) "
+                f"({len(paths)} files -> {len(by_frame_idx)} unique frames)"
+            )
+
+    return [by_frame_idx[i] for i in sorted(by_frame_idx)]
 
 
 def parse_args():
@@ -88,7 +123,9 @@ class LlavaOnevisionLocal:
         self.max_new_tokens = max_new_tokens
         self.repetition_penalty = repetition_penalty
 
-        self.processor = LlavaOnevisionProcessor.from_pretrained(model_path, local_files_only=True, use_fast=True)
+        self.processor = LlavaOnevisionProcessor.from_pretrained(
+            model_path, local_files_only=True, use_fast=True
+        )
         self.processor.tokenizer.padding_side = "left"
         self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_path,
@@ -115,7 +152,9 @@ class LlavaOnevisionLocal:
                 ),
             }
         ]
-        text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+        text_prompt = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
         inputs = self.processor(images=images, text=text_prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
@@ -151,12 +190,14 @@ def load_images(image_paths):
 
 
 def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int):
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"EPISODE: {episode_dir.name}")
 
-    frame_paths = sorted(episode_dir.glob("kf_*.jpg"))
-    if len(frame_paths) == 0:
-        frame_paths = sorted(episode_dir.glob("kf_*.png"))
+    for stale in (episode_dir / "instructions.json", episode_dir / "instructions.txt"):
+        if stale.exists():
+            stale.unlink()
+
+    frame_paths = collect_keyframe_paths(episode_dir)
 
     if len(frame_paths) == 0:
         print("No keyframe images found, skipping.")
@@ -165,7 +206,10 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
     print(f"Found {len(frame_paths)} keyframe images, window_size={window_size}")
 
     # chunk into non-overlapping windows: [0:8], [8:16], [16:24], ...
-    chunks = [frame_paths[i: i + window_size] for i in range(0, len(frame_paths), window_size)]
+    chunks = [
+        frame_paths[i : i + window_size]
+        for i in range(0, len(frame_paths), window_size)
+    ]
     print(f"Total chunks: {len(chunks)}")
 
     results = []
@@ -173,7 +217,9 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
     for chunk_idx, chunk_paths in enumerate(chunks):
         start = chunk_idx * window_size
         end = start + len(chunk_paths) - 1
-        print(f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)")
+        print(
+            f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)"
+        )
 
         images = load_images(chunk_paths)
         if len(images) == 0:
@@ -184,12 +230,14 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
             instruction = llava.generate(images=images)
             print(f"  → {instruction}")
 
-            results.append({
-                "chunk_idx": chunk_idx,
-                "frame_range": f"{start}-{end}",
-                "frames": [p.name for p in chunk_paths],
-                "instruction": instruction,
-            })
+            results.append(
+                {
+                    "chunk_idx": chunk_idx,
+                    "frame_range": f"{start}-{end}",
+                    "frames": [p.name for p in chunk_paths],
+                    "instruction": instruction,
+                }
+            )
 
         except Exception as e:
             print(f"  FAILED: {e}")
@@ -210,7 +258,9 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
     save_txt = episode_dir / "instructions.txt"
     with open(save_txt, "w") as f:
         for item in results:
-            f.write(f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n")
+            f.write(
+                f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n"
+            )
 
     print(f"\nSaved {len(results)} chunk instructions:")
     print(f"  {save_json}")
@@ -230,15 +280,28 @@ def resolve_input_path(input_arg: str | None, root_dir: Path) -> Path | None:
     return input_path
 
 
-def run_episodes(input_path: Path | None, llava: LlavaOnevisionLocal, window_size: int, root_dir: Path):
+def run_episodes(
+    input_path: Path | None,
+    llava: LlavaOnevisionLocal,
+    window_size: int,
+    root_dir: Path,
+):
     if input_path is None:
         episode_dirs = sorted(
-            [x for x in root_dir.iterdir() if x.is_dir() and x.name.startswith("episode_")]
+            [
+                x
+                for x in root_dir.iterdir()
+                if x.is_dir() and x.name.startswith("episode_")
+            ]
         )
         print(f"Found {len(episode_dirs)} episodes in {root_dir}")
     else:
         episode_dirs = sorted(
-            [x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")]
+            [
+                x
+                for x in input_path.iterdir()
+                if x.is_dir() and x.name.startswith("episode_")
+            ]
         )
         if episode_dirs:
             print(f"Found {len(episode_dirs)} episodes in {input_path}")
@@ -264,4 +327,6 @@ if __name__ == "__main__":
     )
 
     input_path = resolve_input_path(args.input, args.root_dir)
-    run_episodes(input_path, llava, window_size=args.window_size, root_dir=args.root_dir)
+    run_episodes(
+        input_path, llava, window_size=args.window_size, root_dir=args.root_dir
+    )

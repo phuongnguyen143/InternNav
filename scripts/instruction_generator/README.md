@@ -13,7 +13,7 @@ Keyframe Extraction  →  Subclip Division  →  Instruction Generation  →  Su
 ```
 
 1. **Keyframe Extraction** — detects and saves key navigation moments from real-time RGB and odometry streams using turn and distance thresholds
-2. **Subclip Division** — groups keyframes into episodes of 30 and splits the raw frames between each keyframe pair into structured subclips
+2. **Subclip Division** — groups keyframes into episodes of 10 and splits the raw frames between each keyframe pair into structured subclips
 3. **Instruction Generation** — generates per-subclip navigation instructions using LLaVA by interleaving image frames inside the prompt
 4. **Summarization** — consolidates all subclip instructions into a single long-horizon instruction using Qwen2-72B
 
@@ -50,9 +50,9 @@ keyframe_output/
         ├── subclip_00/         # Raw frames between keyframe 0 and 1
         ├── subclip_01/         # Raw frames between keyframe 1 and 2
         ├── ...
-        ├── instructions.json   # Per-group instructions with metadata
-        ├── instructions_raw.txt  # Raw per-subclip instructions from LLaVA
-        └── instructions.txt    # Final summarized long-horizon instruction
+        ├── kf_*.jpg            # Keyframe images (up to ~11 per episode)
+        ├── instructions.json   # Per-chunk instructions with metadata
+        └── instructions.txt    # Per-chunk instructions from LLaVA (one line per chunk)
 ```
 
 ---
@@ -144,7 +144,10 @@ python ../dataset_converters/rosbag2lerobot.py --keyframe_root ./keyframe_output
 | `curvature_thresh_deg` | 25.0 | Lower = more keyframes on curves |
 | `max_dist_between_keyframes` | 6.0 m | Lower = denser keyframes |
 | `min_dist_between_keyframes` | 3.0 m | Higher = fewer keyframes |
-| `DEFAULT_KEYFRAMES_PER_EPISODE` | 30 | Keyframes per episode |
+| `DEFAULT_KEYFRAMES_PER_EPISODE` | 10 | Keyframes per episode (~11 with shared boundary) |
+| `merge_window_frames` | 10 | Higher = fewer keyframes after merge |
+
+Re-running keyframe extraction clears stale `kf_*.jpg` and episode videos in each `episode_XXXX/` folder automatically.
 
 ---
 
@@ -164,18 +167,19 @@ python generate_instruction.py /path/to/episodes/episode_0000
 python generate_instruction.py
 ```
 
-Output per episode:
-- `instructions.json` — full metadata with subclip names, frame counts, and raw model output
-- `instructions_raw.txt` — one instruction per line, used as input to the summarizer
+Output per episode (only keyframes in that episode folder, sorted by global frame index):
+- `instructions.json` — full metadata per chunk (frame range, filenames, model output)
+- `instructions.txt` — one instruction per chunk window, e.g. `[chunk_0000 frames 0-3] ...`
+
+**Re-run after changing extraction settings:** run keyframe extraction first, then `generate_instruction.py`. Existing mixed keyframes from old runs are not fixed by instruction generation alone.
 
 **Configuration** (top of `generate_instruction.py`):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `MODEL_PATH` | `/path/to/llava-...` | Local path to LLaVA model |
-| `SUBCLIPS_PER_INSTRUCTION` | `2` | Subclips grouped per instruction |
-| `FRAMES_PER_SUBCLIP` | `4` | Max frames sampled per subclip |
-| `MAX_NEW_TOKENS` | `96` | Max tokens in generated instruction |
+| `DEFAULT_MODEL_PATH` | local LLaVA path | Local path to LLaVA-OneVision model |
+| `DEFAULT_WINDOW_SIZE` | `4` | Keyframe images per chunk |
+| `DEFAULT_MAX_NEW_TOKENS` | `96` | Max tokens in generated instruction |
 
 ---
 
@@ -223,14 +227,13 @@ Summarize all of them into ONE fluent, long-horizon navigation instruction.
 
 Each episode produces:
 
-**`instructions_raw.txt`** — one instruction per subclip group from LLaVA:
+**`instructions.txt`** — one instruction per chunk from LLaVA (`generate_instruction.py`):
 ```
-[0000] Walk straight ahead, passing the bulletin board on your left, and stop at the staircase.
-[0001] Turn left at the glass door and continue down the corridor toward the exit sign.
-[0002] Walk straight ahead toward the elevator lobby and stop at the reception desk.
+[chunk_0000 frames 0-3] Walk straight ahead, passing the bulletin board on your left...
+[chunk_0001 frames 4-7] Turn left at the glass door and continue down the corridor...
 ```
 
-**`instructions.txt`** — single long-horizon instruction from Qwen2-72B:
+**`summary.txt`** — optional single long-horizon instruction from Qwen2-72B (`summarize_instructions.py`):
 ```
 Walk straight ahead past the bulletin board, turn left at the glass door, continue down
 the corridor past the exit sign, and stop at the reception desk in the elevator lobby.
