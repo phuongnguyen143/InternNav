@@ -17,13 +17,13 @@ from transformers import (
 from prompts import TRAJECTORY_PROMPT_BEFORE, TRAJECTORY_PROMPT_AFTER
 
 DEFAULT_MAX_NEW_TOKENS = 96
-DEFAULT_WINDOW_SIZE = 4
+DEFAULT_WINDOW_SIZE = 6
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
 DEFAULT_ROOT_DIR = Path(
     "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes"
 )
-DEFAULT_DEVICE = "cuda:0"
+DEFAULT_DEVICE = "cuda:1"
 
 _KEYFRAME_FRAME_IDX_RE = re.compile(r"_(\d{6})\.(?:jpg|png)$", re.IGNORECASE)
 
