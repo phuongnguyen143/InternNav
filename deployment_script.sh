@@ -16,6 +16,13 @@ SERVER_PORT="${INTERNNAV_SERVER_PORT:-5801}"
 PROCESS_START_DELAY="${INTERNNAV_PROCESS_START_DELAY:-1}"
 STOP_TIMEOUT="${INTERNNAV_STOP_TIMEOUT:-20}"
 TERM_TIMEOUT="${INTERNNAV_TERM_TIMEOUT:-5}"
+RECORD_BAG=true
+if [[ "${1:-}" == "--no-record" ]]; then
+    RECORD_BAG=false
+elif (( $# )); then
+    echo "Usage: $0 [--no-record]" >&2
+    exit 2
+fi
 
 STARTED_LABELS=()
 
@@ -267,12 +274,14 @@ sleep "${SERVER_START_DELAY}"
 verify_process http_internvla_server "http_internvla_server_new.py"
 wait_for_http_server
 
-run_in_container_detached \
-    rosbag_record \
-    ros2 bag record -o "${BAG_OUTPUT}" "${TOPICS[@]}"
+if [[ "${RECORD_BAG}" == "true" ]]; then
+    run_in_container_detached \
+        rosbag_record \
+        ros2 bag record -o "${BAG_OUTPUT}" "${TOPICS[@]}"
 
-sleep "${PROCESS_START_DELAY}"
-verify_process rosbag_record "ros2 bag record"
+    sleep "${PROCESS_START_DELAY}"
+    verify_process rosbag_record "ros2 bag record"
+fi
 
 run_in_container_detached \
     http_internvla_client \
@@ -294,6 +303,8 @@ verify_process plotjuggler "plotjuggler"
 verify_process rviz2 "rviz2"
 
 echo "InternNav deployment started successfully."
-echo "Bag output: ${BAG_OUTPUT}"
+if [[ "${RECORD_BAG}" == "true" ]]; then
+    echo "Bag output: ${BAG_OUTPUT}"
+fi
 echo "Logs: ${LOG_DIR}"
 ask_to_stop
