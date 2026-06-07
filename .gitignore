@@ -152,3 +152,18 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+
+# Local datasets / real-world samples
+assets/bkhn_data1/
+assets/realworld_sample_data1/
+assets/realworld_sample_data2/
+
+# Docker image exports
+internnav-thor-060626.tar
+internnav-thor-ready-050626.tar.gz
+
+# Accidental local file
+python=3.10
+
+# Notebook test data
+scripts/notebooks/test_data/

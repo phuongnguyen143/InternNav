@@ -156,14 +156,30 @@ def read_jsonl(path):
         return [json.loads(line) for line in f]
 
 
+_DATA_PATH_OVERRIDES = {
+    "traj_data/r2r": os.environ.get("INTERNAV_R2R_DATA_PATH", ""),
+    "traj_data/rxr": os.environ.get("INTERNAV_RXR_DATA_PATH", ""),
+    "traj_data/scalevln": os.environ.get("INTERNAV_SCALEVLN_DATA_PATH", ""),
+}
+
+
 def data_list(dataset_names):
     config_list = []
     for dataset_name in dataset_names:
         sampling_rate = parse_sampling_rate(dataset_name)
+        raw_name = dataset_name
         dataset_name = re.sub(r"%(\d+)$", "", dataset_name)
         if dataset_name in data_dict.keys():
             config = data_dict[dataset_name].copy()
             config["sampling_rate"] = sampling_rate
+            default_path = config["data_path"]
+            override = _DATA_PATH_OVERRIDES.get(default_path, "").strip()
+            if override:
+                config["data_path"] = override
+            rank0_print(
+                f"dataset '{raw_name}': default={default_path} "
+                f"env_override={override or '(none)'} -> resolved={config['data_path']}"
+            )
             config_list.append(config)
         else:
             raise ValueError(f"do not find {dataset_name}")
@@ -181,9 +197,80 @@ DEFAULT_TRAJ_TOKEN = "<traj>"
 local_rank = None
 
 
+def _is_rank0():
+    if local_rank is not None:
+        return local_rank == 0
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
 def rank0_print(*args):
-    if local_rank == 0:
+    if _is_rank0():
         print(*args)
+
+
+def debug_dataset_path(data_path, setting):
+    """Print filesystem and schema checks to diagnose empty datasets."""
+    rank0_print("\n=== Dataset debug ===")
+    rank0_print(f"data_path: {data_path}")
+    rank0_print(f"exists: {os.path.isdir(data_path)}")
+    rank0_print(f"setting: {setting}")
+
+    if not os.path.isdir(data_path):
+        rank0_print("ERROR: data_path is missing or not a directory.")
+        rank0_print("=== End dataset debug ===\n")
+        return
+
+    entries = os.listdir(data_path)
+    scene_dirs = [d for d in entries if os.path.isdir(os.path.join(data_path, d))]
+    tarballs = [f for f in entries if f.endswith(".tar.gz")]
+    rank0_print(f"scene_dirs: {len(scene_dirs)}  tarballs: {len(tarballs)}")
+    if scene_dirs:
+        rank0_print(f"first scenes: {scene_dirs[:5]}")
+    if tarballs and not scene_dirs:
+        rank0_print("HINT: only .tar.gz found — extract scenes before training:")
+        rank0_print(f"  cd {data_path} && for f in *.tar.gz; do tar -xzf \"$f\"; done")
+
+    if not scene_dirs:
+        rank0_print("=== End dataset debug ===\n")
+        return
+
+    scene_path = os.path.join(data_path, scene_dirs[0])
+    episodes_path = os.path.join(scene_path, "meta", "episodes.jsonl")
+    rank0_print(f"probe scene: {scene_dirs[0]}")
+    rank0_print(f"episodes.jsonl exists: {os.path.isfile(episodes_path)}")
+
+    if os.path.isfile(episodes_path):
+        episodes = read_jsonl(episodes_path)
+        rank0_print(f"episodes in probe scene: {len(episodes)}")
+        if episodes:
+            rank0_print(f"first episode keys: {list(episodes[0].keys())}")
+            if "length" not in episodes[0]:
+                rank0_print("WARN: episodes.jsonl missing 'length' (v0.5 format) — loader will fail")
+
+    import pyarrow.parquet as pq
+
+    ep_id = 0
+    parquet_path = os.path.join(scene_path, "data", "chunk-000", f"episode_{ep_id:06d}.parquet")
+    rank0_print(f"probe parquet: {parquet_path}")
+    rank0_print(f"parquet exists: {os.path.isfile(parquet_path)}")
+    if os.path.isfile(parquet_path):
+        table = pq.read_table(parquet_path)
+        columns = table.column_names
+        rank0_print(f"parquet rows: {table.num_rows}")
+        rank0_print(f"parquet columns ({len(columns)}): {columns[:12]}{'...' if len(columns) > 12 else ''}")
+        expected = [
+            "action",
+            f"pose.{setting}",
+            f"goal.{setting}",
+            f"relative_goal_frame_id.{setting}",
+        ]
+        for col in expected:
+            rank0_print(f"  expects {col}: {col in columns}")
+        if "action" not in columns and "observation.action" in columns:
+            rank0_print("WARN: parquet has observation.action but loader expects action — data may need preprocessing")
+    rank0_print("=== End dataset debug ===\n")
 
 
 def preprocess_qwen_2_visual(
@@ -759,6 +846,8 @@ def get_annotations_from_lerobot_data(data_path, setting):
         "episodes": [],
     }
     scene_ids = [d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))]
+    debug_dataset_path(data_path, setting)
+    scene_errors = []
 
     def process_scene(scene_id):
         scene_path = os.path.join(data_path, scene_id)
@@ -814,8 +903,15 @@ def get_annotations_from_lerobot_data(data_path, setting):
                 scene_annotations = future.result()
                 annotations["episodes"].extend(scene_annotations)
             except Exception as e:
-                print(f"Error processing scene {scene_id}: {e}")
+                scene_errors.append((scene_id, str(e)))
+                rank0_print(f"Error processing scene {scene_id}: {e}")
 
+    rank0_print(
+        f"Loaded {len(annotations['episodes'])} episodes from {len(scene_ids)} scenes "
+        f"({len(scene_errors)} scene errors)"
+    )
+    if scene_errors:
+        rank0_print(f"first scene errors: {scene_errors[:3]}")
     return annotations
 
 
@@ -944,7 +1040,16 @@ class NavPixelGoalDataset(Dataset):
             else:
                 rank0_print(f"dataset name: {data}")
 
+            rank0_print(
+                f"dataset {data_path} setting={setting}: "
+                f"raw={len(pixel_goal_list)} turn={len(turn_list)} stop={len(stop_list)} "
+                f"final={len(list_data_dict)} (sampling_rate={sampling_rate})"
+            )
             self.list_data_dict.extend(list_data_dict)
+
+        rank0_print(f"NavPixelGoalDataset total samples: {len(self.list_data_dict)}")
+        if len(self.list_data_dict) == 0:
+            rank0_print("ERROR: NavPixelGoalDataset is empty — check data path and parquet schema above.")
 
         self.num_history = data_args.num_history
         self.idx2actions = {0: 'STOP', 1: "↑", 2: "←", 3: "→", 5: "↓"}
@@ -1375,7 +1480,10 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
         train_datasets.append(VLLNDataset(tokenizer=tokenizer, data_args=data_args))
     if data_args.vln_dataset_use:
         train_datasets.append(NavPixelGoalDataset(tokenizer=tokenizer, data_args=data_args))
+    for i, ds in enumerate(train_datasets):
+        rank0_print(f"train_datasets[{i}] ({type(ds).__name__}): {len(ds)} samples")
     train_dataset = CombinedDataset(train_datasets, shuffle=False)
+    rank0_print(f"CombinedDataset total: {len(train_dataset)} samples")
     if data_args.data_flatten:
         data_collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=tokenizer)
         return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)

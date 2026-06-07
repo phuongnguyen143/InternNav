@@ -1,0 +1,213 @@
+# InternNav refined requirements for Jetson AGX Thor / Linux aarch64
+# Base assumptions:
+#   Python 3.10
+#   Jetson Thor / CUDA 13.x
+#   PyTorch installed from NVIDIA/Jetson-compatible CUDA 13 wheel
+#
+# Install order recommended:
+#   1) install torch/torchvision/torchaudio first from the Jetson/NVIDIA index
+#   2) pip install -r requirements_jetson_thor_refined.txt
+#
+# NOTE:
+# Do NOT keep conda-exported entries like:
+#   package @ file:///home/conda/...
+# They only work on the original build machine.
+
+# =========================
+# Core ML / VLA stack
+# =========================
+accelerate==1.13.0
+transformers==4.51.0
+diffusers==0.32.2
+huggingface_hub==0.36.2
+hf-xet
+safetensors
+tokenizers==0.21.4
+regex
+einops==0.8.1
+ftfy==6.3.1
+
+# =========================
+# Jetson CUDA / PyTorch stack
+# Keep these Jetson-specific versions from your Thor env.
+# If torch install fails through this requirements file,
+# install torch/vision/audio manually first, then rerun pip install.
+# =========================
+cuda-bindings==13.3.1
+cuda-pathfinder==1.5.5
+cuda-toolkit==13.0.2
+nvidia-cublas==13.1.1.3
+nvidia-cuda-cupti==13.0.85
+nvidia-cuda-nvrtc==13.0.88
+nvidia-cuda-runtime==13.0.96
+nvidia-cudnn-cu13==9.20.0.48
+nvidia-cufft==12.0.0.61
+nvidia-cufile==1.15.1.6
+nvidia-curand==10.4.0.35
+nvidia-cusolver==12.0.4.66
+nvidia-cusparse==12.6.3.3
+nvidia-cusparselt-cu13==0.8.1
+nvidia-nccl-cu13==2.29.7
+nvidia-nvjitlink==13.0.88
+nvidia-nvshmem-cu13==3.4.5
+nvidia-nvtx==13.0.85
+
+torch==2.12.0+cu130
+torchvision==0.27.0+cu130
+torchaudio==2.11.0+cu130
+triton==3.7.0
+
+# =========================
+# InternNav source
+# Prefer official repo unless you intentionally use your fork.
+# =========================
+-e git+https://github.com/phuongnguyen143/InternNav.git@daf85b3dc16face3a84c806d03235422823753b4#egg=internnav
+# Alternative official repo:
+# -e git+https://github.com/InternRobotics/InternNav.git@7a5c62400ac45b313d9b709c740b64191556a242#egg=internnav
+
+# =========================
+depth_camera_filtering @ git+https://github.com/naokiyokoyama/depth_camera_filtering.git@39d6e2f391c8b2198a67ad96f94bf6da0acd48a0
+diffusion_policy @ git+https://github.com/real-stanford/diffusion_policy.git@5ba07ac6661db573af695b419a7947ecb704690f
+gym==0.26.2
+gymnasium==0.29.1
+Farama-Notifications==0.0.4
+pyquaternion==0.9.9
+numpy-quaternion==2024.0.13
+cloudpickle
+ConfigArgParse==1.7.5
+tyro==0.9.35
+docstring_parser==0.16
+shtab==1.8.0
+typeguard==4.5.1
+waterbear==2.6.8
+
+# Ray may be hard on aarch64/Jetson. Keep only if your code imports ray.
+ray==2.47.1
+# =========================
+
+# =========================
+# Computer vision / geometry
+# =========================
+numpy==1.26.4
+scipy==1.15.3
+opencv-python-headless==4.11.0.86
+imageio==2.31.5
+imageio-ffmpeg==0.6.0
+pillow==11.3.0
+matplotlib==3.9.4
+open3d==0.19.0
+vtk==9.6.1
+pyarrow==21.0.0
+pandas==2.3.1
+scikit-learn==1.7.2
+joblib==1.5.3
+threadpoolctl==3.6.0
+contourpy
+cycler
+fonttools
+kiwisolver
+pyparsing
+
+# =========================
+# Web/API/server utilities
+# =========================
+fastapi==0.110.3
+starlette==0.37.2
+uvicorn==0.30.6
+python-multipart==0.0.26
+pydantic==2.11.10
+pydantic_core==2.33.2
+pydantic-settings==2.14.1
+pydantic-extra-types==2.11.1
+typing_extensions==4.15.0
+typing-inspection==0.4.2
+anyio
+sniffio
+h11
+httpcore
+httpx==0.26.0
+requests
+urllib3
+certifi
+charset-normalizer
+idna
+PyYAML
+python-dotenv==1.2.2
+
+# =========================
+# Visualization / dashboards / logging
+# =========================
+dash
+Flask
+Werkzeug
+Jinja2
+MarkupSafe
+itsdangerous
+click
+plotly
+retrying
+blinker
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+protobuf
+Markdown
+termcolor==3.3.0
+coloredlogs==15.0.1
+humanfriendly==10.0
+gpustat==1.1.1
+nvidia-ml-py==13.595.45
+nvsmi==0.4.2
+sentry-sdk
+
+# =========================
+# Jupyter / debugging
+# Optional but useful on dev machine.
+# =========================
+ipython
+ipykernel
+jupyter_client
+jupyter_core
+matplotlib-inline
+debugpy
+decorator
+executing
+asttokens
+stack-data
+pure_eval
+jedi
+parso
+pexpect
+ptyprocess
+prompt_toolkit
+Pygments
+traitlets
+tornado
+pyzmq
+wcwidth
+comm
+nest-asyncio
+
+# =========================
+# Common utilities
+# =========================
+filelock
+fsspec
+packaging
+platformdirs
+psutil
+tqdm
+six
+setuptools-scm==10.0.5
+sympy
+mpmath==1.3.0
+networkx
+ninja==1.13.0
+msgpack
+msgpack-numpy==0.4.8
+addict==2.4.0
+tomli==2.4.1
+zipp
+importlib_metadata
+attrs
+exceptiongroup
+annotated-types

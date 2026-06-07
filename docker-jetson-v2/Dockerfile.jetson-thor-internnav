@@ -1,0 +1,138 @@
+# Dockerfile.jetson-thor-internnav
+#
+# Build ARM64:
+#   docker buildx build --platform linux/arm64 --network=host \
+#     -f Dockerfile.jetson-thor-internnav \
+#     -t internnav-thor:humble-arm64 \
+#     --output type=docker,dest=internnav-thor-humble-arm64.tar .
+#
+# Or build directly on Jetson:
+#   docker build --network=host -f Dockerfile.jetson-thor-internnav -t internnav-thor:humble .
+#
+# Run:
+#   docker run --rm -it --runtime nvidia --network=host --ipc=host \
+#     -v $PWD:/root/InternNav \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     internnav-thor:humble
+
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_ROS=true
+
+ENV TZ=Asia/Bangkok \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,video \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=""
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        bzip2 \
+        ca-certificates \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        git-lfs \
+        gnupg2 \
+        locales \
+        libegl1 \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libusb-1.0-0 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        libxrandr2 \
+        libxfixes3 \
+        libxi6 \
+        libxinerama1 \
+        libxcursor1 \
+        libxkbcommon0 \
+        libxkbcommon-x11-0 \
+        libgtk-3-0 \
+        libopenblas-dev \
+        liblapack-dev \
+        libomp-dev \
+        libjpeg-dev \
+        libpng-dev \
+        libtiff-dev \
+        libavcodec-dev \
+        libavformat-dev \
+        libswscale-dev \
+        lsb-release \
+        ninja-build \
+        pkg-config \
+        python-is-python3 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-setuptools \
+        python3-venv \
+        python3-wheel \
+        software-properties-common \
+        wget \
+        build-essential \
+    && locale-gen en_US.UTF-8 || true \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROS 2 Humble for Ubuntu 22.04 / jammy
+RUN if [[ "${INSTALL_ROS}" == "true" ]]; then \
+        add-apt-repository universe \
+        && curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            -o /usr/share/keyrings/ros-archive-keyring.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu jammy main" \
+            > /etc/apt/sources.list.d/ros2.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+            ros-humble-desktop \
+            ros-humble-cv-bridge \
+            ros-humble-message-filters \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+ENV ROS_DISTRO=humble \
+    ROS_VERSION=2 \
+    ROS_PYTHON_VERSION=3 \
+    AMENT_PREFIX_PATH=/opt/ros/humble \
+    PATH=/opt/ros/humble/bin:${PATH} \
+    PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH} \
+    LD_LIBRARY_PATH=/opt/ros/humble/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+WORKDIR /root/InternNav
+
+COPY requirements_jetson_thor_internnav.txt /tmp/requirements_jetson_thor_internnav.txt
+
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && sed -E \
+        -e '/^-e git\+https:\/\/github.com\/InternRobotics\/InternNav.git/d' \
+        -e '/^-e git\+https:\/\/github.com\/phuongnguyen143\/InternNav.git/d' \
+        -e '/^torch==/d' \
+        -e '/^torchvision==/d' \
+        -e '/^torchaudio==/d' \
+        -e '/^triton==/d' \
+        -e '/^cuda-/d' \
+        -e '/^nvidia-/d' \
+        -e '/^open3d==/d' \
+        -e '/^vtk==/d' \
+        -e '/^ray==/d' \
+        -e '/^sympy==/d' \
+        -e '/^mpmath==/d' \
+        /tmp/requirements_jetson_thor_internnav.txt > /tmp/requirements_jetson_thor_internnav.docker.txt \
+    && python3 -m pip install \
+        --ignore-installed \
+        --no-cache-dir \
+        --no-deps \
+        -r /tmp/requirements_jetson_thor_internnav.docker.txt \
+    && git lfs install --skip-repo \
+    && if [[ -f /opt/ros/humble/setup.bash ]]; then echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc; fi
+
+CMD ["/bin/bash"]

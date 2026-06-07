@@ -1,3 +1,4 @@
+import inspect
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -27,6 +28,23 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model_cfg = kwargs.get('model_cfg', None)
+
+    # If transformer version is newer than 4.48.0, use the following code to expose the text_config attributes
+    # def __post_init__(self, **kwargs):
+    #     super().__post_init__(**kwargs)
+    #     self._expose_text_config_attrs()
+
+    # def _expose_text_config_attrs(self):
+    #     """Mirror text_config on the root config for legacy InternVLA checkpoints."""
+    #     text_config = getattr(self, "text_config", None)
+    #     if text_config is None:
+    #         return
+    #     text_config_cls = self.sub_configs["text_config"]
+    #     text_params = list(inspect.signature(text_config_cls.__init__).parameters.keys())
+    #     text_params += ["rope_parameters", "rope_scaling", "rope_theta"]
+    #     for key in text_params:
+    #         if hasattr(text_config, key) and not hasattr(self, key):
+    #             setattr(self, key, getattr(text_config, key))
 
 
 class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):

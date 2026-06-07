@@ -13,6 +13,7 @@ XAUTH_DOCKER="${INTERNNAV_XAUTH_DOCKER:-/tmp/.docker.xauth-internnav}"
 DOCKER_ARGS=(
     --rm
     -it
+    --runtime nvidia
     --gpus all
     --ipc host
     --name "${CONTAINER_NAME}"

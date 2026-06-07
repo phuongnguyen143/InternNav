@@ -28,15 +28,17 @@ from torchvision.transforms import v2
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-from qwenvl_base import replace_qwen2_vl_attention_class
+import qwenvl_base  # noqa: F401  # Trainer/model monkey patches; flash_attn not required unless data_flatten
 from transformers import (
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
     Qwen2VLForConditionalGeneration,
     Qwen2VLImageProcessor,
     Trainer,
+    TrainerCallback,
 )
 
+import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.trainer.internvla_n1_argument import (
@@ -44,6 +46,19 @@ from internnav.trainer.internvla_n1_argument import (
     ModelArguments,
     TrainingArguments,
 )
+from internnav.trainer.jetson_monitor import (
+    JetsonTrainingCallback,
+    format_memory_line,
+    print_jetson_summary,
+    print_status_block,
+)
+
+
+class JetsonTrainerCallback(TrainerCallback, JetsonTrainingCallback):
+    """Bridge HF TrainerCallback with Jetson training/memory logging."""
+
+    def __init__(self):
+        JetsonTrainingCallback.__init__(self)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -73,6 +88,12 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings = model.get_input_embeddings().weight.data
         input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
+
+
+def is_rank0() -> bool:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
 
 
 def set_model(model_args, model):
@@ -122,14 +143,24 @@ def set_model(model_args, model):
         model.model.latent_queries.requires_grad = True
 
 
-def train(attn_implementation="flash_attention_2"):
+def train(attn_implementation="sdpa"):
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
+    lerobot_dataset.local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
+
+    if is_rank0():
+        print_jetson_summary()
+        print("\n=== Training data env ===")
+        print(f"vln_dataset_use: {data_args.vln_dataset_use}")
+        print(f"INTERNAV_R2R_DATA_PATH: {os.environ.get('INTERNAV_R2R_DATA_PATH', '(not set)')}")
+        print(f"INTERNAV_RXR_DATA_PATH: {os.environ.get('INTERNAV_RXR_DATA_PATH', '(not set)')}")
+        print(f"INTERNAV_SCALEVLN_DATA_PATH: {os.environ.get('INTERNAV_SCALEVLN_DATA_PATH', '(not set)')}")
+        print("=== End training data env ===\n")
 
     if data_args.data_augmentation:
         data_args.transform_train = v2.Compose(
@@ -152,6 +183,7 @@ def train(attn_implementation="flash_attention_2"):
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            low_cpu_mem_usage=True,
         )
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -163,6 +195,7 @@ def train(attn_implementation="flash_attention_2"):
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            low_cpu_mem_usage=True,
         )
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -174,6 +207,7 @@ def train(attn_implementation="flash_attention_2"):
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            low_cpu_mem_usage=True,
         )
         data_args.image_processor = Qwen2VLImageProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -181,6 +215,8 @@ def train(attn_implementation="flash_attention_2"):
         data_args.model_type = "qwen2vl"
 
     if data_args.data_flatten:
+        from qwenvl_base import replace_qwen2_vl_attention_class
+
         replace_qwen2_vl_attention_class()
     model.config.use_cache = False
 
@@ -206,22 +242,45 @@ def train(attn_implementation="flash_attention_2"):
         model.get_model().initialize_vision_modules(model_args=model_args)
     set_model(model_args, model)
 
-    if torch.distributed.get_rank() == 0:
+    if is_rank0():
         model.visual.print_trainable_parameters()
         model.model.print_trainable_parameters()
+        print_status_block("after_model_load")
 
     if data_args.data_packing:
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)  # noqa: F821
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(model=model, processing_class=tokenizer, args=training_args, **data_module)
+
+    train_dataset = data_module["train_dataset"]
+    if is_rank0():
+        print(f"train_dataset size: {len(train_dataset)}")
+        print_status_block("after_dataset_load")
+    if len(train_dataset) == 0:
+        raise RuntimeError(
+            "train_dataset has 0 samples. Check dataset debug output above for path/schema issues."
+        )
+
+    trainer = Trainer(
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        callbacks=[JetsonTrainerCallback()],
+        **data_module,
+    )
     from tabulate import tabulate
 
     if trainer.is_world_process_zero():
+        trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in trainer.model.parameters())
+        print(f"trainable params: {trainable_params:,} / {total_params:,}")
+        if trainable_params == 0:
+            print("WARN: all parameters frozen — training will not update weights")
         stat = []
         for i, (n, p) in enumerate(trainer.model.named_parameters()):
             stat.append([i, n, p.shape, p.requires_grad])
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
+        print_status_block("before_train_loop")
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
         trainer.train(resume_from_checkpoint=True)
@@ -236,4 +295,4 @@ def train(attn_implementation="flash_attention_2"):
 
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    train(attn_implementation="sdpa")

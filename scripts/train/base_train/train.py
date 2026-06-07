@@ -1,7 +1,3 @@
-import os
-import sys
-
-sys.path.append('./src/diffusion-policy')
 import logging
 import sys
 from datetime import datetime

@@ -21,7 +21,7 @@ llm=Qwen/Qwen2.5-VL-7B-Instruct
 # Training hyperparameters
 lr=2e-5
 vision_tower_lr=5e-6
-batch_size=2
+batch_size=1
 grad_accum_steps=1
 max_pixels=313600
 min_pixels=3136

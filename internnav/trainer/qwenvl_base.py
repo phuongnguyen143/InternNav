@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from transformers import Trainer
 from transformers.cache_utils import Cache
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -82,6 +81,14 @@ def _flash_attention_forward(
     if softcap is not None:
         flash_kwargs["softcap"] = softcap
 
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+    except ImportError as exc:
+        raise ImportError(
+            "flash_attn is required when --data_flatten True. "
+            "Install flash-attn or run with --data_flatten False and attn_implementation=sdpa."
+        ) from exc
+
     attn_output = flash_attn_varlen_func(
         query_states,
         key_states,
@@ -116,6 +123,14 @@ def _update_causal_mask(
 
 
 def replace_qwen2_vl_attention_class():
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "flash_attn is required when --data_flatten True. "
+            "Install flash-attn or run with --data_flatten False and attn_implementation=sdpa."
+        ) from exc
+
     import transformers
     import transformers.modeling_flash_attention_utils
 

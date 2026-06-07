@@ -4,7 +4,6 @@ import os
 import sys
 from enum import IntEnum
 
-sys.path.append('./src/diffusion-policy')
 import copy
 import itertools
 import random

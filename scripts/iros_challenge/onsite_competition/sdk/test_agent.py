@@ -2,7 +2,7 @@ import importlib.util
 import sys
 
 sys.path.append('.')
-sys.path.append('./src/diffusion-policy/')
+from internnav import DIFFUSION_POLICY_ROOT  # noqa: F401 - registers third_party/diffusion-policy on sys.path
 
 
 import numpy as np

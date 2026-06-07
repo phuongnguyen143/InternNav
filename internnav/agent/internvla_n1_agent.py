@@ -76,7 +76,8 @@ class InternVLAN1Agent(Agent):
         self._start_s2_thread()
 
         # vis debug
-        self.vis_debug = vln_sensor_config['vis_debug']
+        #self.vis_debug = vln_sensor_config['vis_debug']
+        self.vis_debug = vln_sensor_config.get('vis_debug', False)
         if self.vis_debug:
             self.debug_path = vln_sensor_config['vis_debug_path']
             os.makedirs(self.debug_path, exist_ok=True)

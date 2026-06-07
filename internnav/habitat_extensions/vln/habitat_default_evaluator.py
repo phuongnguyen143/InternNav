@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-sys.path.append('./src/diffusion-policy')
+from internnav import DIFFUSION_POLICY_ROOT  # noqa: F401 - registers third_party/diffusion-policy on sys.path
 
 
 # Import for Habitat registry side effects — do not remove
