@@ -6,6 +6,7 @@ import torch
 from internnav.agent import Agent
 from internnav.configs.agent import AgentCfg
 from internnav.model import get_config, get_policy
+from internnav.model.utils.device import resolve_torch_device
 
 
 class SimpleAgent(Agent):
@@ -15,7 +16,7 @@ class SimpleAgent(Agent):
 
     def __init__(self, agent_config: AgentCfg):
         self.agent_config = agent_config
-        self.device = torch.device('cuda', 0)
+        self.device = resolve_torch_device(agent_config.model_settings.get('device'))
 
         # get policy by name
         policy = get_policy(agent_config.model_settings.policy_name)

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from internnav.model.encoder.depth_anything.depth_anything_v2.dpt import DepthAnythingV2
+from internnav.model.utils.device import resolve_torch_device
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -213,14 +214,7 @@ class RGBDBackbone(nn.Module):
         device='cuda:0',
     ):
         super().__init__()
-        # ensure the device is valid
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
+        self.device = resolve_torch_device(device)
         self.finetune = finetune
         self.memory_size = memory_size
         self.image_size = image_size
@@ -316,13 +310,7 @@ class RGBDBackbone(nn.Module):
 class ImageGoalBackbone(nn.Module):
     def __init__(self, image_size=224, embed_size=512, device='cuda:0'):
         super().__init__()
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
+        self.device = resolve_torch_device(device)
         self.image_size = image_size
         self.embed_size = embed_size
         model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
@@ -379,13 +367,7 @@ class ImageGoalBackbone(nn.Module):
 class PixelGoalBackbone(nn.Module):
     def __init__(self, image_size=224, embed_size=512, pixel_channel=7, device='cuda:0'):
         super().__init__()
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
+        self.device = resolve_torch_device(device)
         self.image_size = image_size
         self.embed_size = embed_size
         model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}

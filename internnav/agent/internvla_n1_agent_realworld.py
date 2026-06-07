@@ -33,6 +33,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.utils.device import model_load_dtype, resolve_torch_device
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -50,12 +51,13 @@ class InternVLAN1AsyncAgent:
     """
 
     def __init__(self, args):
-        self.device = torch.device(args.device)
+        self.device = resolve_torch_device(args.device)
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"args.model_path{args.model_path}")
+        load_dtype = model_load_dtype(self.device)
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             args.model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=load_dtype,
             attn_implementation="sdpa",
             device_map={"": self.device},
         )

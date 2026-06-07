@@ -14,6 +14,7 @@ from internnav.agent.base import Agent
 from internnav.configs.agent import AgentCfg
 from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
+from internnav.model.utils.device import resolve_torch_device
 from internnav.model.utils.misc import set_random_seed
 from internnav.model.utils.vln_utils import S1Input, S1Output, S2Input, S2Output
 
@@ -32,7 +33,8 @@ class InternVLAN1Agent(Agent):
         set_random_seed(0)
         vln_sensor_config = self.config.model_settings
         self._model_settings = ModelCfg(**vln_sensor_config)
-        self.device = torch.device(self._model_settings.device)
+        self.device = resolve_torch_device(self._model_settings.device)
+        self._model_settings.device = str(self.device)
         self.mode = getattr(self._model_settings, 'infer_mode', 'sync')
         self.sys2_max_forward_step = getattr(self._model_settings, 'sys2_max_forward_step', 8)
 

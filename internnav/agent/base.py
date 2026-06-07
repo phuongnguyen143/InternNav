@@ -1,6 +1,7 @@
 from typing import Any, Dict
 
 from internnav.configs.agent import AgentCfg
+from internnav.model.utils.device import resolve_torch_device
 
 
 class Agent:
@@ -34,4 +35,7 @@ class Agent:
         """
         Init a agent instance from a config.
         """
+        if config.model_settings is not None:
+            resolved = resolve_torch_device(config.model_settings.get('device'))
+            config.model_settings['device'] = str(resolved)
         return cls.agents[config.model_name](config)

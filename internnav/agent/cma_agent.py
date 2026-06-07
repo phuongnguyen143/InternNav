@@ -9,6 +9,7 @@ from internnav.agent.utils.common import batch_obs, set_seed_model
 from internnav.configs.agent import AgentCfg
 from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
+from internnav.model.utils.device import resolve_torch_device
 
 
 @Agent.register('cma')
@@ -28,7 +29,7 @@ class CmaAgent(Agent):
         set_seed_model(0)
         env_num = getattr(self._model_settings, 'env_num', 1)
         proc_num = getattr(self._model_settings, 'proc_num', 1)
-        self.device = torch.device('cuda', 0)
+        self.device = resolve_torch_device(getattr(self._model_settings, 'device', None))
         policy = get_policy(model_settings.policy_name)
         self.policy = policy.from_pretrained(
             agent_config.ckpt_path,

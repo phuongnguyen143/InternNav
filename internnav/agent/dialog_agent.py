@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 
 from internnav.agent import Agent
 from internnav.configs.agent import AgentCfg
+from internnav.model.utils.device import model_load_dtype, resolve_torch_device
 
 try:
     from depth_camera_filtering import filter_depth
@@ -81,7 +82,11 @@ class DialogAgent(Agent):
         processor.tokenizer = tokenizer
         processor.tokenizer.padding_side = 'left'
 
-        self.device = torch.device('cuda', self.agent_config.model_settings['local_rank'])
+        self.device = resolve_torch_device(
+            self.agent_config.model_settings.get(
+                'device', f"cuda:{self.agent_config.model_settings['local_rank']}"
+            )
+        )
         if self.model_args.mode == 'dual_system':
             raise NotImplementedError("Dual System mode is not supported in DialogAgent.")
         elif self.model_args.mode == 'system2':

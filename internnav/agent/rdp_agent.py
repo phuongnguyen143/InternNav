@@ -9,6 +9,7 @@ from internnav.agent.utils.common import batch_obs, set_seed_model
 from internnav.configs.agent import AgentCfg
 from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model import get_config, get_policy
+from internnav.model.utils.device import resolve_torch_device
 from internnav.model.utils.feature_extract import (
     extract_image_features,
     extract_instruction_tokens,
@@ -41,7 +42,7 @@ class RdpAgent(Agent):
         self._model_settings = ModelCfg(**self._model_settings)
         env_num = getattr(self._model_settings, 'env_num', 1)
         proc_num = getattr(self._model_settings, 'proc_num', 1)
-        self.device = torch.device('cuda', 0)
+        self.device = resolve_torch_device(getattr(self._model_settings, 'device', None))
 
         policy = get_policy(self._model_settings.policy_name)
         self.policy = policy.from_pretrained(

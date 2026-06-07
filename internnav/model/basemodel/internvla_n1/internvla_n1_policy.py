@@ -14,6 +14,7 @@ from internnav.model.basemodel.internvla_n1.internvla_n1 import (
     InternVLAN1ForCausalLM,
     InternVLAN1ModelConfig,
 )
+from internnav.model.utils.device import model_load_dtype, resolve_torch_device
 from internnav.model.utils.vln_utils import (
     S1Output,
     S2Output,
@@ -30,11 +31,13 @@ class InternVLAN1Net(PreTrainedModel):
         super().__init__(config)
         self.model_config = ModelCfg(**config.model_cfg['model'])
 
+        device = resolve_torch_device(self.model_config.device)
+        load_dtype = model_load_dtype(device)
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             self.model_config.model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=load_dtype,
             attn_implementation="sdpa",
-            device_map={"": self.model_config.device},
+            device_map={"": device},
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.model_path, use_fast=True)
