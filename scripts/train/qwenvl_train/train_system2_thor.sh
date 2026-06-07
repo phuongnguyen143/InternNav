@@ -5,12 +5,12 @@
 #   chmod +x scripts/train/qwenvl_train/train_system2_thor.sh
 #   bash scripts/train/qwenvl_train/train_system2_thor.sh
 
-# test freeze all
+# Frozen all no weight updates:
 #   MAX_STEPS=1 bash scripts/train/qwenvl_train/train_system2_thor.sh
-# Train LLM only:
-#   FREEZE_ALL=False TUNE_MM_LLM=True MAX_STEPS=1 bash scripts/train/qwenvl_train/train_system2_thor.sh
-# Train vision + MLP + LLM:
-#   FREEZE_ALL=False TUNE_MM_VISION=True TUNE_MM_MLP=True TUNE_MM_LLM=True bash scripts/train/qwenvl_train/train_system2_thor.sh
+# Train LLM only (lower VRAM):
+#   FREEZE_ALL=False TUNE_MM_VISION=False TUNE_MM_MLP=False TUNE_MM_LLM=True MAX_STEPS=1 bash scripts/train/qwenvl_train/train_system2_thor.sh
+# Full System2 finetune:
+#   FREEZE_ALL=False bash scripts/train/qwenvl_train/train_system2_thor.sh
 
 # DEEPSPEED_CONFIG=scripts/train/qwenvl_train/zero2.json MAX_STEPS=1 bash scripts/train/qwenvl_train/train_system2_thor.sh
 
@@ -75,9 +75,13 @@ if [[ "${FREEZE_ALL:-True}" == "True" ]]; then
     tune_mm_mlp=False
     tune_mm_llm=False
 else
-    tune_mm_vision="${TUNE_MM_VISION:-False}"
-    tune_mm_mlp="${TUNE_MM_MLP:-False}"
-    tune_mm_llm="${TUNE_MM_LLM:-False}"
+    tune_mm_vision="${TUNE_MM_VISION:-True}"
+    tune_mm_mlp="${TUNE_MM_MLP:-True}"
+    tune_mm_llm="${TUNE_MM_LLM:-True}"
+fi
+frozen_smoke=false
+if [[ "${tune_mm_vision}" == "False" && "${tune_mm_mlp}" == "False" && "${tune_mm_llm}" == "False" ]]; then
+    frozen_smoke=true
 fi
 data_augmentation="${DATA_AUGMENTATION:-False}"
 dataloader_workers="${DATALOADER_WORKERS:-0}"
@@ -133,6 +137,9 @@ if [[ "${llm}" == /* ]] && [[ ! -d "${llm}" ]]; then
     exit 1
 fi
 echo "DeepSpeed:     ${deepspeed}"
+if [[ "${frozen_smoke}" == "true" ]]; then
+    echo "Mode:          frozen smoke (no DeepSpeed, no optimizer updates)"
+fi
 echo "Data root:     ${DEFAULT_DATA_ROOT}"
 echo "R2R data path: ${INTERNAV_R2R_DATA_PATH}"
 if [[ ! -d "${INTERNAV_R2R_DATA_PATH}" ]]; then
@@ -149,9 +156,6 @@ echo "Datasets:      ${vln_datasets}"
 echo "Resize:        ${resize_h}x${resize_w}  history=${num_history}  max_len=${model_max_length}"
 echo "Freeze all:    ${FREEZE_ALL:-True}"
 echo "Tune:          vision=${tune_mm_vision} mlp=${tune_mm_mlp} llm=${tune_mm_llm}  aug=${data_augmentation}"
-if [[ "${tune_mm_vision}" == "False" && "${tune_mm_mlp}" == "False" && "${tune_mm_llm}" == "False" ]]; then
-    echo "WARN: all model parts frozen — use for smoke/OOM test only; set FREEZE_ALL=False TUNE_MM_LLM=True to train" >&2
-fi
 echo "Grad accum:    ${grad_accum_steps}"
 echo "Output dir:    ${output_dir}"
 echo "Metrics log:   ${output_dir}/training_metrics.jsonl"
@@ -163,11 +167,16 @@ fi
 
 print_jetson_preflight
 
+deepspeed_args=()
+if [[ "${frozen_smoke}" != "true" ]]; then
+    deepspeed_args=(--deepspeed "${deepspeed}")
+fi
+
 torchrun --nnodes=1 --nproc_per_node=1 \
     --master_addr="${MASTER_ADDR}" \
     --master_port="${MASTER_PORT}" \
     internnav/trainer/internvla_n1_trainer.py \
-    --deepspeed "${deepspeed}" \
+    "${deepspeed_args[@]}" \
     --model_name_or_path "${llm}" \
     --vln_dataset_use "${vln_datasets}" \
     --data_flatten False \

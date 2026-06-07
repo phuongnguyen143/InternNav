@@ -40,7 +40,10 @@ from transformers import (
 
 import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+    InternVLAN1ForCausalLM,
+    InternVLAN1ModelConfig,
+)
 from internnav.trainer.internvla_n1_argument import (
     DataArguments,
     ModelArguments,
@@ -94,6 +97,32 @@ def is_rank0() -> bool:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
     return True
+
+
+def run_frozen_smoke_test(trainer: Trainer) -> None:
+    """Forward-only loop when all params are frozen (no optimizer / DeepSpeed)."""
+    trainer.model.eval()
+    dataloader = trainer.get_train_dataloader()
+    max_steps = trainer.args.max_steps if trainer.args.max_steps and trainer.args.max_steps > 0 else 1
+
+    if trainer.is_world_process_zero():
+        print(f"[frozen smoke] running {max_steps} forward pass(es), weights will not change")
+
+    completed = 0
+    for step, batch in enumerate(dataloader):
+        if step >= max_steps:
+            break
+        batch = trainer._prepare_inputs(batch)
+        with torch.no_grad():
+            loss = trainer.compute_loss(trainer.model, batch)
+        completed = step + 1
+        if trainer.is_world_process_zero():
+            loss_val = loss.item() if hasattr(loss, "item") else float(loss)
+            print(f"[frozen smoke] step {completed}/{max_steps} loss={loss_val:.4f}")
+            print_status_block(f"frozen_smoke_step_{completed}")
+
+    if trainer.is_world_process_zero():
+        print(f"[frozen smoke] done — {completed} forward pass(es), no weight updates")
 
 
 def set_model(model_args, model):
@@ -178,8 +207,25 @@ def train(attn_implementation="sdpa"):
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
     if 'internvla-n1-system2' in model_args.model_name_or_path.lower():
+        internvla_config = InternVLAN1ModelConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+        )
+        # System2 checkpoints ship with nextdit in config. Defer System1 construction
+        # until after checkpoint load — ZeRO-3 partitions params during from_pretrained
+        # and breaks NavDP backbone weight loading if built too early.
+        if model_args.system1 and model_args.system1 != "none":
+            if internvla_config.system1 != "none":
+                if is_rank0():
+                    print(
+                        f"Deferring System1 init during load "
+                        f"(checkpoint system1={internvla_config.system1!r}, "
+                        f"train system1={model_args.system1!r})"
+                    )
+                internvla_config.system1 = "none"
         model = InternVLAN1ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
+            config=internvla_config,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
@@ -242,6 +288,13 @@ def train(attn_implementation="sdpa"):
         model.get_model().initialize_vision_modules(model_args=model_args)
     set_model(model_args, model)
 
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_smoke = trainable_params == 0
+    if frozen_smoke and training_args.deepspeed:
+        if is_rank0():
+            print("All parameters frozen — disabling DeepSpeed; forward-only smoke test (no optimizer updates).")
+        training_args.deepspeed = None
+
     if is_rank0():
         model.visual.print_trainable_parameters()
         model.model.print_trainable_parameters()
@@ -275,23 +328,28 @@ def train(attn_implementation="sdpa"):
         total_params = sum(p.numel() for p in trainer.model.parameters())
         print(f"trainable params: {trainable_params:,} / {total_params:,}")
         if trainable_params == 0:
-            print("WARN: all parameters frozen — training will not update weights")
+            print("Mode: frozen smoke test (forward only, no checkpoint save)")
         stat = []
         for i, (n, p) in enumerate(trainer.model.named_parameters()):
             stat.append([i, n, p.shape, p.requires_grad])
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
         print_status_block("before_train_loop")
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+
+    if frozen_smoke:
+        run_frozen_smoke_test(trainer)
+    elif list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
         trainer.train(resume_from_checkpoint=True)
+        trainer.save_state()
+        data_args.image_processor.save_pretrained(training_args.output_dir)
+        model.config.use_cache = True
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
     else:
         trainer.train()
-    trainer.save_state()
-    data_args.image_processor.save_pretrained(training_args.output_dir)
-
-    model.config.use_cache = True
-
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        trainer.save_state()
+        data_args.image_processor.save_pretrained(training_args.output_dir)
+        model.config.use_cache = True
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

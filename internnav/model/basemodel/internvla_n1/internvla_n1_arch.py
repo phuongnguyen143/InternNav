@@ -124,7 +124,9 @@ class InternVLAN1MetaModel:
         if hasattr(config, "system1"):
             self.latent_queries = nn.Parameter(torch.randn(1, config.n_query, config.hidden_size))
 
-            if 'nextdit' in config.system1:
+            if config.system1 in (None, "none", ""):
+                pass
+            elif 'nextdit' in config.system1:
                 self.traj_dit, self.noise_scheduler = build_traj_dit(config)
                 self.action_encoder = nn.Linear(3, 384, bias=True)
                 self.pos_encoding = SinusoidalPositionalEncoding(384)
@@ -145,6 +147,9 @@ class InternVLAN1MetaModel:
                 raise NotImplementedError
 
     def initialize_vision_modules(self, model_args):
+        if model_args.system1 in (None, "none", ""):
+            return
+
         if 'nextdit' in model_args.system1:
             self.traj_dit, self.noise_scheduler = build_traj_dit(model_args)
             self.action_encoder = nn.Linear(3, 384, bias=True)

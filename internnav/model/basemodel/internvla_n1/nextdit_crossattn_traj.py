@@ -77,11 +77,17 @@ class NextDiTCrossAttn(PreTrainedModel):
 
         # self.model.requires_grad_(False)
 
-        self.freqs_cis = get_2d_rotary_pos_embed_lumina(
-            config.dim // config.n_heads,
-            384,
-            384,
-        )
+        # torch.polar does not support bfloat16 on Jetson; compute RoPE in float32.
+        saved_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            self.freqs_cis = get_2d_rotary_pos_embed_lumina(
+                config.dim // config.n_heads,
+                384,
+                384,
+            )
+        finally:
+            torch.set_default_dtype(saved_dtype)
 
     def forward(self, x, timestep, z_latents, **kwargs):
         model_pred = self.model(
