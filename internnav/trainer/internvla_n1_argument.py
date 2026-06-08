@@ -52,3 +52,18 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+
+
+@dataclass
+class EvalArguments:
+    output_dir: str = field(default="./eval_output")
+    model_max_length: int = field(default=2048)
+    per_device_eval_batch_size: int = field(default=1)
+    max_eval_steps: int = field(
+        default=-1,
+        metadata={"help": "Number of eval batches. -1 runs the full dataset."},
+    )
+    dataloader_num_workers: int = field(default=0)
+    bf16: bool = field(default=True)
+    cache_dir: Optional[str] = field(default=None)
+    local_rank: int = field(default=-1)

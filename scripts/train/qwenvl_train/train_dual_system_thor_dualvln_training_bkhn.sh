@@ -1,4 +1,5 @@
 #!/bin/bash
+# System 1 NavDP 
 #
 # Run 
 #   chmod +x scripts/train/qwenvl_train/train_dual_system_thor.sh
@@ -25,7 +26,7 @@ export MASTER_PORT="${MASTER_PORT:-29500}"
 # Reduce CUDA fragmentation; SIGKILL (-9) during training usually means OOM.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-DEFAULT_DATA_ROOT="${REPO_ROOT}/data/InternData-N1/vln_pe"
+DEFAULT_DATA_ROOT="${REPO_ROOT}/data/InternData-N1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"

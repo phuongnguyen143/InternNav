@@ -1,3 +1,17 @@
+"""
+training data
+flow:
+  1. On-disk LeRobot VLN data (parquet + RGB/depth frames) is indexed at init time.
+  2. NavPixelGoalDataset.__getitem__ loads images, builds a Qwen chat prompt, and tokenizes it (preprocess_qwen_2_visual).
+  3. DataCollatorForSupervisedDataset pads batches and optionally appends <traj> tokensfor the System-1 diffusion head.
+  4. make_supervised_data_module() wires dataset + collator for HuggingFace Trainer.
+
+Main classes:
+  NavPixelGoalDataset:  VLN navigation (pixel goals, turns, stops); primary path.
+  LazySupervisedDataset: general image/video instruction tuning (Cambrian, etc.).
+  DataCollatorForSupervisedDataset: batch assembly consumed by InternVLAN1ForCausalLM.
+"""
+
 import copy
 import itertools
 import json
@@ -20,7 +34,12 @@ from transformers.image_utils import to_numpy_array
 from .rope2d import get_rope_index_2, get_rope_index_25
 from .vlln_lerobot_dataset import VLLNDataset
 
-# Define placeholders for dataset paths
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+# VLN entries (R2R/RxR/ScaleVLN) use LeRobot on-disk layout; pitch_1 = history
+# camera, pitch_2 = lookdown camera for pixel-goal supervision.
+# General VLM entries (Cambrian, etc.) use json/jsonl annotation files instead.
 CAMBRIAN_737K = {
     "annotation_path": "PATH_TO_CAMBRIAN_737K_ANNOTATION",
     "data_path": "",
@@ -144,7 +163,12 @@ data_dict = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Config resolution (dataset names -> paths, sampling rates)
+# ---------------------------------------------------------------------------
+
 def parse_sampling_rate(dataset_name):
+    """Parse trailing '%N' suffix as fraction N/100 (e.g. 'r2r_125cm_0_30%10' → 0.1)."""
     match = re.search(r"%(\d+)$", dataset_name)
     if match:
         return int(match.group(1)) / 100.0
@@ -156,6 +180,7 @@ def read_jsonl(path):
         return [json.loads(line) for line in f]
 
 
+# Env vars override default relative paths in data_dict (see trainer launch scripts).
 _DATA_PATH_OVERRIDES = {
     "traj_data/r2r": os.environ.get("INTERNAV_R2R_DATA_PATH", ""),
     "traj_data/rxr": os.environ.get("INTERNAV_RXR_DATA_PATH", ""),
@@ -164,6 +189,7 @@ _DATA_PATH_OVERRIDES = {
 
 
 def data_list(dataset_names):
+    """Resolve comma-separated dataset keys into config dicts with paths and sampling_rate."""
     config_list = []
     for dataset_name in dataset_names:
         sampling_rate = parse_sampling_rate(dataset_name)
@@ -186,6 +212,9 @@ def data_list(dataset_names):
     return config_list
 
 
+# Token IDs and placeholders used when building prompts and collating batches.
+# IGNORE_INDEX (-100) masks tokens excluded from LM loss.
+# TRAJ_TOKEN_INDEX slots are replaced by learnable latent_queries in the model (S2->S1 bridge).
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
@@ -211,7 +240,6 @@ def rank0_print(*args):
 
 
 def debug_dataset_path(data_path, setting):
-    """Print filesystem and schema checks to diagnose empty datasets."""
     rank0_print("\n=== Dataset debug ===")
     rank0_print(f"data_path: {data_path}")
     rank0_print(f"exists: {os.path.isdir(data_path)}")
@@ -279,6 +307,12 @@ def preprocess_qwen_2_visual(
     grid_thw_image: List = [],
     grid_thw_video: List = [],
 ) -> Dict:
+    """Convert ShareGPT-style conversations into Qwen2-VL input_ids + labels.
+
+    Replaces <image>/<video> placeholders with the correct count of vision pad tokens
+    (one pad per vision patch, derived from grid_thw). User/system tokens get
+    IGNORE_INDEX in labels; assistant tokens are supervised (first 3 tokens masked).
+    """
     roles = {"human": "user", "gpt": "assistant"}
     system_message = "You are a helpful assistant."
 
@@ -366,7 +400,12 @@ def preprocess_qwen_2_visual(
 
 
 class LazySupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
+    """General image/video instruction dataset (non-VLN path).
+
+    Loads json/jsonl annotations (Cambrian, VideoChatGPT, etc.), lazily decodes
+    images/videos in __getitem__, and returns the same token/vision format as
+    NavPixelGoalDataset but without trajectory fields.
+    """
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
         super(LazySupervisedDataset, self).__init__()
@@ -560,6 +599,7 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        """LazySupervisedDataset core: load image/video, tokenize chat, compute RoPE positions."""
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
@@ -622,6 +662,7 @@ class LazySupervisedDataset(Dataset):
                 for merged_thw in video_grid_thw_merged
             ]
         chat_sources = copy.deepcopy([e["conversations"] for e in sources])
+        # Tokenize chat; expand <image>/<video> to vision pad token runs.
         data_dict = preprocess_qwen_2_visual(
             chat_sources,
             self.tokenizer,
@@ -654,6 +695,12 @@ class LazySupervisedDataset(Dataset):
 
         return data_dict
 
+
+# ---------------------------------------------------------------------------
+# Trajectory processing for System-1 (S1) diffusion head
+# ---------------------------------------------------------------------------
+# when pixel_goal_only=True: converts camera extrinsics into smooth,
+# fixed-length relative (dx, dy, d_yaw) sequences that S1 learns to predict.
 
 def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=None):
     start_point = np.array([[0.0, 0.0]])  # Avoid creating arrays repeatedly
@@ -837,6 +884,8 @@ def clip_or_pad(arr, fixed_len):
 
 
 def get_annotations_from_lerobot_data(data_path, setting):
+    """Scan LeRobot scene dirs and load episode-level annotations from parquet.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     import pyarrow.parquet as pq
@@ -867,12 +916,14 @@ def get_annotations_from_lerobot_data(data_path, setting):
 
             ep_actions = df["action"].tolist()
 
+            # Column names encode camera setting, e.g. pose.125cm_30deg, goal.125cm_30deg.
             pose_key = f"pose.{setting}"
             goal_key = f"goal.{setting}"
             relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
 
             if pose_key in df.columns and goal_key in df.columns and relative_goal_frame_id_key in df.columns:
                 ep_poses = df[pose_key].apply(lambda x: x.tolist()).tolist()
+                # pixel_goals[t] = [frames_until_goal, [x, y]]; [-1, _] means no goal at t.
                 ep_pixel_goals = [
                     [df[relative_goal_frame_id_key][idx].tolist(), df[goal_key][idx].tolist()] for idx in range(len(df))
                 ]
@@ -916,6 +967,18 @@ def get_annotations_from_lerobot_data(data_path, setting):
 
 
 class NavPixelGoalDataset(Dataset):
+    """Primary VLN dataset: pixel-goal navigation on LeRobot trajectories.
+
+    Init builds a flat index of training samples by sliding a window every
+    sample_step frames over each episode. Three sample types:
+      pixel_goal — supervise 2D waypoint coords in lookdown image
+      turn       — supervise turn symbols (← →) when no pixel goal yet
+      stop       — supervise STOP at episode end (replicated 5× in the mix)
+
+    __getitem__ loads history + current RGB for System-2 (Qwen2.5-VL) and,
+    when pixel_goal_only=True, future lookdown frames + traj_poses for System-1.
+    """
+
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
         super(NavPixelGoalDataset, self).__init__()
         dataset = data_args.vln_dataset_use.split(",")
@@ -946,6 +1009,7 @@ class NavPixelGoalDataset(Dataset):
             setting = f'{height}cm_{pitch_2}deg'
             annotations = get_annotations_from_lerobot_data(data_path, setting)
 
+            # Build flat training index: one entry per (episode, start_frame, type).
             pixel_goal_list = []
             turn_list = []
             stop_list = []
@@ -954,6 +1018,7 @@ class NavPixelGoalDataset(Dataset):
                 ep_id = item['id']
                 instruction = item['instructions']
                 video = item['video']
+                # Shift actions by 1 so action[t] aligns with observation at frame t.
                 actions = item['actions'][1:] + [0]
                 pixel_goals = item['pixel_goals']
                 poses = item[f'poses_{height}cm_{pitch_2}deg']
@@ -962,14 +1027,17 @@ class NavPixelGoalDataset(Dataset):
                 if actions_len < 4:
                     continue
 
+                # Slide window every sample_step frames across the episode.
                 num_rounds = actions_len // self.sample_step
                 for n in range(num_rounds + 1):
                     if n * self.sample_step == actions_len or n * self.sample_step == actions_len - 1:
                         continue
                     start_frame_id = n * self.sample_step
                     action_flag = actions[start_frame_id]
+                    # pixel_goal[0] = frames until goal (-1 = none); pixel_goal[1] = [x, y].
                     pixel_goal = pixel_goals[start_frame_id]
                     if pixel_goal[0] == -1:
+                        # No pixel goal: collect turn actions until forward (1) or horizon.
                         if action_flag == 1:
                             continue
                         else:
@@ -998,6 +1066,7 @@ class NavPixelGoalDataset(Dataset):
                         if goal_len < 3:
                             continue
                         action = pixel_goal[1]
+                        # Pose slice covers the segment the agent follows toward the pixel goal.
                         pose = poses[start_frame_id : start_frame_id + goal_len + 1]
                         pixel_goal_list.append(
                             (
@@ -1029,6 +1098,7 @@ class NavPixelGoalDataset(Dataset):
                     )
                 )
 
+            # Mix sample types; pixel_goal_only skips turn/stop (S1 trajectory training).
             list_data_dict = pixel_goal_list
             rank0_print(len(turn_list), len(pixel_goal_list), len(stop_list))
             if not self.pixel_goal_only:
@@ -1093,6 +1163,7 @@ class NavPixelGoalDataset(Dataset):
         return img, (target_width, target_height)
 
     def __getitem__(self, i):
+        """Load one training sample: images -> chat prompt -> tokens -> optional S1 traj GT."""
         (
             ep_id,
             data_path,
@@ -1105,16 +1176,18 @@ class NavPixelGoalDataset(Dataset):
             action,
             pose,
         ) = self.list_data_dict[i]
+        # Subsample past frames for the history section of the prompt.
         if start_frame_id != 0:
             history_id = np.unique(np.linspace(0, start_frame_id - 1, self.num_history, dtype=np.int32)).tolist()
         else:
             history_id = []
 
-        images = []
+        images = []       # Qwen vision encoder inputs (history + current + lookdown)
         grid_thws = []
-        traj_images = []
-        traj_depths = []  # optional
+        traj_images = []  # Raw lookdown RGB for S1 (pixel_goal_only)
+        traj_depths = []  # Matching depth maps for S1
 
+        # Walk frames [0, end_frame_id): history/current go to S2; future lookdown to S1.
         for id in range(0, end_frame_id):
             image_file = os.path.join(
                 video, f"observation.images.rgb.{height}cm_{pitch_1}deg", f"episode_{ep_id:06d}_{id}.jpg"
@@ -1131,23 +1204,27 @@ class NavPixelGoalDataset(Dataset):
             )
             depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
             if id in history_id or id == start_frame_id:
+                # History + current horizontal views feed System-2 (Qwen2.5-VL).
                 if self.data_args.transform_train is not None:
                     image = self.data_args.transform_train(image)
                 image, grid_thw = self.process_image_unified(image)
                 images.append(image)
                 grid_thws.append(grid_thw)
                 if id == start_frame_id and pose is not None:
+                    # Pixel-goal samples add a lookdown image to the chat (2nd <image> slot).
                     image, grid_thw = self.process_image_unified(lookdown_image)
                     images.append(image)
                     grid_thws.append(grid_thw)
                     traj_images.append(lookdown_image)
                     traj_depths.append(depth_image)
             elif id > start_frame_id:
+                # Future lookdown frames along the goal segment — S1 observations only.
                 traj_images.append(lookdown_image)
                 traj_depths.append(depth_image)
 
         history_imgs = "<image>\n" * len(history_id)
 
+        # Build multi-turn chat; supervised target depends on sample type (see below).
         if start_frame_id != 0:
             chat_sources = [
                 [
@@ -1185,6 +1262,7 @@ class NavPixelGoalDataset(Dataset):
             turn_action_text = ''.join([self.idx2actions[idx] for idx in action])
             chat_sources[0].extend([{'from': 'gpt', 'value': turn_action_text}])
 
+        # Count vision pad tokens per image (patch grid / merge_size²).
         grid_thw_merged = copy.deepcopy(grid_thws)
 
         if not isinstance(grid_thws, Sequence):
@@ -1212,24 +1290,33 @@ class NavPixelGoalDataset(Dataset):
         data_dict["pixel_values"] = torch.cat(images, dim=0)
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
 
+        # System-1 trajectory supervision (dual-system training only).
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
             interval = 2
             frame_ids = np.arange(0, goal_len, interval)
-            max_len = 12
-            traj_images = torch.tensor(np.stack([np.asarray(timg.resize((224, 224))) for timg in traj_images])) / 255.0
+            max_len = 12  # cap S1 sequence length; increase interval if segment is long
+            traj_images = (
+                torch.tensor(
+                    np.stack([np.asarray(timg.resize((224, 224))) for timg in traj_images]),
+                    dtype=torch.float32,
+                )
+                / 255.0
+            )
             if len(frame_ids) > max_len:
                 interval = int(np.ceil(goal_len / max_len))
                 frame_ids = np.arange(0, goal_len, interval)
 
             traj_poses_gt = []
             for cid in frame_ids:
+                # GT relative trajectory from each future frame to resampled 32-step deltas.
+                # express future poses in the current frame’s robot frame -> (x, y, yaw) per step
                 discrete_traj_pose = get_trajectory_relative_to_frame(pose[cid:], camera_deg=pitch_2)
                 rel_trajectory, rel_pose_resample = interpolate_and_resample_trajectory(
                     discrete_traj_pose, self.predict_step_num
                 )
                 rel_pose_resample = clip_or_pad(rel_pose_resample, self.predict_step_num)
-                traj_poses_gt.append(torch.tensor(rel_pose_resample))
+                traj_poses_gt.append(torch.tensor(rel_pose_resample, dtype=torch.float32))
 
             data_dict["traj_images"] = traj_images[:goal_len][::interval]
             data_dict["traj_depths"] = torch.stack(traj_depths[:goal_len][::interval])
@@ -1253,7 +1340,12 @@ def pad_and_cat(tensor_list):
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
+    """Pad per-sample dicts into a batch for InternVLAN1ForCausalLM.forward().
+
+    Output keys consumed by the model:
+      System-2: input_ids, labels, attention_mask, position_ids, pixel_values, image_grid_thw
+      System-1: t_s_pos, traj_images, traj_depths, traj_poses, video_frame_num (when present)
+    """
 
     tokenizer: transformers.PreTrainedTokenizer
 
@@ -1264,6 +1356,11 @@ class DataCollatorForSupervisedDataset(object):
         max_seq_len: int = None,
         traj_token_length: int = 4,  # TODO hard-code
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[int]]:
+        """Append TRAJ_TOKEN_INDEX placeholders after the chat sequence.
+
+        t_s_pos records where those tokens start; the model replaces them with
+        learnable latent_queries whose hidden states condition System-1.
+        """
         if max_seq_len is None:
             max_seq_len = self.tokenizer.model_max_length - traj_token_length
 
@@ -1297,6 +1394,7 @@ class DataCollatorForSupervisedDataset(object):
         if "traj_images" in instances[0]:
             input_ids, labels, t_s_pos = self.process_input_with_traj_tokens(input_ids, labels)
 
+        # Pad text sequences; vision tensors are concatenated (not padded) across the batch.
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
@@ -1349,7 +1447,7 @@ class DataCollatorForSupervisedDataset(object):
             traj_image_batch = []
             traj_depth_batch = []
             traj_pose_batch = []
-            # import pdb; pdb.set_trace()
+            # Pad variable-length traj sequences to max_len (repeat last frame).
             for idx in range(len(traj_images)):
                 t_img = traj_images[idx]
                 t_depth = traj_depths[idx]
@@ -1474,7 +1572,11 @@ class CombinedDataset(Dataset):
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
+    """Entry point: build train_dataset + data_collator for HuggingFace Trainer.
+
+    Combines optional VLLNDataset (IIGN dialog) and NavPixelGoalDataset (VLN).
+    Returns dict with keys: train_dataset, eval_dataset, data_collator.
+    """
     train_datasets = []
     if data_args.iign_dataset_use:
         train_datasets.append(VLLNDataset(tokenizer=tokenizer, data_args=data_args))

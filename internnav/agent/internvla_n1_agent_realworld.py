@@ -219,48 +219,65 @@ class InternVLAN1AsyncAgent:
 
         look_down=True appends a downward-view frame as a follow-up turn (after action 5).
         """
+        # 1. Preprocess the incoming frame 
         image = Image.fromarray(rgb).convert('RGB')
         if not look_down:
+            # Normal planning: resize, store in episode buffer, advance frame counter.
             image = image.resize((self.resize_w, self.resize_h))
             self.rgb_list.append(image)
             image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}.jpg")
         else:
+            # Look-down follow-up: keep original resolution; do not append to rgb_list.
             image.save(f"{self.save_dir}/debug_raw_{self.episode_idx: 04d}_look_down.jpg")
 
+        # 2. Build the chat prompt (2 modes) 
         if not look_down:
-            # Fresh planning turn: reset chat history and inject instruction + frame history.
+            # fresh re-plan: start a new conversation from scratch.
             self.conversation_history = []
             self.past_key_values = None
 
+            # template
             sources = copy.deepcopy(self.conversation)
             sources[0]["value"] = sources[0]["value"].replace('<instruction>.', instruction)
+
+            # Current frame is always the last image in rgb_list
             cur_images = self.rgb_list[-1:]
+
             if self.episode_idx == 0:
+                # First frame no history 
                 history_id = []
             else:
-                # Evenly sample past frames so the VLM sees temporal context without all frames.
+                # Sample num_history past frames evenly (frames 0, 5, 10, ...).
+                # give the VLM temporal context without sending every frame.
                 history_id = np.unique(np.linspace(0, self.episode_idx - 1, self.num_history, dtype=np.int32)).tolist()
                 placeholder = (DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
                 sources[0]["value"] += f' These are your historical observations: {placeholder}.'
 
+            # Image order in the prompt: [history frames..., current frame].
             history_id = sorted(history_id)
             self.input_images = [self.rgb_list[i] for i in history_id] + cur_images
-            input_img_id = 0
+            input_img_id = 0  # index into input_images; incremented for each <image> token
             self.episode_idx += 1
         else:
-            # Follow-up turn: keep prior assistant reply, add the look-down image only.
+            # look-down continue the previous chat turn.
+            # The robot tilted its camera down (action 5); we send that extra view
+            # so the VLM can refine its plan without resetting history.
             self.input_images.append(image)
-            input_img_id = -1
+            input_img_id = -1  # only the newly appended look-down image is used
             assert self.llm_output != "", "Last llm_output should not be empty when look down"
             sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+            # Replay the assistant's previous reply so the model sees the full dialogue.
             self.conversation_history.append(
                 {'role': 'assistant', 'content': [{'type': 'text', 'text': self.llm_output}]}
             )
 
+        # Append the "current view" phrase, e.g. "you can see <image>."
         prompt = self.conjunctions[0] + DEFAULT_IMAGE_TOKEN
         sources[0]["value"] += f" {prompt}."
         prompt_instruction = copy.deepcopy(sources[0]["value"])
-        # Split prompt on <image> placeholders to interleave text and image objects.
+
+        # 3 Convert flat prompt string -> multimodal chat content list 
+        # split_and_clean splits on <image> tokens so we can interleave text and images.
         parts = split_and_clean(prompt_instruction)
 
         content = []
@@ -273,6 +290,7 @@ class InternVLAN1AsyncAgent:
 
         self.conversation_history.append({'role': 'user', 'content': content})
 
+        #  4. Tokenize and run VLM gen
         text = self.processor.apply_chat_template(self.conversation_history, tokenize=False, add_generation_prompt=True)
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
@@ -289,6 +307,7 @@ class InternVLAN1AsyncAgent:
             )
         output_ids = outputs.sequences
 
+        # Decode only the newly generated tokens (skip the input prompt).
         t1 = time.time()
         self.llm_output = self.processor.tokenizer.decode(
             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
@@ -299,18 +318,26 @@ class InternVLAN1AsyncAgent:
         self.past_key_values = copy.deepcopy(outputs.past_key_values)
         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
 
+        #  5. Parse VLM output into one of two branches 
         if bool(re.search(r'\d', self.llm_output)):
-            # Numeric output -> pixel waypoint; swap to [row, col] for downstream drawing/control.
+            # pixel waypoint (e.g. "The next waypoint is at (120, 80)"):
+            # Extract coordinates, hand off to S1 for trajectory generation.
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
+            # Model outputs (col, row); swap to [row, col] for image indexing.
             pixel_goal = [int(coord[1]), int(coord[0])]
+
+            # Re-run the model's hidden states to extract trajectory latents for S1.
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             pixel_values = inputs.pixel_values
             t0 = time.time()
             with torch.no_grad():
                 traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-                return None, traj_latents, pixel_goal
+            # No discrete actions; S1 will produce a continuous trajectory from the latents.
+            return None, traj_latents, pixel_goal
 
         else:
+            # discrete symbols (STOP, ↑, ←, →, ↓)
+            # Execute immediately; no S1 trajectory needed.
             action_seq = self.parse_actions(self.llm_output)
             return action_seq, None, None
 

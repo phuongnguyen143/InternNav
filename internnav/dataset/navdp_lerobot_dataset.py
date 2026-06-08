@@ -15,6 +15,8 @@ from scipy.interpolate import CubicSpline
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from internnav.dataset.vln_n1_lerobot_dataset import _load_scene_frame_lists
+
 original_print = builtins.print
 
 
@@ -50,7 +52,10 @@ class NavDP_Base_Datset(Dataset):
         prior_sample=False,
     ):
 
-        self.dataset_dirs = np.array([p for p in os.listdir(root_dirs)])
+        self.dataset_dirs = np.array([
+            p for p in os.listdir(root_dirs)
+            if os.path.isdir(os.path.join(root_dirs, p)) and not p.endswith(".tar.gz")
+        ])
         self.memory_size = memory_size
         self.image_size = image_size
         self.scene_scale_size = scene_data_scale
@@ -79,41 +84,51 @@ class NavDP_Base_Datset(Dataset):
                 ]
 
                 for scene_dir in tqdm(select_scene_dirs):
-                    chunk_name = os.listdir(os.path.join(root_dirs, group_dir, scene_dir, 'data'))[0]
-                    data_dir = os.path.join(root_dirs, group_dir, scene_dir, f'data/{chunk_name}')
-                    afford_dir = os.path.join(root_dirs, group_dir, scene_dir, 'meta/pointcloud.ply')
-                    with jsonlines.open(
-                        os.path.join(root_dirs, group_dir, scene_dir, 'meta/episodes_stats.jsonl'), 'r'
-                    ) as reader:
+                    if scene_dir.endswith(".tar.gz"):
+                        continue
+
+                    scene_path = os.path.join(root_dirs, group_dir, scene_dir)
+                    data_dir = os.path.join(scene_path, "data")
+                    if not os.path.isdir(data_dir):
+                        print(f"Skip invalid scene, no data dir: {data_dir}")
+                        continue
+
+                    afford_dir = os.path.join(scene_path, "meta/pointcloud.ply")
+                    if not os.path.isfile(afford_dir):
+                        print(f"Skip scene {scene_dir}: missing pointcloud: {afford_dir}")
+                        continue
+
+                    stats_path = os.path.join(scene_path, "meta/episodes_stats.jsonl")
+                    if not os.path.isfile(stats_path):
+                        print(f"Skip scene {scene_dir}: missing episodes_stats.jsonl")
+                        continue
+
+                    try:
+                        rgb_paths, depth_paths, chunk_name = _load_scene_frame_lists(scene_path)
+                    except FileNotFoundError as exc:
+                        print(f"Skip scene {scene_dir}: {exc}")
+                        continue
+
+                    chunk_data_dir = os.path.join(data_dir, chunk_name)
+                    with jsonlines.open(stats_path, "r") as reader:
                         episode_info = list(reader)
-                    rgb_dir = os.path.join(
-                        root_dirs, group_dir, scene_dir, f"videos/{chunk_name}/observation.images.rgb/"
-                    )
-                    rgb_paths = [os.path.join(rgb_dir, p) for p in sorted(os.listdir(rgb_dir))]
 
-                    depth_dir = os.path.join(
-                        root_dirs, group_dir, scene_dir, f"videos/{chunk_name}/observation.images.depth/"
-                    )
-                    depth_paths = [os.path.join(depth_dir, p) for p in sorted(os.listdir(depth_dir))]
+                    for episode in episode_info:
+                        ep_id = episode["episode_index"]
+                        parquet_path = os.path.join(chunk_data_dir, f"episode_{ep_id:06d}.parquet")
+                        if not os.path.isfile(parquet_path):
+                            print(f"Skip episode {ep_id} in {scene_dir}: missing parquet {parquet_path}")
+                            continue
 
-                    data_paths = [os.path.join(data_dir, p) for p in sorted(os.listdir(data_dir))]
+                        image_start_index = episode["image_index"]["min"]
+                        image_end_index = episode["image_index"]["max"]
+                        episode_rgb_path = rgb_paths[image_start_index : image_end_index + 1]
+                        episode_depth_path = depth_paths[image_start_index : image_end_index + 1]
 
-                    for episode_idx, episode in enumerate(episode_info):
-                        image_start_index = episode['image_index']['min']
-                        image_end_index = episode['image_index']['max']
-                        episode_rgb_path = np.array(rgb_paths)[image_start_index : image_end_index + 1].tolist()
-                        episode_depth_path = np.array(depth_paths)[image_start_index : image_end_index + 1].tolist()
-
-                        try:
-                            self.trajectory_data_dir.append(data_paths[episode_idx])
-                            self.trajectory_rgb_path.append(episode_rgb_path)
-                            self.trajectory_depth_path.append(episode_depth_path)
-                            self.trajectory_afford_path.append(afford_dir)
-                        except Exception as e:
-                            import pdb
-
-                            print(f"Error processing episode {episode_idx}: {e}")
-                            pdb.set_trace()
+                        self.trajectory_data_dir.append(parquet_path)
+                        self.trajectory_rgb_path.append(episode_rgb_path)
+                        self.trajectory_depth_path.append(episode_depth_path)
+                        self.trajectory_afford_path.append(afford_dir)
 
             save_dict = {
                 'trajectory_data_dir': self.trajectory_data_dir,

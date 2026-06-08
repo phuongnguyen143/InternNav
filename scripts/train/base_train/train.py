@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,31 @@ class TrainCfg(BaseModel):
 
     name: str = 'cma_train'  # Experiment name
     model_name: str = 'cma'  # Model name, options: 'cma', 'cma_plus', 'seq2seq', 'seq2seq_plus', 'rdp', 'navdp'
+
+
+def _apply_jetson_thor_overrides(exp_cfg):
+    """Apply single-GPU / low-memory defaults when started from start_train_thor.sh."""
+    if os.getenv('INTERNAV_JETSON_THOR', '').lower() not in ('1', 'true', 'yes'):
+        return
+
+    exp_cfg.torch_gpu_ids = [0]
+    exp_cfg.torch_gpu_id = 0
+
+    if batch_size := os.getenv('BATCH_SIZE'):
+        exp_cfg.il.batch_size = int(batch_size)
+    elif exp_cfg.il.batch_size > 1:
+        exp_cfg.il.batch_size = 1
+
+    if num_workers := os.getenv('NUM_WORKERS'):
+        exp_cfg.il.num_workers = int(num_workers)
+    else:
+        exp_cfg.il.num_workers = 0
+
+    if epochs := os.getenv('NUM_TRAIN_EPOCHS'):
+        exp_cfg.il.epochs = float(epochs)
+
+    if report_to := os.getenv('REPORT_TO'):
+        exp_cfg.il.report_to = report_to
 
 
 class CheckpointFormatCallback(TrainerCallback):
@@ -306,6 +332,7 @@ if __name__ == '__main__':
     model_class, model_config_class = get_policy(policy_name), get_config(policy_name)
 
     exp_cfg.name = config.name
+    _apply_jetson_thor_overrides(exp_cfg)
     exp_cfg.num_gpus = len(exp_cfg.torch_gpu_ids)
     exp_cfg.world_size = exp_cfg.num_gpus
 

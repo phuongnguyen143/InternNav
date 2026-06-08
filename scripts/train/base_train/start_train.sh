@@ -69,7 +69,7 @@ export NCCL_DEBUG=INFO
 if [[ "$MODEL" == "navdp" ]]; then
     echo "Using torchrun to start $MODEL training, using $NUM_GPUS GPUs (CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES)"
     torchrun \
-        --nproc_per_node=$NUM_GPUS \
+        --nproc_pe[[0.5,0.0,0.8659999966621399,1.25],[-0.8659999966621399,0.0,0.5,0.0],[0.0,-1.0,0.0,1.25],[0.0,0.0,0.0,1.0]]r_node=$NUM_GPUS \
         --master_port=29500 \
         --nnodes=1 \
         --node_rank=0 \

@@ -2,7 +2,9 @@
 """
 
 Quick start (from InternNav repo root):
-  export INTERNAV_R2R_DATA_PATH="${PWD}/data/InternData-N1/vln_ce/traj_data/r2r"
+  export INTERNAV_R2R_DATA_PATH="${PWD}/data/InternData-N1/vln_ce/traj_data/r2r" python scripts/train/qwenvl_train/explore_dataset.py
+
+  INTERNAV_R2R_DATA_PATH="${PWD}/data/round1_bkhn/traj_data/r2r" python scripts/train/qwenvl_train/explore_dataset.py
   python scripts/train/qwenvl_train/explore_dataset.py
 
 With a local Qwen checkpoint (needed for image preprocessing + token shapes):
@@ -365,7 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collate", action="store_true", help="Also run DataCollator on sample-indices")
     parser.add_argument("--skip-filesystem", action="store_true", help="Skip on-disk schema checks")
     parser.add_argument("--skip-index", action="store_true", help="Skip full episode index scan")
-    parser.add_argument("--set-r2r-path", default="", help=f"Set INTERNAV_R2R_DATA_PATH (default: {default_r2r})")
+    parser.add_argument("--set-r2r-path", default="./data/round1_bkhn/traj_data/", help=f"Set INTERNAV_R2R_DATA_PATH (default: {default_r2r})")
     return parser.parse_args()
 
 
