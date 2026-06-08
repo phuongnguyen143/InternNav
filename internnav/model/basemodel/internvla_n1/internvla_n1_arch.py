@@ -1,9 +1,19 @@
+"""InternVLA-N1 architecture extensions mixed into the Qwen2.5-VL backbone.
+
+InternVLAN1MetaModel adds System-1 modules on top of Qwen2_5_VLModel:
+  - latent_queries: learnable tokens that bridge S2 (VLM) → S1 (trajectory head)
+  - nextdit path:  traj_dit + flow-matching scheduler + action encoder/decoder
+  - navdp path:    pretrained NavDP diffusion policy (async mode only)
+  - async extras:  DepthAnythingV2 + MemoryEncoder + QFormer for visual memory
+
+config.system1 selects the S1 backend, e.g. "nextdit", "nextdit_async", "navdp_async".
+"""
 from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
 
-LatentEmbSize = 768
+LatentEmbSize = 768  # Projected VLM hidden dim fed to NextDiT cross-attention
 MODEL_PATH_TO = "checkpoints"
 
 
@@ -74,6 +84,9 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class MemoryEncoder(nn.Module):
+    """
+    Transformer encoder over spatial visual features for async S1 memory."""
+
     def __init__(self, hidden_size=384, num_heads=6, num_layers=3, max_len=512, dropout=0.1):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
@@ -95,6 +108,9 @@ class MemoryEncoder(nn.Module):
 
 
 class QFormer(nn.Module):
+    """
+    Compresses variable-length visual memory into a fixed set of query tokens."""
+
     def __init__(self, num_query=32, hidden_size=768, num_layers=3, num_heads=12):
         super().__init__()
         self.num_query = num_query
@@ -119,34 +135,45 @@ class QFormer(nn.Module):
 
 
 class InternVLAN1MetaModel:
+    """
+    Mixin that attaches System-1 trajectory modules to the VLM backbone.
+    """
+
     def __init__(self, config):
         super(InternVLAN1MetaModel, self).__init__(config)
         if hasattr(config, "system1"):
+            # Learnable queries inserted at TRAJ_TOKEN_INDEX positions during forward().
             self.latent_queries = nn.Parameter(torch.randn(1, config.n_query, config.hidden_size))
 
             if config.system1 in (None, "none", ""):
                 pass
             elif 'nextdit' in config.system1:
+                # NextDiT: flow-matching diffusion transformer with VLM cross-attention.
                 self.traj_dit, self.noise_scheduler = build_traj_dit(config)
-                self.action_encoder = nn.Linear(3, 384, bias=True)
+                self.action_encoder = nn.Linear(3, 384, bias=True)   # pose → feature
                 self.pos_encoding = SinusoidalPositionalEncoding(384)
-                self.action_decoder = nn.Linear(384, 3, bias=True)
+                self.action_decoder = nn.Linear(384, 3, bias=True)   # feature → pose
+                # Project VLM hidden states (3584) down to NextDiT conditioning dim (768).
                 self.cond_projector = nn.Sequential(
                     nn.Linear(3584, LatentEmbSize), nn.GELU(approximate="tanh"), nn.Linear(LatentEmbSize, LatentEmbSize)
                 )
 
                 if 'async' in config.system1:
+                    # Async mode adds goal+current RGB memory alongside VLM latents.
                     self.rgb_model = build_depthanythingv2(config)
                     self.memory_encoder = MemoryEncoder()
                     self.rgb_resampler = QFormer()
 
             elif 'navdp' in config.system1:
                 if 'async' in config.system1:
+                    # NavDP: pretrained DDPM diffusion policy with RGB-D encoder.
                     self.navdp = build_navdp(config, memory_size=2)
             else:
                 raise NotImplementedError
 
     def initialize_vision_modules(self, model_args):
+        """
+        Lazy-init S1 modules during training (S2 checkpoint may ship without S1 weights)."""
         if model_args.system1 in (None, "none", ""):
             return
 
@@ -178,6 +205,9 @@ class InternVLAN1MetaModel:
 
 
 class InternVLAN1MetaForCausalLM(ABC):
+    """
+    hared helpers for InternVLAN1ForCausalLM (system1 type, noise schedule, etc.)."""
+
     @abstractmethod
     def get_model(self):
         pass
@@ -192,6 +222,8 @@ class InternVLAN1MetaForCausalLM(ABC):
         return self.get_model().config.system1
 
     def get_sigmas(self, timesteps, device, n_dim=4, dtype=torch.float32):
+        """
+        Look up flow-matching noise level (sigma) for each training timestep."""
         sigmas = self.get_model().noise_scheduler.sigmas.to(device=device, dtype=dtype)
         schedule_timesteps = self.get_model().noise_scheduler.timesteps.to(device=device)
         timesteps = timesteps.to(device)

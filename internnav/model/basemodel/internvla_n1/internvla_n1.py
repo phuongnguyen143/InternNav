@@ -1,3 +1,16 @@
+"""InternVLA-N1 core model: Qwen2.5-VL backbone + System-1 trajectory head.
+
+Architecture overview:
+  - System 2: standard Qwen2.5-VL causal LM (vision encoder + transformer + lm_head).
+  - Bridge: learnable latent_queries replace TRAJ_TOKEN_INDEX slots in the input sequence;
+    their final-layer hidden states carry navigation intent to System 1.
+  - System 1 (config.system1): either NextDiT (flow-matching DiT) or NavDP (DDPM policy).
+
+Key entry points:
+  forward()          — training: LM logits + optional S1 diffusion loss
+  generate_latents() — inference: extract traj-conditioning hidden states after S2 generation
+  generate_traj()    — inference: denoise a 32-step (x,y,z) waypoint trajectory
+"""
 import inspect
 from typing import List, Optional, Tuple, Union
 
@@ -16,8 +29,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .internvla_n1_arch import InternVLAN1MetaForCausalLM, InternVLAN1MetaModel
 
-TRAJ_TOKEN_INDEX = 151667
-IMAGE_TOKEN_INDEX = 151655
+# Special token IDs in the Qwen2.5-VL vocabulary.
+TRAJ_TOKEN_INDEX = 151667   # Placeholder replaced by learnable latent_queries (S2→S1 bridge)
+IMAGE_TOKEN_INDEX = 151655  # Placeholder replaced by vision-encoder patch embeddings
+# ImageNet normalization used by DepthAnythingV2 in async S1 mode.
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
@@ -48,6 +63,8 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
 
 
 class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
+    """Qwen2.5-VL backbone extended with S1 modules (latent_queries, traj_dit/navdp, etc.)."""
+
     config_class = InternVLAN1ModelConfig
 
     def __init__(self, config: Qwen2_5_VLConfig):
@@ -55,6 +72,8 @@ class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
 
 
 class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1MetaForCausalLM):
+    """Full InternVLA-N1 model with LM head and S1 trajectory generation methods."""
+
     config_class = InternVLAN1ModelConfig
 
     def __init__(self, config):
@@ -145,6 +164,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
+            # --- Multimodal embedding: scatter vision features into placeholder token slots ---
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -181,6 +201,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+            # Replace traj placeholder tokens with learnable query embeddings (S2→S1 bridge).
             n_traj_tokens = (input_ids == TRAJ_TOKEN_INDEX).sum().item()
             traj_idx = input_ids == TRAJ_TOKEN_INDEX
             latent_queries = self.get_model().latent_queries.repeat(input_ids.shape[0], 1, 1)
@@ -192,7 +213,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
+        # Qwen2.5-VL uses 3D RoPE; position_ids account for variable image grid sizes.
         if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
             # calculate RoPE index once per generation in the pre-fill stage only
             if (
@@ -239,6 +260,8 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         loss = None
         if labels is not None:
+            # --- System 1 training loss (only when trajectory supervision is provided) ---
+            # Slice hidden states at traj-query positions; these condition the diffusion head.
             traj_hidden_states = []
             for b in range(hidden_states.shape[0]):
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
@@ -251,6 +274,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             if 'nextdit' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
+                    # Async mode: stack [pixel-goal frame, current frame] and encode visual memory.
                     cur_images = traj_images.flatten(0, 1)
                     pix_goal_images = traj_images[:, 0:1].repeat(1, traj_images.size(1), 1, 1, 1).flatten(0, 1)
                     bsz = cur_images.size(0)
@@ -275,6 +299,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
                     latents = traj_hidden_states
 
+                # Flow-matching training: interpolate between clean poses and noise.
                 relative_poses = traj_poses.flatten(0, 1)
                 bsz = relative_poses.shape[0]
                 noise = torch.randn(relative_poses.shape, device=relative_poses.device, dtype=relative_poses.dtype)
@@ -297,7 +322,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     z_latents=latents,
                 )
                 noise_pred = self.get_model().action_decoder(noise_pred)
-                target = noise - relative_poses
+                target = noise - relative_poses  # flow-matching velocity target
                 loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 mask = loss_mask.flatten(0, 1)[:, None, None]
                 masked_loss = loss * mask
@@ -336,12 +361,19 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
 
     def generate_latents(self, input_ids, pixel_values, image_grid_thw):
+        """Extract S1-conditioning hidden states after S2 text generation.
+
+        Appends N_QUERY traj tokens to the generated sequence, runs one forward pass,
+        and returns the last-layer hidden states at those positions [B, n_query, hidden_size].
+        Called from InternVLAN1Net.s2_step when the VLM outputs pixel-goal coordinates.
+        """
         input_ids.to(self.get_model().device)
         with torch.no_grad():
             text_embeds = self.get_model().embed_tokens(input_ids)
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
+        # Extend the generated token sequence with traj-query placeholders.
         input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
 
         pixel_values = pixel_values.type(self.visual.dtype)
@@ -374,6 +406,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
     ):
+        """System 1 inference: denoise a waypoint trajectory from S2 latents.
+
+        NextDiT path: flow-matching diffusion with classifier-free guidance.
+        NavDP path:   DDPM policy conditioned on VLM hidden states (+ RGB-D in async mode).
+
+        Returns tensor of shape [num_samples, predict_step_nums, 3] (relative poses).
+        """
         if 'nextdit' in self.get_system1_type():
             scheduler = FlowMatchEulerDiscreteScheduler()
             device = traj_latents.device
@@ -398,11 +437,12 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
             else:
                 hidden_states = traj_latents
+            # Classifier-free guidance: batch [unconditional, conditional] latents together.
             hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
             hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
             batch_size = traj_latents.shape[0]
             latent_size = predict_step_nums
-            latent_channels = 3
+            latent_channels = 3  # (x, y, z) relative waypoint coordinates
 
             latents = randn_tensor(
                 shape=(batch_size * num_sample_trajs, latent_size, latent_channels),
@@ -441,11 +481,10 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
                 noise_pred = self.get_model().action_decoder(noise_pred)
 
-                # perform guidance
+                # CFG: blend unconditional and conditional noise predictions.
                 noise_pred_uncond, noise_pred = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
-                # compute previous: x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
             return latents
 

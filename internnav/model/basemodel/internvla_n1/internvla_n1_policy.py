@@ -1,3 +1,15 @@
+"""Deployment wrapper for InternVLA-N1 dual-system navigation.
+
+System 2 (S2): Qwen2.5-VL generates high-level plans — either pixel-goal coordinates
+in the image or discrete action symbols (↑, ←, →, STOP).
+
+System 1 (S1): A diffusion trajectory head (NextDiT or NavDP) consumes VLM latents
+and RGB(-D) observations to produce low-level waypoint sequences, then discrete actions.
+
+Typical inference loop (see internvla_n1_agent.py):
+  s2_step() → pixel goal + traj latents  OR  direct action symbols
+  s1_step_latent() → continuous trajectory → up to 4 robot actions
+"""
 import copy
 import itertools
 import re
@@ -25,6 +37,8 @@ from internnav.model.utils.vln_utils import (
 
 
 class InternVLAN1Net(PreTrainedModel):
+    """High-level policy that orchestrates S2 (VLM) and S1 (trajectory) inference."""
+
     config_class = InternVLAN1ModelConfig
 
     def __init__(self, config: Union[InternVLAN1ModelConfig, ModelCfg]):
@@ -54,16 +68,17 @@ class InternVLAN1Net(PreTrainedModel):
         self.resize_w = self.model_config.resize_w
         self.resize_h = self.model_config.resize_h
 
+        # Episode state tracked across S2 calls within one navigation episode.
         self.rgb_list = []
         self.depth_list = []
         self.pose_list = []
-        self.episode_idx = 0  # S2's episode idx is different from the system's idx
-        self.conversation_history = []  # Multi-turn conversation exists when looking down
+        self.episode_idx = 0  # Index into rgb_list; only advances on normal (non look-down) steps
+        self.conversation_history = []  # Multi-turn chat used only during look-down follow-ups
         self.llm_output = ""
 
     def init_prompts(self):
         self.DEFAULT_IMAGE_TOKEN = "<image>"
-        # For absolute pixel goal
+        # S2 prompt asks the VLM for the next waypoint pixel coords or STOP.
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
         self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
@@ -78,6 +93,7 @@ class InternVLAN1Net(PreTrainedModel):
             'in your sight is ',
         ]
 
+        # Discrete action vocabulary the VLM may emit instead of pixel coordinates.
         self.actions2idx = OrderedDict(
             {
                 'STOP': [0],
@@ -105,13 +121,22 @@ class InternVLAN1Net(PreTrainedModel):
         return list(actions)
 
     def step_no_infer(self, rgb, depth, pose):
+        """Buffer an observation without running inference (e.g. during S1 execution)."""
         image = Image.fromarray(rgb).convert('RGB')
         image = image.resize((self.resize_w, self.resize_h))
         self.rgb_list.append(image)
         self.episode_idx += 1
 
     def s2_step(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
-        # Need to be careful: look_down images are not added to rgb_list and won't be selected as history
+        """System 2: VLM reasoning step.
+
+        Returns S2Output with either:
+          - output_pixel + output_latent (numeric coords → S1 trajectory head), or
+          - output_action (discrete symbols like ↑/←/STOP, bypasses S1).
+
+        look_down=True continues a multi-turn chat with a downward-facing camera view;
+        those frames are intentionally excluded from rgb_list history.
+        """
         # 1. Preprocess input
         image = Image.fromarray(rgb).convert('RGB')
         if not look_down:  # Don't add look_down images to rgb_list
@@ -130,6 +155,7 @@ class InternVLAN1Net(PreTrainedModel):
             if self.episode_idx == 0:
                 history_id = []
             else:
+                # Uniformly subsample past frames so the VLM sees a fixed num_history budget.
                 history_id = np.unique(np.linspace(0, self.episode_idx - 1, self.num_history, dtype=np.int32)).tolist()
                 placeholder = (self.DEFAULT_IMAGE_TOKEN + '\n') * len(history_id)
                 sources[0]["value"] += f' These are your historical observations: {placeholder}.'
@@ -167,7 +193,7 @@ class InternVLAN1Net(PreTrainedModel):
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
 
-        # 3. Model inference
+        # 3. Autoregressive text generation (Qwen2.5-VL)
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
@@ -183,36 +209,45 @@ class InternVLAN1Net(PreTrainedModel):
         print(f"============ output {self.episode_idx}  {self.llm_output}")
         output = S2Output()
 
-        # 4. Post-process results
-        if bool(re.search(r'\d', self.llm_output)):  # Output pixel goal
+        # 4. Route VLM output: numeric coords → S1 latents; symbols → direct actions
+        if bool(re.search(r'\d', self.llm_output)):
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
+            # VLM outputs (row, col) but downstream expects [y, x] image coordinates.
             pixel_goal = [int(coord[1]), int(coord[0])]
             output.output_pixel = np.array(pixel_goal)
 
+            # One extra forward pass: extract hidden states at learnable traj-query tokens.
+            # These latents condition the S1 diffusion head (see generate_latents).
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             with torch.no_grad():
                 traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
             output.output_latent = traj_latents
 
-        else:  # Output action
+        else:
             action_seq = self.parse_actions(self.llm_output)
             output.output_action = action_seq
 
         return output
 
     def s1_step_latent(self, rgb, depth, latent):
+        """System 1: diffusion trajectory generation from S2 latents.
+
+        generate_traj backend depends on config.system1 (nextdit vs navdp, sync vs async).
+        Returns up to 4 discrete actions before the agent re-queries S2.
+        """
         with torch.no_grad():
             dp_actions = self.model.generate_traj(
                 traj_latents=latent, images_dp=rgb, depths_dp=depth
-            )  # use_aysnc based on MODEL
+            )
 
         if self.continuous_traj:
             action_list = traj_to_actions(dp_actions)
         else:
+            # NextDiT may sample multiple trajectories; pick one at random.
             random_choice = np.random.choice(dp_actions.shape[0])
             action_list = chunk_token(dp_actions[random_choice])
 
-        action_list = [x for x in action_list if x != 0]
+        action_list = [x for x in action_list if x != 0]  # drop padding / null actions
 
         output = S1Output(idx=action_list[:4])
         return output
