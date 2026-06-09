@@ -67,3 +67,11 @@ class EvalArguments:
     bf16: bool = field(default=True)
     cache_dir: Optional[str] = field(default=None)
     local_rank: int = field(default=-1)
+    report_to: str = field(
+        default="tensorboard",
+        metadata={"help": "Logging integrations: tensorboard, none (comma-separated)."},
+    )
+    logging_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "TensorBoard log dir. Defaults to <output_dir>/tensorboard."},
+    )

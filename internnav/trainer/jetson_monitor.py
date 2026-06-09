@@ -10,6 +10,12 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from internnav.model.utils.tensorboard_utils import (
+    TensorboardWriter,
+    log_scalars_to_tensorboard,
+    log_system_metrics_to_tensorboard,
+)
+
 TRAIN_METRIC_KEYS = (
     "loss",
     "train_loss",
@@ -229,11 +235,34 @@ def print_jetson_summary() -> None:
     print("=== End Jetson summary ===\n", flush=True)
 
 
-class JetsonTrainingCallback:
-    """Print and persist training metrics plus Jetson memory/perf stats."""
+def train_tensorboard_enabled(args) -> bool:
+    """Custom TensorBoard (loss + Jetson metrics), independent of HF report_to."""
+    env_flag = os.environ.get("TRAIN_TENSORBOARD", "").strip().lower()
+    if env_flag in ("0", "false", "no", "off"):
+        return False
+    if env_flag in ("1", "true", "yes", "on"):
+        return True
+    report_to = os.environ.get("TRAIN_REPORT_TO", "").strip()
+    if report_to:
+        tokens = {x.strip().lower() for x in report_to.split(",") if x.strip()}
+        return "tensorboard" in tokens or "all" in tokens
+    return True
 
+
+def train_tensorboard_log_dir(args) -> str:
+    logging_dir = getattr(args, "logging_dir", None)
+    if logging_dir:
+        return logging_dir
+    env_dir = os.environ.get("TRAIN_TENSORBOARD_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    return os.path.join(args.output_dir, "tensorboard")
+
+
+class JetsonTrainingCallback:
     def __init__(self):
         self.log_path: Optional[str] = None
+        self.tb_writer: Optional[TensorboardWriter] = None
         self._train_start: Optional[float] = None
         self._last_step_time: Optional[float] = None
         self._last_step: int = 0
@@ -267,6 +296,11 @@ class JetsonTrainingCallback:
             "model_max_length": args.model_max_length,
         }
         self._append_jsonl(header)
+        if train_tensorboard_enabled(args):
+            log_dir = train_tensorboard_log_dir(args)
+            os.makedirs(log_dir, exist_ok=True)
+            self.tb_writer = TensorboardWriter(log_dir)
+            print(f"  tensorboard: {log_dir}", flush=True)
         print("\n=== Training started ===", flush=True)
         print(
             f"  log_file: {self.log_path}\n"
@@ -304,6 +338,23 @@ class JetsonTrainingCallback:
         self._append_jsonl(record)
         print(format_training_line(metrics), flush=True)
         print(format_memory_line("mem"), flush=True)
+        if self.tb_writer is not None:
+            step = state.global_step
+            log_scalars_to_tensorboard(self.tb_writer, step, metrics, prefix="train")
+            if logs:
+                extra = {
+                    k: v
+                    for k, v in logs.items()
+                    if k not in metrics and not isinstance(v, (dict, list, tuple, str))
+                }
+                log_scalars_to_tensorboard(self.tb_writer, step, extra, prefix="train")
+            log_system_metrics_to_tensorboard(
+                self.tb_writer,
+                step,
+                record["system_memory"],
+                record["gpu_memory"],
+                record["jetson"],
+            )
 
     def on_save(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
@@ -338,5 +389,10 @@ class JetsonTrainingCallback:
             flush=True,
         )
         print(f"  metrics log: {self.log_path}", flush=True)
+        if self.tb_writer is not None:
+            print(f"  tensorboard: {train_tensorboard_log_dir(args)}", flush=True)
+            if self.tb_writer.writer:
+                self.tb_writer.writer.close()
+            self.tb_writer = None
         print(format_memory_line("mem"), flush=True)
         print("=== End training ===\n", flush=True)

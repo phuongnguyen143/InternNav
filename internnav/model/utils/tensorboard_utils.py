@@ -4,11 +4,56 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+
+def try_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def log_scalars_to_tensorboard(
+    writer: Optional["TensorboardWriter"],
+    step: int,
+    scalars: Dict[str, Any],
+    prefix: str = "train",
+) -> None:
+    if writer is None or writer.writer is None:
+        return
+    for key, value in scalars.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            writer.add_scalar(f"{prefix}/{key}", float(value), step)
+            continue
+        fval = try_float(value)
+        if fval is not None and fval == fval:  # skip NaN
+            writer.add_scalar(f"{prefix}/{key}", fval, step)
+
+
+def log_system_metrics_to_tensorboard(
+    writer: Optional["TensorboardWriter"],
+    step: int,
+    system_memory: Dict[str, float],
+    gpu_memory: Dict[str, float],
+    jetson_info: Dict[str, Any],
+) -> None:
+    if writer is None or writer.writer is None:
+        return
+    for key, value in system_memory.items():
+        writer.add_scalar(f"system_memory/{key}", value, step)
+    for key, value in gpu_memory.items():
+        writer.add_scalar(f"gpu_memory/{key}", value, step)
+    for key, value in jetson_info.items():
+        fval = try_float(value)
+        if fval is not None:
+            writer.add_scalar(f"jetson/{key}", fval, step)
 
 
 class TensorboardWriter:

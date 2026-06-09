@@ -32,8 +32,16 @@ from internnav.trainer.internvla_n1_argument import (
     EvalArguments,
     ModelArguments,
 )
+from internnav.model.utils.tensorboard_utils import (
+    TensorboardWriter,
+    log_scalars_to_tensorboard,
+    log_system_metrics_to_tensorboard,
+)
 from internnav.trainer.jetson_monitor import (
     format_memory_line,
+    get_gpu_memory_mb,
+    get_jetson_info,
+    get_system_memory_mb,
     print_jetson_summary,
     print_status_block,
 )
@@ -164,6 +172,32 @@ def append_jsonl(path: str, record: Dict[str, Any]) -> None:
         handle.write(json.dumps(record, default=str) + "\n")
 
 
+def _tensorboard_enabled(eval_args: EvalArguments) -> bool:
+    report_to = os.environ.get("EVAL_REPORT_TO", eval_args.report_to)
+    return "tensorboard" in {x.strip().lower() for x in report_to.split(",") if x.strip()}
+
+
+def _tensorboard_log_dir(output_dir: str, eval_args: EvalArguments) -> str:
+    if eval_args.logging_dir:
+        return eval_args.logging_dir
+    env_dir = os.environ.get("EVAL_TENSORBOARD_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    return os.path.join(output_dir, "tensorboard")
+
+
+def create_eval_tensorboard_writer(
+    output_dir: str,
+    eval_args: EvalArguments,
+) -> Optional[TensorboardWriter]:
+    if not is_rank0() or not _tensorboard_enabled(eval_args):
+        return None
+    log_dir = _tensorboard_log_dir(output_dir, eval_args)
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"tensorboard log_dir: {log_dir}")
+    return TensorboardWriter(log_dir)
+
+
 def my_eval(
     model: InternVLAN1ForCausalLM,
     dataloader: DataLoader,
@@ -179,34 +213,47 @@ def my_eval(
     if is_rank0() and os.path.exists(log_path):
         os.remove(log_path)
 
+    tb_writer = create_eval_tensorboard_writer(output_dir, eval_args)
+
     total_loss = 0.0
     total_batches = 0
     started = time.time()
 
     loss_alert_multiplier = float(os.environ.get("LOSS_ALERT_MULTIPLIER", "5"))
     loss_baseline_steps = int(os.environ.get("LOSS_BASELINE_STEPS", "5"))
-    loss_alert_abs_str = os.environ.get("LOSS_ALERT_ABS", "").strip()
-    loss_alert_abs: Optional[float] = float(loss_alert_abs_str) if loss_alert_abs_str else None
+
 
     stats = RunningStats()
     baseline_mean: Optional[float] = None
     spikes = 0
-    spikes_by_abs = 0
     spikes_by_ratio = 0
 
     if is_rank0():
         max_steps = eval_args.max_eval_steps if eval_args.max_eval_steps > 0 else len(dataloader)
         print(f"[eval] running up to {max_steps} batch(es) on {device}")
-        append_jsonl(
-            log_path,
-            {
-                "event": "eval_begin",
-                "timestamp": time.time(),
-                "output_dir": output_dir,
-                "max_eval_steps": eval_args.max_eval_steps,
-                "dataset_batches": len(dataloader),
-            },
-        )
+        begin_record = {
+            "event": "eval_begin",
+            "timestamp": time.time(),
+            "output_dir": output_dir,
+            "max_eval_steps": eval_args.max_eval_steps,
+            "dataset_batches": len(dataloader),
+            "per_device_eval_batch_size": eval_args.per_device_eval_batch_size,
+            "bf16": eval_args.bf16,
+            "loss_alert_multiplier": loss_alert_multiplier,
+            "loss_baseline_steps": loss_baseline_steps,
+        }
+        append_jsonl(log_path, begin_record)
+        if tb_writer is not None:
+            tb_writer.add_text("eval/config", json.dumps(begin_record, default=str, indent=2), 0)
+            log_scalars_to_tensorboard(
+                tb_writer,
+                0,
+                {
+                    "max_eval_steps": eval_args.max_eval_steps,
+                    "dataset_batches": len(dataloader),
+                    "per_device_eval_batch_size": eval_args.per_device_eval_batch_size,
+                },
+            )
 
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
@@ -235,16 +282,22 @@ def my_eval(
             if baseline_mean is None and stats.n >= loss_baseline_steps:
                 baseline_mean = stats.mean
                 if is_rank0():
-                    append_jsonl(
-                        log_path,
+                    baseline_record = {
+                        "event": "loss_baseline_set",
+                        "timestamp": time.time(),
+                        "baseline_steps": loss_baseline_steps,
+                        "baseline_mean": baseline_mean,
+                        "loss_alert_multiplier": loss_alert_multiplier,
+                    }
+                    append_jsonl(log_path, baseline_record)
+                    log_scalars_to_tensorboard(
+                        tb_writer,
+                        total_batches,
                         {
-                            "event": "loss_baseline_set",
-                            "timestamp": time.time(),
-                            "baseline_steps": loss_baseline_steps,
                             "baseline_mean": baseline_mean,
                             "loss_alert_multiplier": loss_alert_multiplier,
-                            "loss_alert_abs": loss_alert_abs,
                         },
+                        prefix="eval/baseline",
                     )
 
             if is_rank0():
@@ -257,11 +310,7 @@ def my_eval(
 
                 alert = False
                 alert_reason: Optional[str] = None
-                if loss_alert_abs is not None and loss_value > loss_alert_abs:
-                    alert = True
-                    alert_reason = "abs"
-                    spikes_by_abs += 1
-                elif baseline_mean is not None and loss_value > baseline_mean * loss_alert_multiplier:
+                if baseline_mean is not None and loss_value > baseline_mean * loss_alert_multiplier:
                     alert = True
                     alert_reason = "ratio"
                     spikes_by_ratio += 1
@@ -281,12 +330,29 @@ def my_eval(
                     f"min={stats.min:.4f} max={stats.max:.4f} "
                     f"ratio_to_avg={ratio_to_avg:.2f}"
                 )
-                append_jsonl(
-                    log_path,
+                step_record = {
+                    "event": "eval_step",
+                    "timestamp": time.time(),
+                    "step": total_batches,
+                    "loss": loss_value,
+                    "avg_loss": running_avg,
+                    "std_loss": running_std,
+                    "min_loss_so_far": stats.min,
+                    "max_loss_so_far": stats.max,
+                    "ratio_to_running_avg": ratio_to_avg,
+                    "baseline_mean": baseline_mean,
+                    "ratio_to_baseline": ratio_to_baseline,
+                    "alert": alert,
+                    "alert_reason": alert_reason,
+                    "loss_spikes_total": spikes,
+                    "loss_spikes_by_ratio": spikes_by_ratio,
+                    "elapsed_sec": time.time() - started,
+                }
+                append_jsonl(log_path, step_record)
+                log_scalars_to_tensorboard(
+                    tb_writer,
+                    total_batches,
                     {
-                        "event": "eval_step",
-                        "timestamp": time.time(),
-                        "step": total_batches,
                         "loss": loss_value,
                         "avg_loss": running_avg,
                         "std_loss": running_std,
@@ -296,10 +362,19 @@ def my_eval(
                         "baseline_mean": baseline_mean,
                         "ratio_to_baseline": ratio_to_baseline,
                         "alert": alert,
-                        "alert_reason": alert_reason,
+                        "loss_spikes_total": spikes,
+                        "loss_spikes_by_ratio": spikes_by_ratio,
+                        "elapsed_sec": step_record["elapsed_sec"],
                     },
                 )
                 if total_batches == 1 or total_batches % 10 == 0 or alert:
+                    log_system_metrics_to_tensorboard(
+                        tb_writer,
+                        total_batches,
+                        get_system_memory_mb(),
+                        get_gpu_memory_mb(),
+                        get_jetson_info(),
+                    )
                     print_status_block("eval", step=total_batches, loss=running_avg)
 
     if total_batches == 0:
@@ -313,28 +388,39 @@ def my_eval(
         "eval_loss_min": stats.min,
         "eval_loss_max": stats.max,
         "loss_spikes_total": float(spikes),
-        "loss_spikes_by_abs": float(spikes_by_abs),
         "loss_spikes_by_ratio": float(spikes_by_ratio),
         "loss_baseline_mean": baseline_mean if baseline_mean is not None else float("nan"),
     }
 
     if is_rank0():
-        append_jsonl(
-            log_path,
-            {
-                "event": "eval_end",
-                "timestamp": time.time(),
-                **metrics,
-            },
+        end_record = {
+            "event": "eval_end",
+            "timestamp": time.time(),
+            **metrics,
+        }
+        append_jsonl(log_path, end_record)
+        final_step = int(metrics["eval_batches"])
+        log_scalars_to_tensorboard(tb_writer, final_step, metrics, prefix="eval/summary")
+        log_system_metrics_to_tensorboard(
+            tb_writer,
+            final_step,
+            get_system_memory_mb(),
+            get_gpu_memory_mb(),
+            get_jetson_info(),
         )
+        if tb_writer is not None:
+            tb_writer.add_text("eval/summary", json.dumps(end_record, default=str, indent=2), final_step)
+            tb_writer.close()
         print("\n=== Evaluation finished ===")
         print(f"  batches:   {int(metrics['eval_batches'])}")
         print(f"  eval_loss: {metrics['eval_loss']:.6f}")
         print(f"  min/max:   {metrics['eval_loss_min']:.6f} / {metrics['eval_loss_max']:.6f}")
         print(f"  std:       {metrics['eval_loss_std']:.6f}")
-        print(f"  spikes:    {int(metrics['loss_spikes_total'])} (abs={int(metrics['loss_spikes_by_abs'])} ratio={int(metrics['loss_spikes_by_ratio'])})")
+        print(f"  spikes:    {int(metrics['loss_spikes_total'])} (ratio={int(metrics['loss_spikes_by_ratio'])})")
         print(f"  runtime:   {metrics['eval_runtime_sec']:.1f}s")
         print(f"  log_file:  {log_path}")
+        if tb_writer is not None and tb_writer.writer is not None:
+            print(f"  tensorboard: {_tensorboard_log_dir(output_dir, eval_args)}")
         print(format_memory_line("mem"))
         print("=== End evaluation ===\n")
 

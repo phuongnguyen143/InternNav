@@ -68,6 +68,7 @@ from internnav.trainer.jetson_monitor import (
     format_memory_line,
     print_jetson_summary,
     print_status_block,
+    train_tensorboard_log_dir,
 )
 
 
@@ -351,6 +352,7 @@ def train(attn_implementation="sdpa"):
     train_dataset = data_module["train_dataset"]
     if is_rank0():
         print(f"train_dataset size: {len(train_dataset)}")
+        print(f"TensorBoard:     {train_tensorboard_log_dir(training_args)}")
         print_status_block("after_dataset_load")
     if len(train_dataset) == 0:
         raise RuntimeError(
