@@ -160,15 +160,37 @@ def yaw_on_floor_plane(R_world: np.ndarray, floor_plane: tuple) -> float:
     return float(math.atan2(np.dot(forward_proj, y_ax), np.dot(forward_proj, x_ax)))
 
 
+def floor_xy_to_world_on_plane(x: float, y: float, floor_plane: tuple) -> np.ndarray:
+    """Map floor-frame (x, y) to the corresponding 3D point on the floor plane."""
+    origin, x_ax, y_ax, _ = build_floor_frame(floor_plane)
+    return origin + float(x) * x_ax + float(y) * y_ax
+
+
+def pose_floor_world_xyz(pose: dict, floor_plane: Optional[tuple] = None) -> np.ndarray:
+    """
+    Return the on-floor world 3D target stored in a poses.json / floor entry dict.
+
+    Prefers explicit world_x/y/z; falls back to floor (x, y) + calibration plane.
+    """
+    if all(k in pose for k in ("world_x", "world_y", "world_z")):
+        return np.array(
+            [float(pose["world_x"]), float(pose["world_y"]), float(pose["world_z"])],
+            dtype=np.float64,
+        )
+    if floor_plane is None:
+        raise ValueError("floor_plane required when pose lacks world_x/y/z")
+    return floor_xy_to_world_on_plane(float(pose["x"]), float(pose["y"]), floor_plane)
+
+
 def project_base_pose_to_floor(
     T_world_base: np.ndarray,
     floor_plane: tuple,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, np.ndarray]:
     """
     Project base pose onto floor plane.
 
     Returns:
-        x, y, yaw in floor 2D frame, z (projected height along world Z of base origin)
+        x, y, yaw in floor 2D frame, legacy_z (world-Z of projected point), world_xyz
     """
     T_world_base = np.asarray(T_world_base, dtype=np.float64).reshape(4, 4)
     pos = T_world_base[:3, 3]
@@ -180,7 +202,7 @@ def project_base_pose_to_floor(
     y_floor = float(np.dot(delta, y_ax))
     yaw = yaw_on_floor_plane(T_world_base[:3, :3], floor_plane)
 
-    return x_floor, y_floor, yaw, float(pos_proj[2])
+    return x_floor, y_floor, yaw, float(pos_proj[2]), pos_proj.copy()
 
 
 def base_pose_to_action_matrix(
@@ -215,17 +237,17 @@ def base_pose_to_action_matrix(
 def camera_matrix_to_floor_pose(
     T_world_cam: np.ndarray,
     floor_plane: tuple,
-) -> Tuple[float, float, float, float, np.ndarray]:
+) -> Tuple[float, float, float, float, np.ndarray, np.ndarray]:
     """
     Full pipeline: camera odom -> base -> floor projection.
 
     Returns:
-        x, y, yaw, z, action_matrix (4x4 float32)
+        x, y, yaw, legacy_z, action_matrix (4x4 float32), world_xyz (3,) on floor plane
     """
     T_base = camera_matrix_to_base_T(T_world_cam)
-    x, y, yaw, z = project_base_pose_to_floor(T_base, floor_plane)
+    x, y, yaw, legacy_z, world_xyz = project_base_pose_to_floor(T_base, floor_plane)
     action = base_pose_to_action_matrix(T_base, floor_plane)
-    return x, y, yaw, z, action
+    return x, y, yaw, legacy_z, action, world_xyz
 
 
 def floor_2d_pose_to_action_matrix(
@@ -235,14 +257,18 @@ def floor_2d_pose_to_action_matrix(
     z: float,
     floor_plane: tuple,
 ) -> np.ndarray:
-    """Build world-frame 4x4 action from floor-frame (x, y, yaw, z)."""
-    origin, x_ax, y_ax, n = build_floor_frame(floor_plane)
+    """Build world-frame 4x4 action from floor-frame (x, y, yaw).
+
+    ``z`` is accepted for backward compatibility but is not used for translation;
+    world position comes from (x, y) on the floor plane.
+    """
+    _, x_ax, y_ax, n = build_floor_frame(floor_plane)
     if n[2] < 0:
         n = -n
         x_ax = -x_ax
         y_ax = -y_ax
 
-    pos_world = origin + x * x_ax + y * y_ax + z * n
+    pos_world = floor_xy_to_world_on_plane(x, y, floor_plane)
     forward = math.cos(yaw) * x_ax + math.sin(yaw) * y_ax
     y_dir = np.cross(n, forward)
     y_dir /= np.linalg.norm(y_dir) + 1e-12

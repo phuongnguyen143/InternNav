@@ -22,6 +22,10 @@ class FloorEntry:
     y: float
     yaw: float
     z: float = 0.0
+    # World-frame 3D point on the floor plane (map/SLAM frame).
+    world_x: float = 0.0
+    world_y: float = 0.0
+    world_z: float = 0.0
 
 
 @dataclass
@@ -69,7 +73,11 @@ def parse_floor_trajectory_txt(filepath: str | Path) -> List[FloorEntry]:
     """
     Format (blocks of 2 lines):
         <timestamp>
-        <x> <y> <yaw> [<z>]
+        <x> <y> <yaw> [<legacy_z> [<world_x> <world_y> <world_z>]]
+
+    legacy_z is the old world-Z scalar (kept for backward compatibility).
+    When world_x/y/z are omitted they default to 0 and should be recomputed
+    from (x, y) + floor calibration at load time.
     """
     entries: List[FloorEntry] = []
     lines = Path(filepath).read_text().strip().splitlines()
@@ -91,8 +99,23 @@ def parse_floor_trajectory_txt(filepath: str | Path) -> List[FloorEntry]:
             i += 1
             continue
         x, y, yaw = float(parts[0]), float(parts[1]), float(parts[2])
-        z = float(parts[3]) if len(parts) >= 4 else 0.0
-        entries.append(FloorEntry(timestamp=timestamp, x=x, y=y, yaw=yaw, z=z))
+        legacy_z = float(parts[3]) if len(parts) >= 4 else 0.0
+        if len(parts) >= 7:
+            world_x, world_y, world_z = float(parts[4]), float(parts[5]), float(parts[6])
+        else:
+            world_x = world_y = world_z = 0.0
+        entries.append(
+            FloorEntry(
+                timestamp=timestamp,
+                x=x,
+                y=y,
+                yaw=yaw,
+                z=legacy_z,
+                world_x=world_x,
+                world_y=world_y,
+                world_z=world_z,
+            )
+        )
         i += 2
 
     if not entries:
@@ -110,7 +133,10 @@ def write_floor_trajectory_txt(filepath: str | Path, entries: List[FloorEntry]) 
     lines: List[str] = []
     for e in entries:
         lines.append(f"{e.timestamp:.9f}")
-        lines.append(f"{e.x:.8f} {e.y:.8f} {e.yaw:.8f} {e.z:.8f}")
+        lines.append(
+            f"{e.x:.8f} {e.y:.8f} {e.yaw:.8f} {e.z:.8f} "
+            f"{e.world_x:.8f} {e.world_y:.8f} {e.world_z:.8f}"
+        )
     path.write_text("\n".join(lines) + "\n")
     print(f"[FloorParser] Wrote {len(entries)} entries to {path}")
     return path

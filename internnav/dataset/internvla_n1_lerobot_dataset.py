@@ -11,10 +11,8 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 import transformers
-from decord import VideoReader
 from PIL import Image
 from torch.utils.data import Dataset
-from torchcodec.decoders import VideoDecoder
 from transformers.image_utils import to_numpy_array
 
 from .rope2d import get_rope_index_2, get_rope_index_25
@@ -123,7 +121,12 @@ SCALEVLN_60CM_30_30 = {
     "pitch_1": 30,
     "pitch_2": 30,
 }
-
+BKHN = {
+    "data_path": "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot_data_1",
+    "height": 125,
+    "pitch_1": 0,
+    "pitch_2": 30,
+}
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
@@ -141,6 +144,7 @@ data_dict = {
     "scalevln_125cm_0_30": SCALEVLN_125CM_0_30,
     "scalevln_125cm_0_45": SCALEVLN_125CM_0_45,
     "scalevln_60cm_30_30": SCALEVLN_60CM_30_30,
+    "bkhn_125cm_0_30": BKHN,
 }
 
 
@@ -212,7 +216,9 @@ def preprocess_qwen_2_visual(
 
         input_id, target = [], []
 
-        input_id += tokenizer.apply_chat_template([{"role": "system", "content": system_message}])
+        input_id += tokenizer.apply_chat_template(
+            [{"role": "system", "content": system_message}]
+        )
         target += [IGNORE_INDEX] * len(input_id)
 
         for conv in source:
@@ -232,7 +238,8 @@ def preprocess_qwen_2_visual(
                         new_parts.append(parts[i])
                         replacement = (
                             "<|vision_start|>"
-                            + f"<|image_pad|>" * grid_thw_image[visual_replicate_index_image]  # noqa: F541
+                            + f"<|image_pad|>"
+                            * grid_thw_image[visual_replicate_index_image]  # noqa: F541
                             + "<|vision_end|>"
                         )
                         new_parts.append(replacement)
@@ -247,7 +254,8 @@ def preprocess_qwen_2_visual(
                         new_parts.append(parts[i])
                         replacement = (
                             "<|vision_start|>"
-                            + "<|video_pad|>" * grid_thw_video[visual_replicate_index_video]
+                            + "<|video_pad|>"
+                            * grid_thw_video[visual_replicate_index_video]
                             + "<|vision_end|>"
                         )
                         new_parts.append(replacement)
@@ -287,8 +295,12 @@ class LazySupervisedDataset(Dataset):
         dataset = data_args.dataset_use.split(",")
         dataset_list = data_list(dataset)
         rank0_print(f"Loading datasets: {dataset_list}")
-        self.video_max_total_pixels = getattr(data_args, "video_max_total_pixels", 1664 * 28 * 28)
-        self.video_min_total_pixels = getattr(data_args, "video_min_total_pixels", 256 * 28 * 28)
+        self.video_max_total_pixels = getattr(
+            data_args, "video_max_total_pixels", 1664 * 28 * 28
+        )
+        self.video_min_total_pixels = getattr(
+            data_args, "video_min_total_pixels", 256 * 28 * 28
+        )
         self.model_type = data_args.model_type
         if data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
@@ -305,7 +317,9 @@ class LazySupervisedDataset(Dataset):
                 annotations = json.load(open(data["annotation_path"], "r"))
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
-                annotations = random.sample(annotations, int(len(annotations) * sampling_rate))
+                annotations = random.sample(
+                    annotations, int(len(annotations) * sampling_rate)
+                )
                 print(f"sampling {len(annotations)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
@@ -334,15 +348,22 @@ class LazySupervisedDataset(Dataset):
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
-            length_list.append(sum(len(conv["value"].split()) for conv in sample["conversations"]) + img_tokens)
+            length_list.append(
+                sum(len(conv["value"].split()) for conv in sample["conversations"])
+                + img_tokens
+            )
         return length_list
 
     @property
     def modality_lengths(self):
         length_list = []
         for sample in self.list_data_dict:
-            cur_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
-            cur_len = cur_len if ("image" in sample) or ("video" in sample) else -cur_len
+            cur_len = sum(
+                len(conv["value"].split()) for conv in sample["conversations"]
+            )
+            cur_len = (
+                cur_len if ("image" in sample) or ("video" in sample) else -cur_len
+            )
             length_list.append(cur_len)
         return length_list
 
@@ -388,6 +409,8 @@ class LazySupervisedDataset(Dataset):
             print(f"torchcodec attempt failed: {e}")
 
     def video_decord(self, video_file):
+        from decord import VideoReader
+
         if not os.path.exists(video_file):
             print(f"File not exist: {video_file}")
         vr = VideoReader(video_file, num_threads=4)
@@ -400,13 +423,17 @@ class LazySupervisedDataset(Dataset):
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
         video_max_frames = getattr(self.data_args, "video_max_frames", 8)
 
-        target_frames = min(max(num_frames_to_sample, video_min_frames), video_max_frames)
+        target_frames = min(
+            max(num_frames_to_sample, video_min_frames), video_max_frames
+        )
         frame_idx = np.linspace(0, total_frames - 1, target_frames, dtype=int)
         frame_idx = np.unique(frame_idx)
         video = vr.get_batch(frame_idx).asnumpy()
         return self.process_video_frames(video, frame_idx, video_length)
 
     def video_torchcodec(self, video_file):
+        from torchcodec.decoders import VideoDecoder
+
         device = "cpu"  # or e.g. "cuda"
         decoder = VideoDecoder(video_file, device=device)
         total_frames = decoder.metadata.num_frames
@@ -418,7 +445,9 @@ class LazySupervisedDataset(Dataset):
         video_min_frames = getattr(self.data_args, "video_min_frames", 4)
         video_max_frames = getattr(self.data_args, "video_max_frames", 8)
 
-        target_frames = min(max(num_frames_to_sample, video_min_frames), video_max_frames)
+        target_frames = min(
+            max(num_frames_to_sample, video_min_frames), video_max_frames
+        )
         frame_idx = np.linspace(0, total_frames - 1, target_frames, dtype=int)
         frame_idx = np.unique(frame_idx)
         frame_batch = decoder.get_frames_at(indices=frame_idx.tolist())
@@ -432,10 +461,14 @@ class LazySupervisedDataset(Dataset):
         processor.min_pixels = self.data_args.video_min_frame_pixels
         processor.size["longest_edge"] = processor.max_pixels
         processor.size["shortest_edge"] = processor.min_pixels
-        video_processed = processor.preprocess(images=None, videos=video, return_tensors="pt")
+        video_processed = processor.preprocess(
+            images=None, videos=video, return_tensors="pt"
+        )
         video_tensor = video_processed["pixel_values_videos"]
         grid_thw = video_processed["video_grid_thw"][0]
-        second_per_grid_ts = [self.data_args.image_processor.temporal_patch_size / fps] * len(grid_thw)
+        second_per_grid_ts = [
+            self.data_args.image_processor.temporal_patch_size / fps
+        ] * len(grid_thw)
         return video_tensor, grid_thw, second_per_grid_ts
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
@@ -490,7 +523,9 @@ class LazySupervisedDataset(Dataset):
             image_file = self.list_data_dict[i]["image"]
             if isinstance(image_file, List):
                 if len(image_file) > 1:
-                    image_file = [os.path.join(image_folder, file) for file in image_file]
+                    image_file = [
+                        os.path.join(image_folder, file) for file in image_file
+                    ]
                     results = [self.process_image_unified(file) for file in image_file]
                     image, grid_thw = zip(*results)
                 else:
@@ -507,24 +542,31 @@ class LazySupervisedDataset(Dataset):
                 grid_thw_merged = [grid_thw_merged]
                 grid_thw = [grid_thw]
             grid_thw_merged = [
-                merged_thw.prod() // self.data_args.image_processor.merge_size**2 for merged_thw in grid_thw_merged
+                merged_thw.prod() // self.data_args.image_processor.merge_size**2
+                for merged_thw in grid_thw_merged
             ]
         if "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
             video_folder = self.list_data_dict[i]["data_path"]
             if isinstance(video_file, List):
                 if len(video_file) > 1:
-                    video_file = [os.path.join(video_folder, file) for file in video_file]
+                    video_file = [
+                        os.path.join(video_folder, file) for file in video_file
+                    ]
                     results = [self.process_video(file) for file in video_file]
                     video, video_grid_thw, second_per_grid_ts = zip(*results)
                 else:
                     video_file = video_file[0]
                     video_file = os.path.join(video_folder, video_file)
-                    video, video_grid_thw, second_per_grid_ts = self.process_video(video_file)
+                    video, video_grid_thw, second_per_grid_ts = self.process_video(
+                        video_file
+                    )
                     video = [video]
             else:
                 video_file = os.path.join(video_folder, video_file)
-                video, video_grid_thw, second_per_grid_ts = self.process_video(video_file)
+                video, video_grid_thw, second_per_grid_ts = self.process_video(
+                    video_file
+                )
                 video = [video]
             video_grid_thw_merged = copy.deepcopy(video_grid_thw)
             if not isinstance(video_grid_thw, Sequence):
@@ -545,25 +587,38 @@ class LazySupervisedDataset(Dataset):
             self.data_args.image_processor.merge_size,
             data_dict["input_ids"],
             image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
-            video_grid_thw=(torch.stack(video_grid_thw, dim=0) if video_grid_thw else None),
+            video_grid_thw=(
+                torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
+            ),
             second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
         )
         if "image" not in sources[0] and "video" not in sources[0]:
             grid_thw_merged = None
             sources = copy.deepcopy([e["conversations"] for e in sources])
-            data_dict = preprocess_qwen_2_visual(sources, self.tokenizer, grid_thw=grid_thw_merged)
-            position_ids = torch.arange(0, data_dict["input_ids"].size(1)).view(1, -1).unsqueeze(0).expand(3, -1, -1)
+            data_dict = preprocess_qwen_2_visual(
+                sources, self.tokenizer, grid_thw=grid_thw_merged
+            )
+            position_ids = (
+                torch.arange(0, data_dict["input_ids"].size(1))
+                .view(1, -1)
+                .unsqueeze(0)
+                .expand(3, -1, -1)
+            )
 
         data_dict["position_ids"] = position_ids
         data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
 
         if "image" in self.list_data_dict[i]:
             data_dict["pixel_values"] = torch.cat(image, dim=0)
-            data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thw], dim=0)
+            data_dict["image_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in grid_thw], dim=0
+            )
         # video exist in the data
         elif "video" in self.list_data_dict[i]:
             data_dict["pixel_values_videos"] = torch.cat(video, dim=0)
-            data_dict["video_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in video_grid_thw], dim=0)
+            data_dict["video_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in video_grid_thw], dim=0
+            )
 
         return data_dict
 
@@ -581,7 +636,9 @@ def interpolate_and_resample_trajectory(absolute_trajectories, predict_step_num=
     filtered_traj = traj[1:][mask]  # (T, 2), where M is the number of filtered steps
     filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)  # (T+1, 2)
 
-    resampled_trajectories = smooth_and_resample_trajectory(filtered_traj, sample_length=predict_step_num + 1)
+    resampled_trajectories = smooth_and_resample_trajectory(
+        filtered_traj, sample_length=predict_step_num + 1
+    )
     resampled_relative_poses = xy_to_delta_xyt(resampled_trajectories)
 
     resampled_relative_poses[:, 0:2] *= 4  # norm
@@ -603,11 +660,25 @@ def get_trajectory_relative_to_frame(extrinsics, camera_deg=0):
     # T_world2camera
     # Coordinate transformation matrices
     T_camera2robot = np.array(
-        [[[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+        [
+            [
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ]
     )
 
     T_robot2camera = np.array(
-        [[[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+        [
+            [
+                [0.0, 0.0, 1.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ]
     )
 
     # Apply camera pitch angle transformation (30 degrees downward)
@@ -643,7 +714,9 @@ def get_trajectory_relative_to_frame(extrinsics, camera_deg=0):
     relative_translations = relative_to_ref[:, :2, 3]  # (x, y), only take the xy-plane
     relative_yaws = np.arctan2(relative_to_ref[:, 1, 0], relative_to_ref[:, 0, 0])
 
-    relative_xyyaw = np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
+    relative_xyyaw = np.concatenate(
+        (relative_translations, relative_yaws.reshape(-1, 1)), axis=-1
+    )
 
     return relative_xyyaw
 
@@ -664,7 +737,9 @@ def smooth_and_resample_trajectory(points, sample_length=33, interval=0.1):
     diff = np.diff(points, axis=0)
     segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
     cumulative_distances = np.cumsum(segment_lengths)
-    cumulative_distances = np.insert(cumulative_distances, 0, 0)  # Starting point distance is 0
+    cumulative_distances = np.insert(
+        cumulative_distances, 0, 0
+    )  # Starting point distance is 0
 
     # Use cubic spline interpolation for smoothing
     if len(points) > 3:  # At least 4 points are needed for cubic spline interpolation
@@ -673,7 +748,9 @@ def smooth_and_resample_trajectory(points, sample_length=33, interval=0.1):
         cs_y = CubicSpline(cumulative_distances, points[:, 1])
 
         # Perform dense sampling within the original cumulative distance range
-        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
+        dense_distances = np.linspace(
+            0, cumulative_distances[-1], max(50, len(points) * 2)
+        )
         x_smooth = cs_x(dense_distances)
         y_smooth = cs_y(dense_distances)
         smoothed_points = np.column_stack((x_smooth, y_smooth))
@@ -702,7 +779,9 @@ def smooth_and_resample_trajectory(points, sample_length=33, interval=0.1):
             continue
 
         # Find the line segment where the target distance is located
-        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side='right') - 1
+        segment_idx = (
+            np.searchsorted(smooth_cumulative_distances, target_dist, side="right") - 1
+        )
 
         # Calculate interpolation ratio
         start_dist = smooth_cumulative_distances[segment_idx]
@@ -755,10 +834,17 @@ def get_annotations_from_lerobot_data(data_path, setting):
     import pyarrow.parquet as pq
 
     annotations = {
-        "axis_align_matrix": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        "axis_align_matrix": [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
         "episodes": [],
     }
-    scene_ids = [d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))]
+    scene_ids = [
+        d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d))
+    ]
 
     def process_scene(scene_id):
         scene_path = os.path.join(data_path, scene_id)
@@ -770,7 +856,10 @@ def get_annotations_from_lerobot_data(data_path, setting):
             ep_instructions = ep["tasks"][0].split("<INSTRUCTION_SEP>")
             ep_len = ep["length"]
             parquet_path = os.path.join(
-                scene_path, "data", f"chunk-{ep_id // 1000:03d}", f"episode_{ep_id:06d}.parquet"
+                scene_path,
+                "data",
+                f"chunk-{ep_id // 1000:03d}",
+                f"episode_{ep_id:06d}.parquet",
             )
 
             table = pq.read_table(parquet_path)
@@ -782,15 +871,27 @@ def get_annotations_from_lerobot_data(data_path, setting):
             goal_key = f"goal.{setting}"
             relative_goal_frame_id_key = f"relative_goal_frame_id.{setting}"
 
-            if pose_key in df.columns and goal_key in df.columns and relative_goal_frame_id_key in df.columns:
+            if (
+                pose_key in df.columns
+                and goal_key in df.columns
+                and relative_goal_frame_id_key in df.columns
+            ):
                 ep_poses = df[pose_key].apply(lambda x: x.tolist()).tolist()
                 ep_pixel_goals = [
-                    [df[relative_goal_frame_id_key][idx].tolist(), df[goal_key][idx].tolist()] for idx in range(len(df))
+                    [
+                        df[relative_goal_frame_id_key][idx].tolist(),
+                        df[goal_key][idx].tolist(),
+                    ]
+                    for idx in range(len(df))
                 ]
             else:
-                print(f"Warning: Missing data for setting {setting} in episode {ep_id}, filling with defaults.")
+                print(
+                    f"Warning: Missing data for setting {setting} in episode {ep_id}, filling with defaults."
+                )
 
-            assert len(ep_actions) == ep_len, f"Action length mismatch in episode {ep_id}"
+            assert len(ep_actions) == ep_len, (
+                f"Action length mismatch in episode {ep_id}"
+            )
 
             for ep_instruction in ep_instructions:
                 episode = {
@@ -807,7 +908,9 @@ def get_annotations_from_lerobot_data(data_path, setting):
         return scene_annotations
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(process_scene, scene_id): scene_id for scene_id in scene_ids}
+        futures = {
+            executor.submit(process_scene, scene_id): scene_id for scene_id in scene_ids
+        }
         for future in as_completed(futures):
             scene_id = futures[future]
             try:
@@ -825,8 +928,12 @@ class NavPixelGoalDataset(Dataset):
         dataset = data_args.vln_dataset_use.split(",")
         dataset_list = data_list(dataset)
         rank0_print(f"Loading datasets: {dataset_list}")
-        self.video_max_total_pixels = getattr(data_args, "video_max_total_pixels", 1664 * 28 * 28)
-        self.video_min_total_pixels = getattr(data_args, "video_min_total_pixels", 256 * 28 * 28)
+        self.video_max_total_pixels = getattr(
+            data_args, "video_max_total_pixels", 1664 * 28 * 28
+        )
+        self.video_min_total_pixels = getattr(
+            data_args, "video_min_total_pixels", 256 * 28 * 28
+        )
         self.model_type = data_args.model_type
         if data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
@@ -846,21 +953,21 @@ class NavPixelGoalDataset(Dataset):
             pitch_1 = data.get("pitch_1", None)
             pitch_2 = data.get("pitch_2", None)
 
-            data_path = data['data_path']
-            setting = f'{height}cm_{pitch_2}deg'
+            data_path = data["data_path"]
+            setting = f"{height}cm_{pitch_2}deg"
             annotations = get_annotations_from_lerobot_data(data_path, setting)
 
             pixel_goal_list = []
             turn_list = []
             stop_list = []
             list_data_dict = []
-            for item in annotations['episodes']:
-                ep_id = item['id']
-                instruction = item['instructions']
-                video = item['video']
-                actions = item['actions'][1:] + [0]
-                pixel_goals = item['pixel_goals']
-                poses = item[f'poses_{height}cm_{pitch_2}deg']
+            for item in annotations["episodes"]:
+                ep_id = item["id"]
+                instruction = item["instructions"]
+                video = item["video"]
+                actions = item["actions"][1:] + [0]
+                pixel_goals = item["pixel_goals"]
+                poses = item[f"poses_{height}cm_{pitch_2}deg"]
 
                 actions_len = len(actions)
                 if actions_len < 4:
@@ -868,7 +975,10 @@ class NavPixelGoalDataset(Dataset):
 
                 num_rounds = actions_len // self.sample_step
                 for n in range(num_rounds + 1):
-                    if n * self.sample_step == actions_len or n * self.sample_step == actions_len - 1:
+                    if (
+                        n * self.sample_step == actions_len
+                        or n * self.sample_step == actions_len - 1
+                    ):
                         continue
                     start_frame_id = n * self.sample_step
                     action_flag = actions[start_frame_id]
@@ -877,7 +987,9 @@ class NavPixelGoalDataset(Dataset):
                         if action_flag == 1:
                             continue
                         else:
-                            end_frame_id = min(actions_len, start_frame_id + self.num_future_steps)
+                            end_frame_id = min(
+                                actions_len, start_frame_id + self.num_future_steps
+                            )
                             turn_actions = []
                             for id in range(start_frame_id, end_frame_id):
                                 if actions[id] == 1:
@@ -939,7 +1051,9 @@ class NavPixelGoalDataset(Dataset):
                 list_data_dict += turn_list
                 list_data_dict += stop_list * 5
             if sampling_rate < 1.0:
-                list_data_dict = random.sample(list_data_dict, int(len(list_data_dict) * sampling_rate))
+                list_data_dict = random.sample(
+                    list_data_dict, int(len(list_data_dict) * sampling_rate)
+                )
                 print(f"sampling {len(list_data_dict)} examples from dataset {data}")
             else:
                 rank0_print(f"dataset name: {data}")
@@ -947,15 +1061,15 @@ class NavPixelGoalDataset(Dataset):
             self.list_data_dict.extend(list_data_dict)
 
         self.num_history = data_args.num_history
-        self.idx2actions = {0: 'STOP', 1: "↑", 2: "←", 3: "→", 5: "↓"}
+        self.idx2actions = {0: "STOP", 1: "↑", 2: "←", 3: "→", 5: "↓"}
         self.conjunctions = [
-            'you can see ',
-            'in front of you is ',
-            'there is ',
-            'you can spot ',
-            'you are toward the ',
-            'ahead of you is ',
-            'in your sight is ',
+            "you can see ",
+            "in front of you is ",
+            "there is ",
+            "you can spot ",
+            "you are toward the ",
+            "ahead of you is ",
+            "in your sight is ",
         ]
         self.data_args = data_args
         self.tokenizer = tokenizer
@@ -973,13 +1087,20 @@ class NavPixelGoalDataset(Dataset):
         return image_tensor, grid_thw
 
     def preprocess_depth_image_v2(
-        self, depth_image, do_depth_scale=True, depth_scale=1000, target_height=None, target_width=None
+        self,
+        depth_image,
+        do_depth_scale=True,
+        depth_scale=1000,
+        target_height=None,
+        target_width=None,
     ):
         if target_height is None:
-            target_height = self.image_processor.crop_size['height']
-            target_width = self.image_processor.crop_size['width']
+            target_height = self.image_processor.crop_size["height"]
+            target_width = self.image_processor.crop_size["width"]
 
-        resized_depth_image = depth_image.resize((target_width, target_height), Image.NEAREST)
+        resized_depth_image = depth_image.resize(
+            (target_width, target_height), Image.NEAREST
+        )
 
         img = to_numpy_array(resized_depth_image)
         if do_depth_scale:
@@ -1001,7 +1122,9 @@ class NavPixelGoalDataset(Dataset):
             pose,
         ) = self.list_data_dict[i]
         if start_frame_id != 0:
-            history_id = np.unique(np.linspace(0, start_frame_id - 1, self.num_history, dtype=np.int32)).tolist()
+            history_id = np.unique(
+                np.linspace(0, start_frame_id - 1, self.num_history, dtype=np.int32)
+            ).tolist()
         else:
             history_id = []
 
@@ -1012,19 +1135,31 @@ class NavPixelGoalDataset(Dataset):
 
         for id in range(0, end_frame_id):
             image_file = os.path.join(
-                video, f"observation.images.rgb.{height}cm_{pitch_1}deg", f"episode_{ep_id:06d}_{id}.jpg"
+                video,
+                f"observation.images.rgb.{height}cm_{pitch_1}deg",
+                f"episode_{ep_id:06d}_{id}.jpg",
             )
-            image = Image.open(image_file).convert('RGB')
-            lookdown_image = Image.open(image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg')).convert('RGB')
+            image = Image.open(image_file).convert("RGB")
+            lookdown_image = Image.open(
+                image_file.replace(f"_{pitch_1}deg", f"_{pitch_2}deg")
+            ).convert("RGB")
 
             depth_image = Image.open(
-                image_file.replace(f'_{pitch_1}deg', f'_{pitch_2}deg').replace('rgb', 'depth').replace('.jpg', '.png')
+                image_file.replace(f"_{pitch_1}deg", f"_{pitch_2}deg")
+                .replace("rgb", "depth")
+                .replace(".jpg", ".png")
             )
 
             depth_image, resize_shape = self.preprocess_depth_image_v2(
-                depth_image, do_depth_scale=True, depth_scale=1000, target_height=224, target_width=224
+                depth_image,
+                do_depth_scale=True,
+                depth_scale=1000,
+                target_height=224,
+                target_width=224,
             )
-            depth_image = torch.as_tensor(np.ascontiguousarray(depth_image)).float()  # [H, W]
+            depth_image = torch.as_tensor(
+                np.ascontiguousarray(depth_image)
+            ).float()  # [H, W]
             if id in history_id or id == start_frame_id:
                 if self.data_args.transform_train is not None:
                     image = self.data_args.transform_train(image)
@@ -1047,38 +1182,45 @@ class NavPixelGoalDataset(Dataset):
             chat_sources = [
                 [
                     {
-                        'from': 'human',
-                        'value': f"You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task. These are your historical observations: <history>. {random.choice(self.conjunctions)}<image>.",
+                        "from": "human",
+                        "value": f"You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task. These are your historical observations: <history>. {random.choice(self.conjunctions)}<image>.",
                     }
                 ]
             ]
-            chat_sources[0][0]['value'] = (
-                chat_sources[0][0]['value'].replace('<instruction>', instruction).replace('<history>', history_imgs)
+            chat_sources[0][0]["value"] = (
+                chat_sources[0][0]["value"]
+                .replace("<instruction>", instruction)
+                .replace("<history>", history_imgs)
             )
         else:
             chat_sources = [
                 [
                     {
-                        'from': 'human',
-                        'value': f"You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task. {random.choice(self.conjunctions)}<image>.",
+                        "from": "human",
+                        "value": f"You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task. {random.choice(self.conjunctions)}<image>.",
                     }
                 ]
             ]
-            chat_sources[0][0]['value'] = chat_sources[0][0]['value'].replace('<instruction>', instruction)
+            chat_sources[0][0]["value"] = chat_sources[0][0]["value"].replace(
+                "<instruction>", instruction
+            )
 
         if pose is not None:
             chat_sources[0].extend(
                 [
-                    {'from': 'gpt', 'value': self.idx2actions[5]},
-                    {'from': 'human', 'value': f'{random.choice(self.conjunctions)}<image>.'},
-                    {'from': 'gpt', 'value': f'{action[0]} {action[1]}'},
+                    {"from": "gpt", "value": self.idx2actions[5]},
+                    {
+                        "from": "human",
+                        "value": f"{random.choice(self.conjunctions)}<image>.",
+                    },
+                    {"from": "gpt", "value": f"{action[0]} {action[1]}"},
                 ]
             )
         elif action == 0:
-            chat_sources[0].extend([{'from': 'gpt', 'value': self.idx2actions[action]}])
+            chat_sources[0].extend([{"from": "gpt", "value": self.idx2actions[action]}])
         else:
-            turn_action_text = ''.join([self.idx2actions[idx] for idx in action])
-            chat_sources[0].extend([{'from': 'gpt', 'value': turn_action_text}])
+            turn_action_text = "".join([self.idx2actions[idx] for idx in action])
+            chat_sources[0].extend([{"from": "gpt", "value": turn_action_text}])
 
         grid_thw_merged = copy.deepcopy(grid_thws)
 
@@ -1087,7 +1229,8 @@ class NavPixelGoalDataset(Dataset):
             grid_thws = [grid_thws]
 
         grid_thw_merged = [
-            merged_thw.prod() // self.data_args.image_processor.merge_size**2 for merged_thw in grid_thw_merged
+            merged_thw.prod() // self.data_args.image_processor.merge_size**2
+            for merged_thw in grid_thw_merged
         ]
 
         data_dict = preprocess_qwen_2_visual(
@@ -1105,25 +1248,38 @@ class NavPixelGoalDataset(Dataset):
         data_dict["position_ids"] = position_ids
         data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
         data_dict["pixel_values"] = torch.cat(images, dim=0)
-        data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
+        data_dict["image_grid_thw"] = torch.cat(
+            [thw.unsqueeze(0) for thw in grid_thws], dim=0
+        )
 
         if self.pixel_goal_only:
             goal_len = end_frame_id - start_frame_id - 1
             interval = 2
             frame_ids = np.arange(0, goal_len, interval)
             max_len = 12
-            traj_images = torch.tensor(np.stack([np.asarray(timg.resize((224, 224))) for timg in traj_images])) / 255.0
+            traj_images = (
+                torch.tensor(
+                    np.stack(
+                        [np.asarray(timg.resize((224, 224))) for timg in traj_images]
+                    )
+                )
+                / 255.0
+            )
             if len(frame_ids) > max_len:
                 interval = int(np.ceil(goal_len / max_len))
                 frame_ids = np.arange(0, goal_len, interval)
 
             traj_poses_gt = []
             for cid in frame_ids:
-                discrete_traj_pose = get_trajectory_relative_to_frame(pose[cid:], camera_deg=pitch_2)
+                discrete_traj_pose = get_trajectory_relative_to_frame(
+                    pose[cid:], camera_deg=pitch_2
+                )
                 rel_trajectory, rel_pose_resample = interpolate_and_resample_trajectory(
                     discrete_traj_pose, self.predict_step_num
                 )
-                rel_pose_resample = clip_or_pad(rel_pose_resample, self.predict_step_num)
+                rel_pose_resample = clip_or_pad(
+                    rel_pose_resample, self.predict_step_num
+                )
                 traj_poses_gt.append(torch.tensor(rel_pose_resample))
 
             data_dict["traj_images"] = traj_images[:goal_len][::interval]
@@ -1168,7 +1324,10 @@ class DataCollatorForSupervisedDataset(object):
         t_s_pos = [0] * batch_size
 
         traj_token_template = torch.full(
-            (traj_token_length,), TRAJ_TOKEN_INDEX, dtype=input_ids[0].dtype, device=input_ids[0].device
+            (traj_token_length,),
+            TRAJ_TOKEN_INDEX,
+            dtype=input_ids[0].dtype,
+            device=input_ids[0].device,
         )
 
         for i in range(batch_size):
@@ -1184,18 +1343,23 @@ class DataCollatorForSupervisedDataset(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels, position_ids = tuple(
-            [instance[key] for instance in instances] for key in ("input_ids", "labels", "position_ids")
+            [instance[key] for instance in instances]
+            for key in ("input_ids", "labels", "position_ids")
         )
         input_ids = [ids.squeeze(0) for ids in input_ids]
         labels = [ids.squeeze(0) for ids in labels]
 
         if "traj_images" in instances[0]:
-            input_ids, labels, t_s_pos = self.process_input_with_traj_tokens(input_ids, labels)
+            input_ids, labels, t_s_pos = self.process_input_with_traj_tokens(
+                input_ids, labels
+            )
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=IGNORE_INDEX
+        )
 
         if input_ids.shape[1] > self.tokenizer.model_max_length:
             print(
@@ -1211,11 +1375,23 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-        images = list(instance["pixel_values"] for instance in instances if "pixel_values" in instance)
-        videos = list(instance["pixel_values_videos"] for instance in instances if "pixel_values_videos" in instance)
+        images = list(
+            instance["pixel_values"]
+            for instance in instances
+            if "pixel_values" in instance
+        )
+        videos = list(
+            instance["pixel_values_videos"]
+            for instance in instances
+            if "pixel_values_videos" in instance
+        )
         if len(images) != 0:
             concat_images = torch.cat([image for image in images], dim=0)
-            grid_thw = [instance["image_grid_thw"] for instance in instances if "image_grid_thw" in instance]
+            grid_thw = [
+                instance["image_grid_thw"]
+                for instance in instances
+                if "image_grid_thw" in instance
+            ]
             grid_thw = torch.cat(grid_thw, dim=0)
         else:
             concat_images = None
@@ -1223,7 +1399,11 @@ class DataCollatorForSupervisedDataset(object):
 
         if len(videos) != 0:
             concat_videos = torch.cat([video for video in videos], dim=0)
-            video_grid_thw = [instance["video_grid_thw"] for instance in instances if "video_grid_thw" in instance]
+            video_grid_thw = [
+                instance["video_grid_thw"]
+                for instance in instances
+                if "video_grid_thw" in instance
+            ]
             video_grid_thw = torch.cat(video_grid_thw, dim=0)
         else:
             concat_videos = None
@@ -1237,7 +1417,8 @@ class DataCollatorForSupervisedDataset(object):
 
         if "traj_images" in instances[0]:
             traj_images, traj_depths, traj_poses = tuple(
-                [instance[key] for instance in instances] for key in ("traj_images", "traj_depths", "traj_poses")
+                [instance[key] for instance in instances]
+                for key in ("traj_images", "traj_depths", "traj_poses")
             )
             video_frame_num = []
             max_len = max(img.shape[0] for img in traj_images)
@@ -1269,12 +1450,12 @@ class DataCollatorForSupervisedDataset(object):
                 traj_image_batch.append(padded_img)
                 traj_depth_batch.append(padded_depth)
                 traj_pose_batch.append(padded_pose)
-            batch['position_ids'] = None
-            batch['t_s_pos'] = t_s_pos
-            batch['traj_images'] = torch.stack(traj_image_batch)
-            batch['traj_depths'] = torch.stack(traj_depth_batch)
-            batch['traj_poses'] = torch.stack(traj_pose_batch)
-            batch['video_frame_num'] = torch.tensor(video_frame_num)
+            batch["position_ids"] = None
+            batch["t_s_pos"] = t_s_pos
+            batch["traj_images"] = torch.stack(traj_image_batch)
+            batch["traj_depths"] = torch.stack(traj_depth_batch)
+            batch["traj_poses"] = torch.stack(traj_pose_batch)
+            batch["video_frame_num"] = torch.tensor(video_frame_num)
 
         return batch
 
@@ -1291,7 +1472,13 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
             for key in ("input_ids", "labels", "position_ids", "attention_mask")
         )
         attention_mask = list(
-            itertools.chain(*(instance["attention_mask"] for instance in instances if "attention_mask" in instance))
+            itertools.chain(
+                *(
+                    instance["attention_mask"]
+                    for instance in instances
+                    if "attention_mask" in instance
+                )
+            )
         )
         seq_lens = torch.tensor([0] + attention_mask, dtype=torch.int32)
         cumsum_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
@@ -1305,11 +1492,23 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
             attention_mask=cumsum_seq_lens,
             position_ids=position_ids,
         )
-        images = list(instance["pixel_values"] for instance in instances if "pixel_values" in instance)
-        videos = list(instance["pixel_values_videos"] for instance in instances if "pixel_values_videos" in instance)
+        images = list(
+            instance["pixel_values"]
+            for instance in instances
+            if "pixel_values" in instance
+        )
+        videos = list(
+            instance["pixel_values_videos"]
+            for instance in instances
+            if "pixel_values_videos" in instance
+        )
         if len(images) != 0:
             concat_images = torch.cat([image for image in images], dim=0)
-            grid_thw = [instance["image_grid_thw"] for instance in instances if "image_grid_thw" in instance]
+            grid_thw = [
+                instance["image_grid_thw"]
+                for instance in instances
+                if "image_grid_thw" in instance
+            ]
             grid_thw = torch.cat(grid_thw, dim=0)
         else:
             concat_images = None
@@ -1317,7 +1516,11 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
 
         if len(videos) != 0:
             concat_videos = torch.cat([video for video in videos], dim=0)
-            video_grid_thw = [instance["video_grid_thw"] for instance in instances if "video_grid_thw" in instance]
+            video_grid_thw = [
+                instance["video_grid_thw"]
+                for instance in instances
+                if "video_grid_thw" in instance
+            ]
             video_grid_thw = torch.cat(video_grid_thw, dim=0)
         else:
             concat_videos = None
@@ -1368,19 +1571,27 @@ class CombinedDataset(Dataset):
         raise ValueError(f"Index {real_idx} out of bound")
 
 
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+def make_supervised_data_module(
+    tokenizer: transformers.PreTrainedTokenizer, data_args
+) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_datasets = []
     if data_args.iign_dataset_use:
         train_datasets.append(VLLNDataset(tokenizer=tokenizer, data_args=data_args))
     if data_args.vln_dataset_use:
-        train_datasets.append(NavPixelGoalDataset(tokenizer=tokenizer, data_args=data_args))
+        train_datasets.append(
+            NavPixelGoalDataset(tokenizer=tokenizer, data_args=data_args)
+        )
     train_dataset = CombinedDataset(train_datasets, shuffle=False)
     if data_args.data_flatten:
         data_collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+        return dict(
+            train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+        )
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(
+        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+    )
 
 
 if __name__ == "__main__":

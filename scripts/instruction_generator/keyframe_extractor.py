@@ -32,10 +32,15 @@ from constants import (
     DEFAULT_RGB_TOPIC,
     DEFAULT_SYNC_SLOP_SEC,
     FLOOR_CALIBRATION_FILENAME,
+    FLOOR_TRAJECTORY_FILENAME,
 )
-from floor_pose import load_floor_calibration, floor_2d_pose_to_action_matrix
+from floor_pose import (
+    floor_2d_pose_to_action_matrix,
+    floor_xy_to_world_on_plane,
+    load_floor_calibration,
+)
 from keyframe_selection import KeyframeConfig, extract_keyframes, get_frame_from_video
-from trajectory_io import OdomMatcher, parse_odom_txt
+from trajectory_io import FloorMatcher, OdomMatcher, parse_floor_trajectory_txt, parse_odom_txt
 
 
 def _clear_episode_dir(episode_dir: Path) -> None:
@@ -204,6 +209,15 @@ class KeyframeExtractor(Node):
         else:
             self.get_logger().warn("camera_odom_file not set; poses.json will lack camera_matrix.")
 
+        floor_matcher = None
+        floor_traj_path = self.output_dir / FLOOR_TRAJECTORY_FILENAME
+        if floor_traj_path.is_file():
+            floor_entries = parse_floor_trajectory_txt(floor_traj_path)
+            floor_matcher = FloorMatcher(floor_entries, max_dt=DEFAULT_OFFLINE_MATCH_MAX_DT)
+            self.get_logger().info(
+                f"Merging floor world xyz from {floor_traj_path} ({len(floor_entries)} entries)"
+            )
+
         merged = 0
         for pose in self.poses:
             ts = pose["timestamp"]
@@ -218,6 +232,34 @@ class KeyframeExtractor(Node):
                     merged += 1
 
             if self.floor_plane is not None:
+                world_xyz = None
+                if floor_matcher is not None:
+                    floor_entry = floor_matcher.find_closest(ts)
+                    if floor_entry is not None:
+                        if (
+                            abs(floor_entry.world_x)
+                            + abs(floor_entry.world_y)
+                            + abs(floor_entry.world_z)
+                            > 1e-9
+                        ):
+                            world_xyz = np.array(
+                                [floor_entry.world_x, floor_entry.world_y, floor_entry.world_z],
+                                dtype=np.float64,
+                            )
+                        pose["x"] = float(floor_entry.x)
+                        pose["y"] = float(floor_entry.y)
+                        pose["yaw"] = float(floor_entry.yaw)
+                        pose["z"] = float(floor_entry.z)
+
+                if world_xyz is None:
+                    world_xyz = floor_xy_to_world_on_plane(
+                        pose["x"], pose["y"], self.floor_plane
+                    )
+
+                pose["world_x"] = float(world_xyz[0])
+                pose["world_y"] = float(world_xyz[1])
+                pose["world_z"] = float(world_xyz[2])
+
                 action = floor_2d_pose_to_action_matrix(
                     pose["x"],
                     pose["y"],
@@ -384,6 +426,9 @@ class KeyframeExtractor(Node):
             }
             if "z" in kf.pose:
                 kf_meta["z"] = kf.pose["z"]
+            for wk in ("world_x", "world_y", "world_z"):
+                if wk in kf.pose:
+                    kf_meta[wk] = kf.pose[wk]
             if "action_matrix" in kf.pose:
                 kf_meta["action_matrix"] = kf.pose["action_matrix"]
             metadata.append(kf_meta)

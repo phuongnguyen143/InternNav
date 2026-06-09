@@ -42,7 +42,8 @@ keyframe_output/
 ├── keyframes/                  # Labelled keyframe images
 ├── keyframes.json              # Keyframe metadata (position, yaw, timestamp)
 ├── floor_calibration.json      # Floor plane (copy from precompute output_dir)
-├── poses.json                  # Floor x,y,yaw + camera_matrix + action_matrix per frame
+├── poses.json                  # Floor pose + world_x/y/z + camera_matrix + action_matrix
+├── floor_trajectory.txt        # Copy or symlink from precompute (used at finalize)
 ├── trajectory.png              # Top-down trajectory visualization
 └── episodes/
     ├── episodes.json           # Episode and subclip metadata
@@ -108,11 +109,44 @@ Floor estimation is **offline** (slow on large PCDs). Do not run it inside ROS n
 python precompute_floor_trajectory.py \
   --pcd /path/to/scene.pcd \
   --camera_odom /path/to/odometry_camera.txt \
-  --output_dir /path/to/scene_dir/
+  --output_dir /path/to/scene_dir/ \
+  --smooth moving_average --smooth_window 5
 ```
 
-Writes `floor_calibration.json` and `floor_trajectory.txt` (timestamp + `x y yaw z` per line).
+Writes `floor_calibration.json` and `floor_trajectory.txt`.
+
+**`floor_trajectory.txt` format** (2 lines per sample):
+
+```text
+<timestamp>
+<x> <y> <yaw> <legacy_z> <world_x> <world_y> <world_z>
+```
+
+- `x, y, yaw` — floor-frame embodiment pose (for actions / top-down plots)
+- `legacy_z` — world-Z of projected base point (kept for compatibility)
+- `world_x/y/z` — **3D point on the floor plane** in map/SLAM frame (used for pixel-goal projection)
+
+Older 3- or 4-field rows still parse; `world_*` is recomputed from `(x,y)` + calibration when missing.
+
 Large clouds use coarser patch stride automatically; override with `--stride` / `--patch_radius`.
+
+**Trajectory smoothing** (applied before save; timestamps unchanged):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--smooth` | `moving_average` | `none`, `moving_average`, or `bspline` |
+| `--smooth_window` | `5` | Odd window for moving average (bspline fallback when N < 4) |
+| `--smooth_s` | `1.0` | B-spline smoothing factor (`0` = interpolate, larger = smoother) |
+
+```bash
+# B-spline smoothing:
+python precompute_floor_trajectory.py ... --smooth bspline --smooth_s 2.0
+
+# Disable smoothing:
+python precompute_floor_trajectory.py ... --smooth none
+```
+
+Smoothing params are recorded in `floor_calibration.json` under `trajectory_smooth`.
 
 Requires `open3d` in the `internnav` conda environment.
 
@@ -123,18 +157,36 @@ Requires `open3d` in the `internnav` conda environment.
 ```
 
 - Pane 1: `trajectory_publishers.py floor` (loads txt only, no PCD at startup)
-- Pane 2: `keyframe_extractor.py` merges camera odom at `finalize()` into `poses.json`
+- Pane 2: `keyframe_extractor.py` merges camera odom and floor trajectory at `finalize()` into `poses.json`
 
 Press `Ctrl+B` then `S` to stop and save.
 
-#### LeRobot conversion (pose vs action split)
+Place `floor_trajectory.txt` and `floor_calibration.json` in `output_dir` before extraction (or copy from precompute `output_dir`). At finalize, each pose gets:
+
+| Field | Source |
+|-------|--------|
+| `x, y, yaw, z` | Matched `floor_trajectory.txt` entry |
+| `world_x, world_y, world_z` | On-floor 3D point from trajectory |
+| `camera_matrix` | Matched camera odom txt |
+| `action_matrix` | Base on floor plane from `(x,y,yaw)` |
+
+#### LeRobot conversion (pose vs action vs pixel goals)
+
+See [`../dataset_converters/README.md`](../dataset_converters/README.md).
 
 ```bash
-python ../dataset_converters/rosbag2lerobot.py --keyframe_root ./keyframe_output
+python ../dataset_converters/rosbag2lerobot.py \
+  --keyframe_root ./keyframe_output_round2_bkhn \
+  --lerobot_out ../dataset_converters/lerobot_data_1 \
+  --scene_id round2_bkhn \
+  --goal_lookahead 200 \
+  --overwrite
 ```
 
-- `observation.camera_extrinsic` ← `camera_matrix` (camera in world)
-- `action` ← `action_matrix` (base on floor), never from camera pose
+- `action` ← discrete steps from floor `(x,y,yaw)`
+- `pose.*` ← synthetic camera extrinsics per height/pitch setting
+- `goal.125cm_30deg` ← project `world_x/y/z` at frame `i + lookahead` into image `i` (640×480)
+- `relative_goal_frame_id.125cm_30deg` ← fixed lookahead (e.g. 200) or `-1`
 
 **Tuning keyframe density** (edit `KeyframeConfig` in `keyframe_selection.py`; episode size in `constants.py`):
 

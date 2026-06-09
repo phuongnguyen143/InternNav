@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import open3d as o3d
 
@@ -203,6 +205,244 @@ def make_frustum(T_world_cam, K, img_w, img_h, scale, color):
     return cam
 
 
+# ── Top-down jitter map ───────────────────────────────────────────────
+
+def entries_to_floor_uv(
+    entries: List[OdomExtrinsicEntry],
+    floor_plane: Optional[tuple] = None,
+) -> np.ndarray:
+    """Project all poses to floor (u, v); fall back to world XY if no plane."""
+    pts_3d = np.array([e.t.astype(np.float64) for e in entries])
+    if floor_plane is not None:
+        return project_to_floor_2d(pts_3d, floor_plane)
+    return pts_3d[:, :2].copy()
+
+
+def load_pcd_floor_uv(
+    pcd_path: str,
+    floor_plane: tuple,
+    max_pts: int = 200_000,
+) -> np.ndarray:
+    """Load PCD, project to floor frame, and downsample for scatter background."""
+    print(f"[topdown] Loading PCD for background: {pcd_path}")
+    pcd = o3d.io.read_point_cloud(pcd_path)
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    print(f"  {len(pts):,} points")
+    if len(pts) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    if len(pts) > max_pts:
+        idx = np.random.choice(len(pts), max_pts, replace=False)
+        pts = pts[idx]
+        print(f"  downsampled to {max_pts:,}")
+    return project_to_floor_2d(pts, floor_plane)
+
+
+def _smooth_path_3pt(uv: np.ndarray) -> np.ndarray:
+    """Simple 3-point moving average; endpoints unchanged."""
+    if len(uv) < 3:
+        return uv.copy()
+    smooth = uv.copy()
+    smooth[1:-1] = (uv[:-2] + uv[1:-1] + uv[2:]) / 3.0
+    return smooth
+
+
+def compute_jitter_stats(uv: np.ndarray) -> dict:
+    """Quantify 2D trajectory smoothness from floor-projected poses."""
+    if len(uv) < 2:
+        return {
+            "step_disp_mean": 0.0,
+            "step_disp_std": 0.0,
+            "lateral_std": 0.0,
+            "max_step_jump": 0.0,
+        }
+
+    steps = np.linalg.norm(np.diff(uv, axis=0), axis=1)
+    smooth = _smooth_path_3pt(uv)
+
+    lateral = np.empty(len(uv), dtype=np.float64)
+    lateral[0] = np.linalg.norm(uv[0] - smooth[0])
+    lateral[-1] = np.linalg.norm(uv[-1] - smooth[-1])
+    for i in range(1, len(uv) - 1):
+        seg = smooth[i + 1] - smooth[i - 1]
+        seg_len = np.linalg.norm(seg)
+        if seg_len < 1e-9:
+            lateral[i] = np.linalg.norm(uv[i] - smooth[i])
+        else:
+            t = np.dot(uv[i] - smooth[i - 1], seg) / (seg_len * seg_len)
+            t = np.clip(t, 0.0, 1.0)
+            proj = smooth[i - 1] + t * seg
+            lateral[i] = np.linalg.norm(uv[i] - proj)
+
+    return {
+        "step_disp_mean": float(steps.mean()),
+        "step_disp_std": float(steps.std()),
+        "lateral_std": float(lateral.std()),
+        "max_step_jump": float(steps.max()),
+    }
+
+
+def pick_jitter_zoom_center(uv: np.ndarray, zoom_span: float) -> Tuple[float, float]:
+    """
+    Pick the trajectory region with highest step-displacement variance.
+    Jitter is easiest to see on nominally straight segments at high zoom.
+    """
+    if len(uv) < 2:
+        return float(uv[0, 0]), float(uv[0, 1])
+
+    steps = np.linalg.norm(np.diff(uv, axis=0), axis=1)
+    half = zoom_span / 2.0
+    best_score = -1.0
+    best_center = (float(uv[len(uv) // 2, 0]), float(uv[len(uv) // 2, 1]))
+
+    for i in range(len(uv)):
+        u0, v0 = uv[i]
+        in_window = (
+            (uv[:, 0] >= u0 - half) & (uv[:, 0] <= u0 + half)
+            & (uv[:, 1] >= v0 - half) & (uv[:, 1] <= v0 + half)
+        )
+        if not in_window.any():
+            continue
+        idx = np.where(in_window)[0]
+        if len(idx) < 2:
+            continue
+        local_steps = steps[max(0, idx[0] - 1) : min(len(steps), idx[-1] + 1)]
+        if len(local_steps) == 0:
+            continue
+        score = float(local_steps.var())
+        if score > best_score:
+            best_score = score
+            best_center = (float(u0), float(v0))
+
+    return best_center
+
+
+def _draw_topdown_panel(
+    ax,
+    uv: np.ndarray,
+    pcd_uv: Optional[np.ndarray],
+    ulim: Tuple[float, float],
+    vlim: Tuple[float, float],
+    title: str,
+    zoom_rect: Optional[Tuple[float, float, float, float]] = None,
+):
+    """Draw PCD background, trajectory, pose dots, and optional zoom rectangle."""
+    ax.set_facecolor("#1a1a1a")
+    ax.set_title(title, color="white")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
+
+    if pcd_uv is not None and len(pcd_uv) > 0:
+        mask = (
+            (pcd_uv[:, 0] >= ulim[0]) & (pcd_uv[:, 0] <= ulim[1])
+            & (pcd_uv[:, 1] >= vlim[0]) & (pcd_uv[:, 1] <= vlim[1])
+        )
+        pts = pcd_uv[mask]
+        if len(pts) > 0:
+            ax.scatter(
+                pts[:, 0], pts[:, 1],
+                s=0.3, c="#888888", alpha=0.15, linewidths=0, rasterized=True,
+            )
+
+    ax.plot(uv[:, 0], uv[:, 1], color="#4fc3f7", linewidth=0.8, alpha=0.9, zorder=3)
+    ax.scatter(uv[:, 0], uv[:, 1], s=2, c="cyan", linewidths=0, zorder=4)
+    ax.scatter(uv[0, 0], uv[0, 1], s=60, c="lime", edgecolors="white",
+               linewidths=0.5, zorder=5, label="start")
+    ax.scatter(uv[-1, 0], uv[-1, 1], s=60, c="red", edgecolors="white",
+               linewidths=0.5, zorder=5, label="end")
+
+    if zoom_rect is not None:
+        ru0, rv0, ru1, rv1 = zoom_rect
+        rect = Rectangle(
+            (ru0, rv0), ru1 - ru0, rv1 - rv0,
+            linewidth=1.5, edgecolor="red", facecolor="none", linestyle="--", zorder=6,
+        )
+        ax.add_patch(rect)
+
+    ax.set_xlim(ulim)
+    ax.set_ylim(vlim)
+    ax.set_aspect("equal")
+    ax.grid(True, color="#333333", linewidth=0.5)
+    ax.legend(loc="upper right", fontsize=8, facecolor="#2a2a2a", labelcolor="white")
+
+
+def _default_topdown_save_path(floor_calibration: Optional[str]) -> Path:
+    if floor_calibration:
+        return Path(floor_calibration).parent / "traj_topdown.png"
+    return Path.cwd() / "traj_topdown.png"
+
+
+def visualize_topdown(
+    entries: List[OdomExtrinsicEntry],
+    floor_plane: Optional[tuple] = None,
+    pcd_path: Optional[str] = None,
+    zoom_span: float = 5.0,
+    save_path: Optional[str] = None,
+    pcd_max_pts: int = 200_000,
+    block: bool = True,
+):
+    """Two-panel top-down map: overview + high-magnification jitter view."""
+    if floor_plane is None:
+        print("[topdown] WARNING: no floor plane; using XY projection")
+
+    uv = entries_to_floor_uv(entries, floor_plane)
+    stats = compute_jitter_stats(uv)
+    print(
+        f"\n[topdown] jitter stats — "
+        f"step mean={stats['step_disp_mean']:.4f} m  "
+        f"step std={stats['step_disp_std']:.4f} m  "
+        f"lateral std={stats['lateral_std']:.4f} m  "
+        f"max jump={stats['max_step_jump']:.4f} m"
+    )
+
+    pcd_uv = None
+    if pcd_path is not None and floor_plane is not None:
+        pcd_uv = load_pcd_floor_uv(pcd_path, floor_plane, max_pts=pcd_max_pts)
+    elif pcd_path is not None:
+        print("[topdown] Skipping PCD background (floor plane required for projection)")
+
+    margin = 2.0
+    u_over = (uv[:, 0].min() - margin, uv[:, 0].max() + margin)
+    v_over = (uv[:, 1].min() - margin, uv[:, 1].max() + margin)
+
+    zoom_cu, zoom_cv = pick_jitter_zoom_center(uv, zoom_span)
+    half = zoom_span / 2.0
+    u_zoom = (zoom_cu - half, zoom_cu + half)
+    v_zoom = (zoom_cv - half, zoom_cv + half)
+    zoom_rect = (u_zoom[0], v_zoom[0], u_zoom[1], v_zoom[1])
+
+    fig, (ax_over, ax_zoom) = plt.subplots(1, 2, figsize=(16, 8), dpi=150)
+    fig.patch.set_facecolor("#121212")
+
+    _draw_topdown_panel(
+        ax_over, uv, pcd_uv, u_over, v_over,
+        title="Overview (full trajectory)",
+        zoom_rect=zoom_rect,
+    )
+    _draw_topdown_panel(
+        ax_zoom, uv, pcd_uv, u_zoom, v_zoom,
+        title=f"Jitter zoom ({zoom_span:.1f} m viewport)",
+    )
+
+    fig.tight_layout()
+    out_path = Path(save_path) if save_path else None
+    if out_path is None:
+        out_path = _default_topdown_save_path(None)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    print(f"[topdown] Saved figure: {out_path.resolve()}")
+
+    if block:
+        print("[topdown] Close the matplotlib window to continue.")
+        plt.show(block=True)
+    else:
+        print("[topdown] Opening 2D map window (non-blocking)")
+        plt.ion()
+        plt.show(block=False)
+        fig.canvas.flush_events()
+        plt.pause(0.5)
+
+
 # ── Main visualizer ───────────────────────────────────────────────────
 
 def visualize_open3d(
@@ -349,6 +589,8 @@ def main():
             f"    --floor_calibration {_DEFAULT_FLOOR_CALIB}\n"
             f"    --odom {_DEFAULT_ODOM}\n"
             "  # pcd is read from floor_calibration.json if --pcd is omitted\n"
+            "\n"
+            "  python scene_viz.py --topdown --topdown_zoom_m 3.0\n"
         ),
     )
     parser.add_argument(
@@ -387,6 +629,33 @@ def main():
         action="store_true",
         help="Do not load floor plane (ignore --floor_calibration)",
     )
+    parser.add_argument(
+        "--topdown",
+        action="store_true",
+        help="Show 2D top-down jitter map (always saves PNG; blocks until window closed)",
+    )
+    parser.add_argument(
+        "--topdown_only",
+        action="store_true",
+        help="Only show/save the 2D top-down map; skip Open3D viewer",
+    )
+    parser.add_argument(
+        "--topdown_zoom_m",
+        type=float,
+        default=5.0,
+        help="Jitter zoom panel viewport size in meters (smaller = more jitter visible)",
+    )
+    parser.add_argument(
+        "--topdown_save",
+        default=None,
+        help="Optional PNG output path for the top-down figure",
+    )
+    parser.add_argument(
+        "--topdown_pcd_max",
+        type=int,
+        default=200_000,
+        help="Max PCD points for top-down background scatter",
+    )
     args = parser.parse_args()
 
     if not args.odom:
@@ -403,16 +672,32 @@ def main():
     )
 
     entries = load_odometry_txt(args.odom)
-    visualize_open3d(
-        entries,
-        K,
-        img_w=args.img_w,
-        img_h=args.img_h,
-        step=args.step,
-        scale=args.scale,
-        pcd_path=pcd_path,
-        floor_plane=floor_plane,
-    )
+
+    if args.topdown or args.topdown_only:
+        save_path = args.topdown_save
+        if save_path is None and floor_cal:
+            save_path = str(_default_topdown_save_path(floor_cal))
+        visualize_topdown(
+            entries,
+            floor_plane=floor_plane,
+            pcd_path=pcd_path,
+            zoom_span=args.topdown_zoom_m,
+            save_path=save_path,
+            pcd_max_pts=args.topdown_pcd_max,
+            block=True,
+        )
+
+    if not args.topdown_only:
+        visualize_open3d(
+            entries,
+            K,
+            img_w=args.img_w,
+            img_h=args.img_h,
+            step=args.step,
+            scale=args.scale,
+            pcd_path=pcd_path,
+            floor_plane=floor_plane,
+        )
 
 
 if __name__ == "__main__":

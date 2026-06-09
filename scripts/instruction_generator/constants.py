@@ -9,6 +9,16 @@ FLOOR_TRAJECTORY_FILENAME = "floor_trajectory.txt"
 # Robot camera-to-base extrinsics (GaussTrace/image_projector.py)
 CAMERA_TO_BASE_TRANSLATION = (0.1067, 0.0, 0.77566)
 CAMERA_PITCH_RAD = 0.0
+# Body (REP-103) -> optical (REP-103 camera) frame, same as image_projector.py
+R_BODY2OPTICAL = (
+    (0.0, -1.0, 0.0, 0.0),
+    (0.0, 0.0, -1.0, 0.0),
+    (1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+# Native RealSense color stream before rosbag2lerobot resize
+NATIVE_RGB_WIDTH = 1280
+NATIVE_RGB_HEIGHT = 720
 
 # ROS topic defaults
 DEFAULT_RGB_TOPIC = "/camera/camera/color/image_raw/compressed"

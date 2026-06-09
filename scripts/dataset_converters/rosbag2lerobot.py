@@ -1,17 +1,16 @@
 """
-Convert keyframe_output episodes to LeRobot v2.1 NavDP format (1LXtFkjw3qL-style).
+Convert keyframe_output episodes to LeRobot v2.1 InternVLA-N1 System2 format (GdvgFV5R1Z5-style).
 
 Output layout:
   {lerobot_out}/{scene_id}/
     meta/info.json, episodes.jsonl, tasks.jsonl, episodes_stats.jsonl
     data/chunk-*/episode_*.parquet
-    videos/chunk-*/observation.images.rgb/episode_*.mp4
+    videos/chunk-*/observation.images.{rgb,depth}.{h}cm_{p}deg/episode_{ep}_{frame}.jpg|png
 """
 
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -22,8 +21,9 @@ import numpy as np
 import torch
 from datasets import concatenate_datasets
 from loguru import logger
-from scipy.spatial.transform import Rotation
 
+_CONVERTERS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_CONVERTERS))
 sys.path.insert(0, "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot/src")
 _INSTR_GEN = Path(__file__).resolve().parents[1] / "instruction_generator"
 sys.path.insert(0, str(_INSTR_GEN))
@@ -34,17 +34,22 @@ from floor_pose import (  # noqa: E402
     load_floor_calibration,
 )
 
+from internvla_labels import (  # noqa: E402
+    CAMERA_SETTINGS,
+    DEFAULT_LOOKAHEAD_FRAMES,
+    build_frame_labels,
+    setting_key,
+)
+
 from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
-    EPISODES_PATH,
-    EPISODES_STATS_PATH,
-    TASKS_PATH,
-    append_jsonlines,
     check_timestamps_sync,
     get_episode_data_index,
     hf_transform_to_torch,
     validate_episode_buffer,
+    write_episode,
+    write_episode_stats,
     write_info,
 )
 from lerobot.datasets.video_utils import get_safe_default_codec
@@ -52,66 +57,78 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 KEYFRAME_ROOT = Path("./keyframe_output")
 LEROBOT_OUT = Path("./lerobot_data")
-SCENE_ID = "1LXtFkjw3qL"
+SCENE_ID = "round2_bkhn"
 
 DATASET_FPS = 30
 TGT_W, TGT_H = 640, 480
-DEFAULT_CAMERA_INTRINSIC = np.array(
-    [[585.0, 0.0, 320.0], [0.0, 585.0, 240.0], [0.0, 0.0, 1.0]],
+# RealSense color intrinsics from bag; scaled from native 1280x720 to TGT_W x TGT_H.
+NATIVE_CAMERA_INTRINSIC = np.array(
+    [[647.04101562, 0.0, 637.3026123], [0.0, 646.40319824, 370.86227417], [0.0, 0.0, 1.0]],
     dtype=np.float32,
 )
-DEFAULT_CAMERA_EXTRINSIC = np.eye(4, dtype=np.float32)
+NATIVE_RGB_SIZE = (1280, 720)
 
 
-def get_features(fps: int, include_depth_video: bool = True) -> Dict:
-    """Parquet + optional video keys aligned with InternData-N1 / NavDP."""
-    vid_info = {
-        "video.fps": fps,
-        "video.codec": "libx264",
-        "video.pix_fmt": "yuv420p",
-        "video.is_depth_map": False,
-        "has_audio": False,
-    }
-    depth_vid_info = {**vid_info, "video.is_depth_map": True}
+def scale_camera_intrinsic(
+    intrinsic: np.ndarray,
+    src_size: Tuple[int, int],
+    dst_size: Tuple[int, int],
+) -> np.ndarray:
+    sw, sh = src_size
+    dw, dh = dst_size
+    sx, sy = dw / sw, dh / sh
+    K = np.array(intrinsic, dtype=np.float64).reshape(3, 3).copy()
+    K[0, 0] *= sx
+    K[0, 2] *= sx
+    K[1, 1] *= sy
+    K[1, 2] *= sy
+    return K.astype(np.float32)
 
-    features = {
-        "observation.camera_intrinsic": {
-            "dtype": "float32",
-            "shape": (3, 3),
-        },
-        "observation.camera_extrinsic": {
-            "dtype": "float32",
-            "shape": (4, 4),
-        },
+
+DEFAULT_CAMERA_INTRINSIC = scale_camera_intrinsic(
+    NATIVE_CAMERA_INTRINSIC, NATIVE_RGB_SIZE, (TGT_W, TGT_H)
+)
+
+# Image folders required by NavPixelGoalDataset (bkhn_125cm_0_30)
+IMAGE_RGB_SETTINGS = [(125, 0), (125, 30)]
+IMAGE_DEPTH_SETTINGS = [(125, 30)]
+
+
+def get_internvla_features() -> Dict:
+    """Parquet feature schema matching GdvgFV5R1Z5 / InternData-N1."""
+    features: Dict = {
         "action": {
-            "dtype": "float32",
-            "shape": (4, 4),
-        },
-        "observation.images.rgb": {
-            "dtype": "video",
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": vid_info,
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["action_index"],
         },
     }
-    if include_depth_video:
-        features["observation.images.depth"] = {
-            "dtype": "video",
-            "shape": (TGT_H, TGT_W, 3),
-            "names": ["height", "width", "channel"],
-            "info": depth_vid_info,
+    for height_cm, pitch_deg in CAMERA_SETTINGS:
+        sk = setting_key(height_cm, pitch_deg)
+        features[f"pose.{sk}"] = {
+            "dtype": "float32",
+            "shape": (4, 4),
+            "names": [f"pose.{sk}"],
+        }
+        features[f"goal.{sk}"] = {
+            "dtype": "int32",
+            "shape": (2,),
+            "names": [f"goal.{sk}"],
+        }
+        features[f"relative_goal_frame_id.{sk}"] = {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": [f"relative_goal_frame_id.{sk}"],
         }
     return features
 
 
-def pose_xyyaw_to_matrix(x: float, y: float, yaw: float, z: float = 0.0) -> np.ndarray:
-    rot = Rotation.from_euler("z", yaw).as_matrix().astype(np.float32)
-    T = np.eye(4, dtype=np.float32)
-    T[:3, :3] = rot
-    T[0, 3] = float(x)
-    T[1, 3] = float(y)
-    T[2, 3] = float(z)
-    return T
+def image_rgb_key(height_cm: int, pitch_deg: int) -> str:
+    return f"observation.images.rgb.{setting_key(height_cm, pitch_deg)}"
+
+
+def image_depth_key(height_cm: int, pitch_deg: int) -> str:
+    return f"observation.images.depth.{setting_key(height_cm, pitch_deg)}"
 
 
 def load_poses_json(keyframe_root: Path) -> Dict[int, Dict]:
@@ -193,137 +210,104 @@ def get_video_frame_count(video_path: Path) -> int:
     return n
 
 
-def reencode_video(
-    src: Path,
-    dst: Path,
-    fps: int,
+def extract_frames_from_video(
+    video_path: Path,
+    out_dir: Path,
+    ep_index: int,
+    ext: str,
     resize_wh: Optional[Tuple[int, int]] = None,
-) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    vf_parts = []
-    if resize_wh:
-        vf_parts.append(f"scale={resize_wh[0]}:{resize_wh[1]}")
-    cmd = ["ffmpeg", "-y", "-i", str(src)]
-    if vf_parts:
-        cmd += ["-vf", ",".join(vf_parts)]
-    cmd += [
-        "-r", str(fps),
-        "-vcodec", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        "-preset", "fast",
-        str(dst),
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        logger.warning(
-            f"Re-encode failed for {src}, falling back to copy.\n"
-            f"{result.stderr.decode()[:300]}"
-        )
-        shutil.copyfile(src, dst)
+    is_depth: bool = False,
+) -> int:
+    """Extract video frames to episode_{ep:06d}_{frame}.{ext}."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
-
-def _pose_to_camera_extrinsic(
-    pose: Dict,
-    default_extrinsic: np.ndarray,
-    camera_height: float,
-    warned: list,
-) -> np.ndarray:
-    """Observation camera pose (T_world_cam) — never from floor x,y,yaw."""
-    if "camera_matrix" in pose:
-        return np.array(pose["camera_matrix"], dtype=np.float32).reshape(4, 4)
-
-    if "camera_x" in pose:
-        return pose_xyyaw_to_matrix(
-            float(pose["camera_x"]),
-            float(pose["camera_y"]),
-            float(pose["camera_yaw"]),
-            z=float(pose.get("camera_z", camera_height)),
-        )
-
-    if not warned[0]:
-        logger.warning(
-            "poses.json missing camera_matrix; using default camera_extrinsic."
-        )
-        warned[0] = True
-    return default_extrinsic.copy()
-
-
-def _pose_to_action_matrix(
-    pose: Dict,
-    floor_plane: Optional[tuple],
-    camera_height: float,
-    warned: list,
-) -> np.ndarray:
-    """NavDP action: floor embodiment only — never from camera_matrix."""
-    if "action_matrix" in pose:
-        return np.array(pose["action_matrix"], dtype=np.float32).reshape(4, 4)
-
-    x = float(pose["x"])
-    y = float(pose["y"])
-    yaw = float(pose["yaw"])
-    z = float(pose.get("z", 0.0))
-    pose_frame = pose.get("pose_frame", "floor")
-
-    if pose_frame == "floor" and floor_plane is not None:
-        return floor_2d_pose_to_action_matrix(x, y, yaw, z, floor_plane)
-
-    if not warned[0]:
-        logger.warning(
-            "poses.json missing action_matrix; building action from floor x,y,yaw "
-            "(legacy fallback)."
-        )
-        warned[0] = True
-    if pose_frame == "floor":
-        z = 0.0
-    else:
-        z = camera_height if z == 0.0 and camera_height != 0.0 else z
-    return pose_xyyaw_to_matrix(x, y, yaw, z=z)
-
-
-def build_frame_records(
-    n_frames: int,
-    start_frame: int,
-    poses_by_frame_idx: Dict[int, Dict],
-    camera_intrinsic: np.ndarray,
-    camera_extrinsic: np.ndarray,
-    camera_height: float,
-    fps: int,
-    floor_plane: Optional[tuple] = None,
-) -> List[Dict]:
-    intrinsic = camera_intrinsic.astype(np.float32)
-    default_extrinsic = camera_extrinsic.astype(np.float32)
-    records = []
-    last_pose = None
-    cam_warn = [False]
-    act_warn = [False]
-
-    for i in range(n_frames):
-        global_idx = start_frame + i
-        pose = poses_by_frame_idx.get(global_idx)
-        if pose is None:
-            if last_pose is None:
-                pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "z": 0.0, "pose_frame": "floor"}
-            else:
-                pose = last_pose
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if resize_wh:
+            frame = cv2.resize(frame, resize_wh)
+        fname = f"episode_{ep_index:06d}_{count}.{ext}"
+        if is_depth:
+            if len(frame.shape) == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(str(out_dir / fname), frame)
         else:
-            last_pose = pose
+            cv2.imwrite(str(out_dir / fname), frame)
+        count += 1
+    cap.release()
+    return count
 
-        cam_ext = _pose_to_camera_extrinsic(
-            pose, default_extrinsic, camera_height, cam_warn
+
+def duplicate_frame_dir(src_dir: Path, dst_dir: Path) -> None:
+    """Copy all frame files from src_dir to dst_dir."""
+    if not src_dir.exists():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for img_file in sorted(src_dir.glob("*")):
+        if img_file.is_file():
+            shutil.copy2(img_file, dst_dir / img_file.name)
+
+
+def export_episode_images(
+    rgb_video: Path,
+    depth_video: Optional[Path],
+    scene_root: Path,
+    chunk: int,
+    ep_index: int,
+    resize_wh: Tuple[int, int],
+) -> Dict[str, Path]:
+    """
+    Extract per-frame images and duplicate into all required setting folders.
+    Returns files dict mapping observation key -> temp directory with frames.
+    """
+    tmp_base = scene_root / "_tmp" / f"episode_{ep_index:06d}"
+    files: Dict[str, Path] = {}
+
+    rgb_0_tmp = tmp_base / "rgb_125cm_0deg"
+    n_rgb = extract_frames_from_video(
+        rgb_video, rgb_0_tmp, ep_index, "jpg", resize_wh=resize_wh
+    )
+    if n_rgb == 0:
+        raise RuntimeError(f"No RGB frames extracted from {rgb_video}")
+
+    files[image_rgb_key(125, 0)] = rgb_0_tmp
+
+    rgb_30_tmp = tmp_base / "rgb_125cm_30deg"
+    duplicate_frame_dir(rgb_0_tmp, rgb_30_tmp)
+    files[image_rgb_key(125, 30)] = rgb_30_tmp
+
+    for height_cm, pitch_deg in [(125, 45), (60, 15), (60, 30)]:
+        dup_tmp = tmp_base / f"rgb_{height_cm}cm_{pitch_deg}deg"
+        duplicate_frame_dir(rgb_0_tmp, dup_tmp)
+        files[image_rgb_key(height_cm, pitch_deg)] = dup_tmp
+
+    if depth_video is not None and depth_video.exists():
+        depth_30_tmp = tmp_base / "depth_125cm_30deg"
+        n_depth = extract_frames_from_video(
+            depth_video,
+            depth_30_tmp,
+            ep_index,
+            "png",
+            resize_wh=resize_wh,
+            is_depth=True,
         )
-        action = _pose_to_action_matrix(
-            pose, floor_plane, camera_height, act_warn
-        )
+        if n_depth != n_rgb:
+            logger.warning(
+                f"Depth frames ({n_depth}) != RGB frames ({n_rgb}) for episode {ep_index}"
+            )
+        files[image_depth_key(125, 30)] = depth_30_tmp
 
-        records.append({
-            "observation.camera_intrinsic": intrinsic.copy(),
-            "observation.camera_extrinsic": cam_ext,
-            "action": action,
-            "timestamp": float(i) / fps,
-        })
+        for height_cm, pitch_deg in [(125, 0), (125, 45), (60, 15), (60, 30)]:
+            dup_tmp = tmp_base / f"depth_{height_cm}cm_{pitch_deg}deg"
+            duplicate_frame_dir(depth_30_tmp, dup_tmp)
+            files[image_depth_key(height_cm, pitch_deg)] = dup_tmp
 
-    return records
+    return files
 
 
 def compute_episode_stats(episode_data: dict, features: dict) -> dict:
@@ -332,7 +316,7 @@ def compute_episode_stats(episode_data: dict, features: dict) -> dict:
         if key not in features:
             continue
         ft = features[key]
-        if ft["dtype"] in ("string", "video"):
+        if ft["dtype"] in ("string", "video", "image"):
             continue
         ep_ft_array = np.array(data)
         if ep_ft_array.ndim == 1:
@@ -351,102 +335,42 @@ def compute_episode_stats(episode_data: dict, features: dict) -> dict:
 
 
 class NavDatasetMetadata(LeRobotDatasetMetadata):
-    @classmethod
-    def create(
-        cls,
-        repo_id: str,
-        fps: int,
-        features: dict,
-        robot_type: str | None = None,
-        root: str | Path | None = None,
-        use_videos: bool = True,
-    ) -> "NavDatasetMetadata":
-        obj = super().create(
-            repo_id=repo_id,
-            fps=fps,
-            features=features,
-            robot_type=robot_type,
-            root=root,
-            use_videos=use_videos,
-        )
-        obj._next_task_index = 0
-        obj._global_image_index = 0
-        return obj
-
     def get_data_file_path(self, ep_index: int) -> Path:
         chunk = self.get_episode_chunk(ep_index)
         return Path("data") / f"chunk-{chunk:03d}" / f"episode_{ep_index:06d}.parquet"
 
     def get_video_file_path(self, ep_index: int, key: str) -> Path:
         chunk = self.get_episode_chunk(ep_index)
-        return Path("videos") / f"chunk-{chunk:03d}" / key / f"episode_{ep_index:06d}.mp4"
-
-    def register_task_dict(self, task: dict) -> int:
-        task_index = self._next_task_index
-        self._next_task_index += 1
-        self.info["total_tasks"] = self._next_task_index
-        append_jsonlines({"task_index": task_index, "task": task}, self.root / TASKS_PATH)
-        return task_index
+        return Path("videos") / f"chunk-{chunk:03d}" / key
 
     def save_episode(
         self,
         episode_index: int,
         episode_length: int,
-        instruction: str,
+        episode_tasks: list[str],
         episode_stats: dict,
     ) -> None:
         self.info["total_episodes"] += 1
         self.info["total_frames"] += episode_length
+
         chunk = self.get_episode_chunk(episode_index)
         if chunk >= self.total_chunks:
             self.info["total_chunks"] += 1
+
         self.info["splits"] = {"train": f"0:{self.info['total_episodes']}"}
         write_info(self.info, self.root)
 
-        last_frame = max(0, episode_length - 1)
-        sub_task = {
-            "sub_instruction": instruction,
-            "sub_indexes": [0, last_frame],
-            "revised_sub_instruction": instruction,
-        }
-        sum_task = {
-            "sum_instruction": instruction,
-            "sum_indexes": [0, last_frame],
-        }
-        task_idx_sub = self.register_task_dict(sub_task)
-        task_idx_sum = self.register_task_dict(sum_task)
-
         episode_dict = {
             "episode_index": episode_index,
-            "tasks": [
-                {**sub_task},
-                {**sum_task},
-            ],
+            "tasks": episode_tasks,
             "length": episode_length,
         }
         self.episodes[episode_index] = episode_dict
-        append_jsonlines(episode_dict, self.root / EPISODES_PATH)
-
-        image_min = self._global_image_index
-        image_max = self._global_image_index + max(0, episode_length - 1)
-        stats_entry = {
-            "episode_index": episode_index,
-            "task_index": {
-                "min": min(task_idx_sub, task_idx_sum),
-                "max": max(task_idx_sub, task_idx_sum),
-                "count": 2,
-            },
-            "image_index": {
-                "min": image_min,
-                "max": image_max,
-                "count": episode_length,
-            },
-        }
-        append_jsonlines(stats_entry, self.root / EPISODES_STATS_PATH)
-        self._global_image_index += episode_length
+        write_episode(episode_dict, self.root)
 
         self.episodes_stats[episode_index] = episode_stats
         self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
+        write_episode_stats(episode_index, episode_stats, self.root)
 
 
 class NavDataset(LeRobotDataset):
@@ -458,7 +382,6 @@ class NavDataset(LeRobotDataset):
         features: dict,
         root: str | Path | None = None,
         robot_type: str | None = None,
-        use_videos: bool = True,
         tolerance_s: float = 1e-4,
         video_backend: str | None = None,
     ) -> "NavDataset":
@@ -469,7 +392,7 @@ class NavDataset(LeRobotDataset):
             robot_type=robot_type,
             features=features,
             root=root,
-            use_videos=use_videos,
+            use_videos=False,
         )
         obj.repo_id = obj.meta.repo_id
         obj.root = obj.meta.root
@@ -518,8 +441,8 @@ class NavDataset(LeRobotDataset):
 
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
+        episode_tasks = list(dict.fromkeys(tasks))
         episode_index = episode_buffer["episode_index"]
-        instruction = tasks[0] if tasks else ""
 
         episode_buffer["index"] = np.arange(
             self.meta.total_frames,
@@ -527,33 +450,39 @@ class NavDataset(LeRobotDataset):
         )
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
-        if self.meta.get_task_index(instruction) is None:
-            self.meta.add_task(instruction)
-        episode_buffer["task_index"] = np.full(
-            (episode_length,), self.meta.get_task_index(instruction)
+        for task in episode_tasks:
+            if self.meta.get_task_index(task) is None:
+                self.meta.add_task(task)
+
+        episode_buffer["task_index"] = np.array(
+            [self.meta.get_task_index(task) for task in tasks]
         )
 
         for key, ft in self.features.items():
-            if key in ("index", "episode_index", "task_index") or ft["dtype"] == "video":
+            if key in ("index", "episode_index", "task_index"):
                 continue
-            episode_buffer[key] = np.stack(episode_buffer[key])
+            stacked = np.stack(episode_buffer[key])
+            if key == "action":
+                episode_buffer[key] = stacked.reshape(-1, 1)
+            elif key.startswith("relative_goal_frame_id"):
+                episode_buffer[key] = stacked.reshape(-1, 1)
+            else:
+                episode_buffer[key] = stacked
 
-        for key, src in files.items():
-            src = Path(src)
-            if self.features.get(key, {}).get("dtype") != "video":
+        for key, source_path in files.items():
+            if not key.startswith("observation.images."):
                 continue
-            if not src.exists():
-                logger.warning(f"Video not found, skipping: {src}")
-                continue
-            dst_rel = self.meta.get_video_file_path(episode_index, key)
-            dst = self.root / dst_rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
-            episode_buffer[key] = str(dst_rel)
+            dest_dir = self.root / self.meta.get_video_file_path(episode_index, key)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            source_dir = Path(source_path)
+            if source_dir.exists():
+                for img_file in source_dir.glob("*"):
+                    if img_file.is_file():
+                        shutil.copy2(img_file, dest_dir / img_file.name)
 
         ep_stats = compute_episode_stats(episode_buffer, self.features)
         self._save_episode_table(episode_buffer, episode_index)
-        self.meta.save_episode(episode_index, episode_length, instruction, ep_stats)
+        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
 
         ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
@@ -578,28 +507,79 @@ class NavDataset(LeRobotDataset):
         ep_dataset.to_parquet(ep_data_path)
 
 
-def write_navdp_info_json(root: Path, fps: int, total_episodes: int, total_frames: int, total_tasks: int):
-    """Finalize meta/info.json to match 1LXtFkjw3qL sample schema."""
+def write_internvla_info_json(
+    root: Path,
+    fps: int,
+    total_episodes: int,
+    total_frames: int,
+    total_tasks: int,
+) -> None:
+    """Finalize meta/info.json to match GdvgFV5R1Z5 schema."""
+    features: Dict = {
+        "action": {
+            "dtype": "int32",
+            "shape": [1],
+            "names": ["action_index"],
+        },
+    }
+    for height_cm, pitch_deg in CAMERA_SETTINGS:
+        sk = setting_key(height_cm, pitch_deg)
+        features[f"pose.{sk}"] = {
+            "dtype": "float32",
+            "shape": [4, 4],
+            "names": [f"pose.{sk}"],
+        }
+        features[f"goal.{sk}"] = {
+            "dtype": "int32",
+            "shape": [2],
+            "names": [f"goal.{sk}"],
+        }
+        features[f"relative_goal_frame_id.{sk}"] = {
+            "dtype": "int32",
+            "shape": [1],
+            "names": [f"relative_goal_frame_id.{sk}"],
+        }
+
+    for col in ("timestamp", "frame_index", "episode_index", "index", "task_index"):
+        features[col] = {"dtype": "float32" if col == "timestamp" else "int64", "shape": [1], "names": None}
+
     info = {
         "codebase_version": "v2.1",
-        "robot_type": "unknown",
+        "robot_type": None,
         "total_episodes": total_episodes,
         "total_frames": total_frames,
         "total_tasks": total_tasks,
-        "total_videos": total_episodes,
+        "total_videos": 0,
         "total_chunks": max(1, (total_episodes - 1) // 1000 + 1) if total_episodes else 1,
         "chunks_size": 1000,
         "fps": fps,
         "splits": {"train": f"0:{total_episodes}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features": {
-            "observation.camera_intrinsic": {"dtype": "float32", "shape": [3, 3]},
-            "observation.camera_extrinsic": {"dtype": "float32", "shape": [4, 4]},
-            "action": {"dtype": "float32", "shape": [4, 4]},
-        },
+        "features": features,
     }
     write_info(info, root)
+
+
+def collect_poses_for_episode(
+    n_frames: int,
+    start_frame: int,
+    poses_by_frame_idx: Dict[int, Dict],
+) -> List[Dict]:
+    poses: List[Dict] = []
+    last_pose: Optional[Dict] = None
+    for i in range(n_frames):
+        global_idx = start_frame + i
+        pose = poses_by_frame_idx.get(global_idx)
+        if pose is None:
+            if last_pose is None:
+                pose = {"x": 0.0, "y": 0.0, "yaw": 0.0, "z": 0.0, "pose_frame": "floor"}
+            else:
+                pose = last_pose
+        else:
+            last_pose = pose
+        poses.append(pose)
+    return poses
 
 
 def convert_episode(
@@ -607,10 +587,12 @@ def convert_episode(
     poses_by_frame_idx: Dict[int, Dict],
     lerobot_dataset: NavDataset,
     camera_intrinsic: np.ndarray,
-    camera_extrinsic: np.ndarray,
-    camera_height: float,
     fps: int,
-    floor_plane: Optional[tuple] = None,
+    floor_plane: Optional[tuple],
+    pitch_horizon: int,
+    pitch_lookdown: int,
+    height_cm: int,
+    goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
 ) -> bool:
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
@@ -626,23 +608,9 @@ def convert_episode(
     resize = (TGT_W, TGT_H)
 
     tmp_dir = lerobot_dataset.root / "_tmp" / episode_dir.name
-    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        tmp_rgb = tmp_dir / "rgb.mp4"
-        print("  Re-encoding rgb.mp4 …", end=" ", flush=True)
-        reencode_video(src_rgb, tmp_rgb, fps=fps, resize_wh=resize)
-        print("done")
-
-        has_depth = src_depth.exists()
-        tmp_depth = None
-        if has_depth:
-            tmp_depth = tmp_dir / "depth.mp4"
-            print("  Re-encoding depth.mp4 …", end=" ", flush=True)
-            reencode_video(src_depth, tmp_depth, fps=fps, resize_wh=resize)
-            print("done")
-
-        n_video = get_video_frame_count(tmp_rgb)
+        n_video = get_video_frame_count(src_rgb)
         if end_frame >= start_frame:
             n_pose_span = end_frame - start_frame + 1
         else:
@@ -659,39 +627,45 @@ def convert_episode(
 
         if n_frames == 0:
             print("  [SKIP] No frames.")
-            shutil.rmtree(tmp_dir, ignore_errors=True)
             return False
 
-        frame_records = build_frame_records(
-            n_frames,
-            start_frame,
-            poses_by_frame_idx,
+        print("  Extracting frames …", end=" ", flush=True)
+        chunk = lerobot_dataset.meta.get_episode_chunk(ep_index)
+        image_files = export_episode_images(
+            src_rgb,
+            src_depth if src_depth.exists() else None,
+            lerobot_dataset.root,
+            chunk,
+            ep_index,
+            resize,
+        )
+        print("done")
+
+        poses = collect_poses_for_episode(n_frames, start_frame, poses_by_frame_idx)
+        frame_records = build_frame_labels(
+            poses,
+            floor_plane,
+            floor_2d_pose_to_action_matrix,
             camera_intrinsic,
-            camera_extrinsic,
-            camera_height,
-            fps,
-            floor_plane=floor_plane,
+            TGT_W,
+            TGT_H,
+            goal_setting=(height_cm, pitch_lookdown),
+            goal_lookahead_frames=goal_lookahead_frames,
         )
 
         print(f"  Adding {n_frames} frames …", end=" ", flush=True)
-        for rec in frame_records:
+        for i, rec in enumerate(frame_records):
+            frame = {k: v for k, v in rec.items()}
             lerobot_dataset.add_frame(
-                frame={
-                    "observation.camera_intrinsic": rec["observation.camera_intrinsic"],
-                    "observation.camera_extrinsic": rec["observation.camera_extrinsic"],
-                    "action": rec["action"],
-                },
+                frame=frame,
                 task=instruction,
-                timestamp=rec["timestamp"],
+                timestamp=float(i) / fps,
             )
         print("done")
 
-        files = {"observation.images.rgb": tmp_rgb}
-        if has_depth and tmp_depth is not None:
-            files["observation.images.depth"] = tmp_depth
-
-        lerobot_dataset.save_episode(files=files)
+        lerobot_dataset.save_episode(files=image_files)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(lerobot_dataset.root / "_tmp" / f"episode_{ep_index:06d}", ignore_errors=True)
 
         ep_idx = lerobot_dataset.meta.total_episodes - 1
         print(
@@ -703,6 +677,7 @@ def convert_episode(
     except Exception:
         lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(lerobot_dataset.root / "_tmp", ignore_errors=True)
         raise
 
 
@@ -726,10 +701,12 @@ def main(
     scene_id: str,
     fps: int,
     camera_intrinsic: np.ndarray,
-    camera_extrinsic: np.ndarray,
-    camera_height: float,
+    height_cm: int,
+    pitch_horizon: int,
+    pitch_lookdown: int,
     overwrite: bool,
     floor_calibration: Optional[Path] = None,
+    goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
 ) -> None:
     episodes_dir = keyframe_root / "episodes"
     if not episodes_dir.exists():
@@ -755,6 +732,8 @@ def main(
     print(f"Scene ID          : {scene_id}")
     print(f"FPS               : {fps}")
     print(f"Resolution        : {TGT_W}×{TGT_H}")
+    print(f"Camera setting    : {height_cm}cm horizon {pitch_horizon}° / lookdown {pitch_lookdown}°")
+    print(f"Goal lookahead    : {goal_lookahead_frames} frames")
     print(f"Output            : {scene_root}")
 
     poses_by_frame_idx = load_poses_json(keyframe_root)
@@ -762,23 +741,16 @@ def main(
 
     floor_plane = resolve_floor_plane(keyframe_root, floor_calibration)
     if floor_plane is not None:
-        print(
-            "Pose/action split: camera_extrinsic <- camera_matrix, "
-            "action <- action_matrix (floor embodiment)"
-        )
+        print("Using floor calibration for base poses and camera extrinsics")
     else:
-        print(
-            "No floor_calibration.json — action fallback from floor x,y,yaw; "
-            "set camera_odom_file in extract_keyframe for camera_extrinsic"
-        )
+        print("No floor_calibration.json — using floor x,y,yaw from poses.json")
 
-    features = get_features(fps, include_depth_video=True)
+    features = get_internvla_features()
     lerobot_dataset = NavDataset.create(
         repo_id=scene_id,
         root=scene_root,
         robot_type="unknown",
         fps=fps,
-        use_videos=True,
         features=features,
     )
 
@@ -791,10 +763,12 @@ def main(
                 poses_by_frame_idx,
                 lerobot_dataset,
                 camera_intrinsic,
-                camera_extrinsic,
-                camera_height,
                 fps,
                 floor_plane=floor_plane,
+                pitch_horizon=pitch_horizon,
+                pitch_lookdown=pitch_lookdown,
+                height_cm=height_cm,
+                goal_lookahead_frames=goal_lookahead_frames,
             ):
                 success += 1
         except Exception as e:
@@ -804,12 +778,12 @@ def main(
             traceback.print_exc()
 
     meta = lerobot_dataset.meta
-    write_navdp_info_json(
+    write_internvla_info_json(
         scene_root,
         fps=fps,
         total_episodes=meta.total_episodes,
         total_frames=meta.total_frames,
-        total_tasks=getattr(meta, "_next_task_index", meta.info.get("total_tasks", 0)),
+        total_tasks=meta.info.get("total_tasks", meta.total_episodes),
     )
 
     sep = "=" * 60
@@ -821,7 +795,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert keyframe episodes to LeRobot NavDP format (1LXtFkjw3qL-style)"
+        description="Convert keyframe episodes to InternVLA-N1 System2 LeRobot format (GdvgFV5R1Z5-style)"
     )
     parser.add_argument("--keyframe_root", type=str, default=str(KEYFRAME_ROOT))
     parser.add_argument("--lerobot_out", type=str, default=str(LEROBOT_OUT))
@@ -833,7 +807,15 @@ if __name__ == "__main__":
         default=None,
         help="9 comma-separated floats or path to JSON 3x3 matrix",
     )
-    parser.add_argument("--camera_height", type=float, default=0.0)
+    parser.add_argument("--height", type=int, default=125, help="Camera height in cm")
+    parser.add_argument("--pitch_horizon", type=int, default=0, help="Horizon pitch in degrees")
+    parser.add_argument("--pitch_lookdown", type=int, default=30, help="Look-down pitch in degrees")
+    parser.add_argument(
+        "--goal_lookahead",
+        type=int,
+        default=DEFAULT_LOOKAHEAD_FRAMES,
+        help="Fixed frame lookahead for relative_goal_frame_id and pixel goals",
+    )
     parser.add_argument(
         "--floor_calibration",
         type=str,
@@ -851,8 +833,10 @@ if __name__ == "__main__":
         scene_id=args.scene_id,
         fps=args.fps,
         camera_intrinsic=load_camera_intrinsic(args.camera_intrinsic),
-        camera_extrinsic=DEFAULT_CAMERA_EXTRINSIC.copy(),
-        camera_height=args.camera_height,
+        height_cm=args.height,
+        pitch_horizon=args.pitch_horizon,
+        pitch_lookdown=args.pitch_lookdown,
         overwrite=args.overwrite,
         floor_calibration=floor_cal,
+        goal_lookahead_frames=args.goal_lookahead,
     )

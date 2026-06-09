@@ -155,3 +155,6 @@ result/
 scripts/dataset_converters/lerobot
 scripts/instruction_generator/keyframe_output
 scripts/instruction_generator/lerobot_out
+scripts/dataset_converters/lerobot_data_1/
+scripts/notebooks/*.whl
+scripts/instruction_generator/keyframe_output_round2_bkhn/

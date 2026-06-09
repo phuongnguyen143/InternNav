@@ -27,7 +27,7 @@ max_pixels=313600
 min_pixels=3136
 
 # Dataset configuration (replace with public dataset names)
-vln_datasets=r2r_125cm_0_30,r2r_125cm_0_45,r2r_60cm_15_15,r2r_60cm_30_30,rxr_125cm_0_30,rxr_125cm_0_45,rxr_60cm_15_15,rxr_60cm_30_30 #,scalevln_125cm_0_30,scalevln_60cm_30_30
+vln_datasets=bkhn_125cm_0_30 #,scalevln_125cm_0_30,scalevln_60cm_30_30
 
 # Output configuration
 run_name=InternVLA-N1-System2
