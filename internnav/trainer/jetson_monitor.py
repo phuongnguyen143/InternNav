@@ -9,6 +9,7 @@ import time
 from typing import Any, Dict, Optional
 
 import torch
+from transformers import TrainerCallback
 
 from internnav.model.utils.tensorboard_utils import (
     TensorboardWriter,
@@ -259,8 +260,9 @@ def train_tensorboard_log_dir(args) -> str:
     return os.path.join(args.output_dir, "tensorboard")
 
 
-class JetsonTrainingCallback:
+class JetsonTrainingCallback(TrainerCallback):
     def __init__(self):
+        super().__init__()
         self.log_path: Optional[str] = None
         self.tb_writer: Optional[TensorboardWriter] = None
         self._train_start: Optional[float] = None
@@ -355,6 +357,7 @@ class JetsonTrainingCallback:
                 record["gpu_memory"],
                 record["jetson"],
             )
+            self.tb_writer.flush()
 
     def on_save(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:

@@ -49,7 +49,6 @@ from transformers import (
     Qwen2VLForConditionalGeneration,
     Qwen2VLImageProcessor,
     Trainer,
-    TrainerCallback,
 )
 
 import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
@@ -72,11 +71,8 @@ from internnav.trainer.jetson_monitor import (
 )
 
 
-class JetsonTrainerCallback(TrainerCallback, JetsonTrainingCallback):
-    """Bridge HF TrainerCallback with Jetson GPU/memory logging (see jetson_monitor.py)."""
-
-    def __init__(self):
-        JetsonTrainingCallback.__init__(self)
+# Alias kept for backwards compatibility; JetsonTrainingCallback extends TrainerCallback.
+JetsonTrainerCallback = JetsonTrainingCallback
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -364,7 +360,7 @@ def train(attn_implementation="sdpa"):
         model=model,
         processing_class=tokenizer,
         args=training_args,
-        callbacks=[JetsonTrainerCallback()],
+        callbacks=[JetsonTrainingCallback()],
         **data_module,
     )
     from tabulate import tabulate

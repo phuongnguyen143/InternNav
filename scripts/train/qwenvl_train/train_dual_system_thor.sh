@@ -22,7 +22,7 @@ export MASTER_PORT="${MASTER_PORT:-29500}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-DEFAULT_DATA_ROOT="${REPO_ROOT}/data/InternData-N1/vln_pe"
+DEFAULT_DATA_ROOT="${REPO_ROOT}/data/InternData-N1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
@@ -40,13 +40,13 @@ fi
 system1="${SYSTEM1:-navdp_async}"
 
 lr="${LR:-1e-4}"
-batch_size=1
-grad_accum_steps="${GRAD_ACCUM_STEPS:-1}"
+batch_size=8
+grad_accum_steps="${GRAD_ACCUM_STEPS:-4}"
 max_pixels="${MAX_PIXELS:-78400}"
 min_pixels="${MIN_PIXELS:-3136}"
 resize_h="${RESIZE_H:-224}"
 resize_w="${RESIZE_W:-224}"
-num_history="${NUM_HISTORY:-4}"
+num_history="${NUM_HISTORY:-8}"
 model_max_length="${MODEL_MAX_LENGTH:-2048}"
 data_augmentation="${DATA_AUGMENTATION:-False}"
 dataloader_workers="${DATALOADER_WORKERS:-0}"
@@ -78,7 +78,7 @@ print_jetson_preflight() {
 }
 
 # data
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%10}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%30,r2r_60cm_15_15%30}"
 
 run_name="${RUN_NAME:-InternVLA-N1-DualVLN-Jetson}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
@@ -90,7 +90,7 @@ if [ -n "${MAX_STEPS:-}" ]; then
     save_steps=1000000
     report_to="none"
 else
-    num_epochs="${NUM_TRAIN_EPOCHS:-0.05}"
+    num_epochs="${NUM_TRAIN_EPOCHS:-0.5}"
     save_steps=5000
     report_to="${REPORT_TO:-none}"
 fi
@@ -116,6 +116,7 @@ echo "Tune System 2:   vision=False mlp=False llm=False  aug=${data_augmentation
 echo "Grad accum:      ${grad_accum_steps}"
 echo "Output dir:      ${output_dir}"
 echo "Metrics log:     ${output_dir}/training_metrics.jsonl"
+echo "TensorBoard:     ${output_dir}/tensorboard"
 if [ -n "${MAX_STEPS:-}" ]; then
     echo "Max steps:       ${MAX_STEPS} (smoke test)"
 else

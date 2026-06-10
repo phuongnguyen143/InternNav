@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 def try_float(value: Any) -> Optional[float]:
     try:
-        return float(value)
+        return float(value, )
     except (TypeError, ValueError):
         return None
 

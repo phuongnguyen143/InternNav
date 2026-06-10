@@ -270,7 +270,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         # ------------------------------------------------------------------
         # 4 (training) System 1 trajectory loss.
-        # Requires labels + traj_images/traj_poses. At inference this block is skipped.
+        # Requires labels + traj_images/traj_poses. 
         # ------------------------------------------------------------------
         loss = None
         if labels is not None:
