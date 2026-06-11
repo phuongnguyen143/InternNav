@@ -34,6 +34,7 @@ from floor_pose import (  # noqa: E402
     load_floor_calibration,
 )
 
+from depth_codec import legacy_depth_vis_to_uint16_mm, resize_depth_nearest  # noqa: E402
 from internvla_labels import (  # noqa: E402
     CAMERA_SETTINGS,
     DEFAULT_LOOKAHEAD_FRAMES,
@@ -216,7 +217,6 @@ def extract_frames_from_video(
     ep_index: int,
     ext: str,
     resize_wh: Optional[Tuple[int, int]] = None,
-    is_depth: bool = False,
 ) -> int:
     """Extract video frames to episode_{ep:06d}_{frame}.{ext}."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -232,12 +232,67 @@ def extract_frames_from_video(
         if resize_wh:
             frame = cv2.resize(frame, resize_wh)
         fname = f"episode_{ep_index:06d}_{count}.{ext}"
-        if is_depth:
-            if len(frame.shape) == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cv2.imwrite(str(out_dir / fname), frame)
-        else:
-            cv2.imwrite(str(out_dir / fname), frame)
+        cv2.imwrite(str(out_dir / fname), frame)
+        count += 1
+    cap.release()
+    return count
+
+
+def extract_depth_frames_from_dir(
+    depth_frames_dir: Path,
+    out_dir: Path,
+    ep_index: int,
+    start_frame: int,
+    n_frames: int,
+    resize_wh: Optional[Tuple[int, int]] = None,
+) -> int:
+    """Extract uint16 mm depth PNGs to episode_{ep:06d}_{frame}.png."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for count in range(n_frames):
+        src = depth_frames_dir / f"frame_{start_frame + count:06d}.png"
+        if not src.exists():
+            raise RuntimeError(f"Missing depth frame: {src}")
+        depth_mm = cv2.imread(str(src), cv2.IMREAD_ANYDEPTH)
+        if depth_mm is None:
+            raise RuntimeError(f"Failed to read depth frame: {src}")
+        if depth_mm.dtype != np.uint16:
+            raise RuntimeError(
+                f"Expected uint16 mm depth at {src}, got dtype={depth_mm.dtype}. "
+                "Re-run keyframe extraction with the updated pipeline."
+            )
+        if resize_wh:
+            depth_mm = resize_depth_nearest(depth_mm, resize_wh)
+        fname = f"episode_{ep_index:06d}_{count}.png"
+        if not cv2.imwrite(str(out_dir / fname), depth_mm):
+            raise RuntimeError(f"Failed to write depth frame: {out_dir / fname}")
+    return n_frames
+
+
+def extract_legacy_depth_frames_from_video(
+    depth_video: Path,
+    out_dir: Path,
+    ep_index: int,
+    resize_wh: Optional[Tuple[int, int]] = None,
+) -> int:
+    """Convert legacy 8-bit depth.mp4 preview frames to uint16 mm LeRobot PNGs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(depth_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open legacy depth video: {depth_video}")
+
+    count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if len(frame.shape) == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        depth_mm = legacy_depth_vis_to_uint16_mm(frame)
+        if resize_wh:
+            depth_mm = resize_depth_nearest(depth_mm, resize_wh)
+        fname = f"episode_{ep_index:06d}_{count}.png"
+        if not cv2.imwrite(str(out_dir / fname), depth_mm):
+            raise RuntimeError(f"Failed to write legacy depth frame: {out_dir / fname}")
         count += 1
     cap.release()
     return count
@@ -255,11 +310,14 @@ def duplicate_frame_dir(src_dir: Path, dst_dir: Path) -> None:
 
 def export_episode_images(
     rgb_video: Path,
-    depth_video: Optional[Path],
+    depth_frames_dir: Optional[Path],
     scene_root: Path,
     chunk: int,
     ep_index: int,
     resize_wh: Tuple[int, int],
+    start_frame: int = 0,
+    n_frames: Optional[int] = None,
+    legacy_depth_video: Optional[Path] = None,
 ) -> Dict[str, Path]:
     """
     Extract per-frame images and duplicate into all required setting folders.
@@ -286,19 +344,42 @@ def export_episode_images(
         duplicate_frame_dir(rgb_0_tmp, dup_tmp)
         files[image_rgb_key(height_cm, pitch_deg)] = dup_tmp
 
-    if depth_video is not None and depth_video.exists():
+    if depth_frames_dir is not None and depth_frames_dir.exists():
+        depth_count = n_frames if n_frames is not None else n_rgb
         depth_30_tmp = tmp_base / "depth_125cm_30deg"
-        n_depth = extract_frames_from_video(
-            depth_video,
+        n_depth = extract_depth_frames_from_dir(
+            depth_frames_dir,
             depth_30_tmp,
             ep_index,
-            "png",
+            start_frame=start_frame,
+            n_frames=depth_count,
             resize_wh=resize_wh,
-            is_depth=True,
         )
         if n_depth != n_rgb:
             logger.warning(
                 f"Depth frames ({n_depth}) != RGB frames ({n_rgb}) for episode {ep_index}"
+            )
+        files[image_depth_key(125, 30)] = depth_30_tmp
+
+        for height_cm, pitch_deg in [(125, 0), (125, 45), (60, 15), (60, 30)]:
+            dup_tmp = tmp_base / f"depth_{height_cm}cm_{pitch_deg}deg"
+            duplicate_frame_dir(depth_30_tmp, dup_tmp)
+            files[image_depth_key(height_cm, pitch_deg)] = dup_tmp
+    elif legacy_depth_video is not None and legacy_depth_video.exists():
+        logger.warning(
+            f"Using legacy depth.mp4 at {legacy_depth_video} (8-bit preview, ~256 depth levels). "
+            "Re-run keyframe extraction for full uint16 mm depth from compressedDepth."
+        )
+        depth_30_tmp = tmp_base / "depth_125cm_30deg"
+        n_depth = extract_legacy_depth_frames_from_video(
+            legacy_depth_video,
+            depth_30_tmp,
+            ep_index,
+            resize_wh=resize_wh,
+        )
+        if n_depth != n_rgb:
+            logger.warning(
+                f"Legacy depth frames ({n_depth}) != RGB frames ({n_rgb}) for episode {ep_index}"
             )
         files[image_depth_key(125, 30)] = depth_30_tmp
 
@@ -597,7 +678,8 @@ def convert_episode(
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
     src_rgb = episode_dir / "rgb.mp4"
-    src_depth = episode_dir / "depth.mp4"
+    src_depth_frames = episode_dir / "depth_frames"
+    src_depth_mp4 = episode_dir / "depth.mp4"
     if not src_rgb.exists():
         print(f"  [SKIP] No rgb.mp4 in {episode_dir.name}")
         return False
@@ -633,11 +715,14 @@ def convert_episode(
         chunk = lerobot_dataset.meta.get_episode_chunk(ep_index)
         image_files = export_episode_images(
             src_rgb,
-            src_depth if src_depth.exists() else None,
+            src_depth_frames if src_depth_frames.exists() else None,
             lerobot_dataset.root,
             chunk,
             ep_index,
             resize,
+            start_frame=start_frame,
+            n_frames=n_frames,
+            legacy_depth_video=src_depth_mp4 if not src_depth_frames.exists() else None,
         )
         print("done")
 

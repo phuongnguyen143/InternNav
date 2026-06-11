@@ -153,8 +153,11 @@ internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
 scripts/dataset_converters/lerobot
-scripts/instruction_generator/keyframe_output
+scripts/instruction_generator/keyframe_output_round2_bkhn
+scripts/instruction_generator/keyframe_output_round1_bkhn
+
 scripts/instruction_generator/lerobot_out
-scripts/dataset_converters/lerobot_data_1/
+scripts/dataset_converters/bkhn_ver1.0
+scripts/dataset_converters/bkhn_ver2.0
 scripts/notebooks/*.whl
-scripts/instruction_generator/keyframe_output_round2_bkhn/
+scripts/dataset_converters/decode_depth_image.py

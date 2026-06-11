@@ -25,7 +25,8 @@ SAVE_STEPS="5000"
 MAX_PIXELS="313600"
 MIN_PIXELS="3136"
 DATALOADER_NUM_WORKERS="8"
-REPORT_TO="${REPORT_TO:-none}"
+REPORT_TO="${REPORT_TO:-tensorboard}"
+LOGGING_DIR=""
  
 EXTRA_ARGS=()
  
@@ -53,11 +54,13 @@ Options:
   --epochs VALUE          Number of train epochs. Default: ${EPOCHS}
   --save-steps N          Save checkpoint every N steps. Default: ${SAVE_STEPS}
   --workers N             Dataloader workers. Default: ${DATALOADER_NUM_WORKERS}
-  --report-to TARGET      Trainer reporting target. Default: ${REPORT_TO}
+  --report-to TARGET      Trainer reporting (tensorboard, wandb, none). Default: ${REPORT_TO}
+  --logging-dir DIR       TensorBoard log directory. Default: <output-dir>/tensorboard
   -h, --help              Show this help message.
- 
+
 Examples:
   $0 --gpus 0
+  $0 --gpus 0,1 --report-to tensorboard
   $0 --gpus 0,1 --master-port 12345 --report-to wandb
   $0 --system2-ckpt /path/to/InternVLA-N1-System2 --no-deepspeed
 EOF
@@ -150,6 +153,10 @@ while [[ $# -gt 0 ]]; do
             REPORT_TO="$2"
             shift 2
             ;;
+        --logging-dir)
+            LOGGING_DIR="$2"
+            shift 2
+            ;;
         --)
             shift
             EXTRA_ARGS+=("$@")
@@ -183,7 +190,11 @@ cd "${REPO_ROOT}"
 if [[ -z "${OUTPUT_DIR}" ]]; then
     OUTPUT_DIR="checkpoints/${RUN_NAME}"
 fi
- 
+
+if [[ -z "${LOGGING_DIR}" ]]; then
+    LOGGING_DIR="${OUTPUT_DIR}/tensorboard"
+fi
+
 TORCHRUN_LOG_DIR="${OUTPUT_DIR}/torchrun_logs"
 mkdir -p "${TORCHRUN_LOG_DIR}"
  
@@ -214,7 +225,7 @@ TRAIN_ARGS=(
     --vln_dataset_use "${VLN_DATASETS}"
     --data_flatten False
     --tune_mm_vision False
-    --tune_mm_mlp False
+    --tune_mm_mlp True
     --tune_mm_llm False
     --bf16
     --num_history 8
@@ -244,6 +255,8 @@ TRAIN_ARGS=(
     --lr_scheduler_type "cosine_with_min_lr"
     --lr_scheduler_kwargs '{"min_lr": 1e-05}'
     --logging_steps 1
+    --logging_first_step True
+    --logging_dir "${LOGGING_DIR}"
     --model_max_length 8192
     --gradient_checkpointing True
     --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
@@ -267,6 +280,10 @@ echo "  torchrun logs: ${TORCHRUN_LOG_DIR}"
 echo "  system2 checkpoint: ${SYSTEM2_CKPT}"
 echo "  system1: ${SYSTEM1}"
 echo "  report_to: ${REPORT_TO}"
+if [[ "${REPORT_TO}" == *"tensorboard"* ]]; then
+    echo "  tensorboard log dir: ${LOGGING_DIR}"
+    echo "  view metrics: tensorboard --logdir ${LOGGING_DIR} --port 6006"
+fi
 if [[ -n "${DEEPSPEED_CONFIG}" ]]; then
     echo "  deepspeed: ${DEEPSPEED_CONFIG}"
 else

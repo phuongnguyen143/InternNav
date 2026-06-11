@@ -1,5 +1,5 @@
 import json
-import struct
+import shutil
 from pathlib import Path
 
 import cv2
@@ -22,7 +22,6 @@ from message_filters import ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 
 from constants import (
-    COMPRESSED_DEPTH_HEADER_SIZE,
     DEFAULT_DEPTH_TOPIC,
     DEFAULT_DEPTH_VIS_SCALE,
     DEFAULT_KEYFRAMES_PER_EPISODE,
@@ -39,6 +38,7 @@ from floor_pose import (
     floor_xy_to_world_on_plane,
     load_floor_calibration,
 )
+from depth_codec import decode_compressed_depth, save_depth_png_mm
 from keyframe_selection import KeyframeConfig, extract_keyframes, get_frame_from_video
 from trajectory_io import FloorMatcher, OdomMatcher, parse_floor_trajectory_txt, parse_odom_txt
 
@@ -48,6 +48,9 @@ def _clear_episode_dir(episode_dir: Path) -> None:
     for pattern in ("kf_*.jpg", "kf_*.png", "rgb.mp4", "depth.mp4"):
         for path in episode_dir.glob(pattern):
             path.unlink(missing_ok=True)
+    depth_frames = episode_dir / "depth_frames"
+    if depth_frames.exists():
+        shutil.rmtree(depth_frames)
 
 
 class KeyframeExtractor(Node):
@@ -92,6 +95,8 @@ class KeyframeExtractor(Node):
         self.tmp_dir.mkdir(exist_ok=True)
         self.tmp_rgb_video = self.tmp_dir / "rgb_full.mp4"
         self.tmp_depth_video = self.tmp_dir / "depth_full.mp4"
+        self.tmp_depth_frames_dir = self.tmp_dir / "depth_frames"
+        self.tmp_depth_frames_dir.mkdir(parents=True, exist_ok=True)
 
         self.kf_dir = self.output_dir / "keyframes"
         self.kf_dir.mkdir(exist_ok=True)
@@ -136,42 +141,7 @@ class KeyframeExtractor(Node):
 
     @staticmethod
     def _decode_compressed_depth(depth_msg: CompressedImage):
-        """Decode sensor_msgs/CompressedImage from compressedDepth transport.
-
-        The payload is not a raw PNG: the first 12 bytes are three float32
-        quantization parameters, followed by the compressed image bytes.
-        """
-        data = bytes(depth_msg.data)
-        if len(data) <= COMPRESSED_DEPTH_HEADER_SIZE:
-            return None
-
-        depth_quant_a = 0.0
-        depth_quant_b = 0.0
-        image_data = data
-
-        fmt = depth_msg.format or ""
-        has_depth_header = "compressedDepth" in fmt
-        if not has_depth_header and len(data) > 16:
-            # Live bags may omit the format hint; PNG magic starts at byte 12.
-            has_depth_header = data[12:16] == b"\x89PNG"
-
-        if has_depth_header:
-            depth_quant_a, depth_quant_b, _ = struct.unpack("<fff", data[:COMPRESSED_DEPTH_HEADER_SIZE])
-            image_data = data[COMPRESSED_DEPTH_HEADER_SIZE:]
-
-        depth = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_ANYDEPTH)
-        if depth is None:
-            return None
-
-        # Inverse RLE quantization used when depth_quant_a != 0.
-        if depth_quant_a != 0.0:
-            depth = depth.astype(np.float32)
-            valid = depth != 0
-            depth_out = np.zeros_like(depth, dtype=np.float32)
-            depth_out[valid] = depth_quant_a / (depth[valid].astype(np.float32) - depth_quant_b)
-            depth = depth_out
-
-        return depth
+        return decode_compressed_depth(bytes(depth_msg.data), format_hint=depth_msg.format or "")
 
     def _odom_to_pose(self, odom_msg: Odometry, frame_idx: int, timestamp: float) -> dict:
         q = odom_msg.pose.pose.orientation
@@ -307,6 +277,12 @@ class KeyframeExtractor(Node):
 
         self.rgb_writer.write(rgb)
 
+        h, w = rgb.shape[:2]
+        if depth.shape[0] != h or depth.shape[1] != w:
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        save_depth_png_mm(self.tmp_depth_frames_dir / f"frame_{self.frame_idx:06d}.png", depth)
+
         depth_vis = cv2.convertScaleAbs(depth, alpha=255.0 / DEFAULT_DEPTH_VIS_SCALE)
         depth_vis = cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)
         self.depth_writer.write(depth_vis)
@@ -353,12 +329,9 @@ class KeyframeExtractor(Node):
         episodes_dir.mkdir(exist_ok=True)
 
         rgb_cap = cv2.VideoCapture(str(self.tmp_rgb_video))
-        depth_cap = cv2.VideoCapture(str(self.tmp_depth_video))
 
         if not rgb_cap.isOpened():
             raise RuntimeError(f"Cannot open {self.tmp_rgb_video}")
-        if not depth_cap.isOpened():
-            raise RuntimeError(f"Cannot open {self.tmp_depth_video}")
 
         width = int(rgb_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(rgb_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -383,23 +356,25 @@ class KeyframeExtractor(Node):
             self.get_logger().info(f"Creating episode {episode_id} frames [{start_frame}, {end_frame}]")
 
             rgb_writer = cv2.VideoWriter(str(episode_dir / "rgb.mp4"), fourcc, self.fps, (width, height))
-            depth_writer = cv2.VideoWriter(str(episode_dir / "depth.mp4"), fourcc, self.fps, (width, height))
+            episode_depth_dir = episode_dir / "depth_frames"
+            episode_depth_dir.mkdir(exist_ok=True)
 
             rgb_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            depth_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
             current = start_frame
             while current <= end_frame:
                 ok_rgb, rgb_frame = rgb_cap.read()
-                ok_depth, depth_frame = depth_cap.read()
-                if not ok_rgb or not ok_depth:
+                if not ok_rgb:
                     break
                 rgb_writer.write(rgb_frame)
-                depth_writer.write(depth_frame)
+
+                src_depth = self.tmp_depth_frames_dir / f"frame_{current:06d}.png"
+                if not src_depth.exists():
+                    raise RuntimeError(f"Missing depth frame: {src_depth}")
+                shutil.copy2(src_depth, episode_depth_dir / f"frame_{current:06d}.png")
                 current += 1
 
             rgb_writer.release()
-            depth_writer.release()
 
             for local_idx, kf in enumerate(episode_keyframes):
                 frame = get_frame_from_video(rgb_cap, kf.frame_idx)
@@ -434,13 +409,14 @@ class KeyframeExtractor(Node):
             metadata.append(kf_meta)
 
         rgb_cap.release()
-        depth_cap.release()
 
         try:
             self.tmp_rgb_video.unlink(missing_ok=True)
             self.tmp_depth_video.unlink(missing_ok=True)
+            if self.tmp_depth_frames_dir.exists():
+                shutil.rmtree(self.tmp_depth_frames_dir)
         except Exception as e:
-            self.get_logger().warn(f"Failed to remove temp videos: {e}")
+            self.get_logger().warn(f"Failed to remove temp files: {e}")
 
         json_path = self.output_dir / "keyframes.json"
         with open(json_path, "w") as f:

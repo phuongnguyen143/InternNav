@@ -6,9 +6,10 @@ Convert `keyframe_output_*` episodes into **InternVLA-N1 System2** LeRobot forma
 
 ```
 precompute_floor_trajectory.py     →  floor_calibration.json + floor_trajectory.txt
-keyframe_extractor.py (live bag)   →  poses.json + episode rgb.mp4
-rosbag2lerobot.py                  →  LeRobot parquet + 640×480 frame JPGs
+keyframe_extractor.py (live bag)   →  poses.json + episode rgb.mp4 + depth_frames/*.png (uint16 mm)
+rosbag2lerobot.py                  →  LeRobot parquet + 640×480 RGB JPGs + depth PNGs (uint16 mm)
 visualize_pixel_goals.py           →  debug overlays (optional)
+decode_depth_image.py              →  inspect depth PNG values (meters / mm)
 ```
 
 Upstream details: [`../instruction_generator/README.md`](../instruction_generator/README.md).
@@ -20,7 +21,9 @@ Upstream details: [`../instruction_generator/README.md`](../instruction_generato
 | File | Role |
 |------|------|
 | `rosbag2lerobot.py` | Main converter: frames, parquet labels, meta JSON |
+| `../instruction_generator/depth_codec.py` | Shared RealSense `compressedDepth` decode + uint16 mm PNG I/O |
 | `internvla_labels.py` | Discrete actions, camera extrinsics per setting, **pixel goals** |
+| `decode_depth_image.py` | CLI to inspect LeRobot / keyframe depth PNGs |
 | `visualize_pixel_goals.py` | Overlay projected goals + optional floor-path debug |
 
 ---
@@ -169,7 +172,22 @@ Exported for training config `bkhn_125cm_0_30`:
 
 - `observation.images.rgb.125cm_0deg` — from horizon video
 - `observation.images.rgb.125cm_30deg` — **duplicate** of 0° frames (format compatibility)
-- `observation.images.depth.125cm_30deg` — from depth video
+- `observation.images.depth.125cm_30deg` — from `episodes/*/depth_frames/` (uint16 **millimeters**, same as sim `GdvgFV5R1Z5`)
+
+Depth pipeline (RealSense `compressedDepth` → train):
+
+1. `keyframe_extractor.py` decodes ROS payload to meters, saves `depth_frames/frame_XXXXXX.png` as uint16 mm
+2. `rosbag2lerobot.py` resizes depth with **nearest-neighbor** to 640×480 and writes LeRobot PNGs
+3. Training divides by `1000` in `preprocess_depth_image_v2` (meters)
+
+Legacy `depth.mp4` (8-bit preview) is **not** accepted — re-run keyframe extraction after updating.
+
+Inspect depth:
+
+```bash
+python scripts/dataset_converters/decode_depth_image.py \
+  scripts/dataset_converters/lerobot_data_1/round2_bkhn/videos/chunk-000/observation.images.depth.125cm_30deg/episode_000000_0.png
+```
 
 Pixel goals use the **real** `camera_matrix` at each frame (matches the exported RGB).
 

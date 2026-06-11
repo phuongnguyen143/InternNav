@@ -30,6 +30,7 @@ scripts/instruction_generator/
 ├── trajectory_io.py              # Camera/floor trajectory txt parse + timestamp matching
 ├── trajectory_publishers.py      # ROS2 publishers (floor + camera odom txt)
 ├── keyframe_selection.py         # KeyframeConfig and extract_keyframes()
+├── depth_codec.py                # RealSense compressedDepth decode + uint16 mm PNG I/O
 ├── keyframe_extractor.py         # Stage 1 — ROS2 node for keyframe extraction
 ├── precompute_floor_trajectory.py  # Offline floor plane + floor_trajectory.txt
 ├── generate_instruction.py       # Stage 2+3 — instruction generation (LLaVA)
@@ -48,6 +49,8 @@ keyframe_output/
 └── episodes/
     ├── episodes.json           # Episode and subclip metadata
     └── episode_XXXX/
+        ├── rgb.mp4             # Episode RGB video (horizon camera)
+        ├── depth_frames/       # uint16 mm PNGs: frame_XXXXXX.png (used by rosbag2lerobot)
         ├── subclip_00/         # Raw frames between keyframe 0 and 1
         ├── subclip_01/         # Raw frames between keyframe 1 and 2
         ├── ...
@@ -158,6 +161,7 @@ Requires `open3d` in the `internnav` conda environment.
 
 - Pane 1: `trajectory_publishers.py floor` (loads txt only, no PCD at startup)
 - Pane 2: `keyframe_extractor.py` merges camera odom and floor trajectory at `finalize()` into `poses.json`
+- Depth from `/camera/camera/aligned_depth_to_color/image_raw/compressedDepth` is decoded to meters and saved as `tmp/depth_frames/frame_XXXXXX.png` (uint16 mm). Episode export copies these into `episodes/*/depth_frames/`. A temporary `depth_full.mp4` preview may be written for debugging only.
 
 Press `Ctrl+B` then `S` to stop and save.
 
