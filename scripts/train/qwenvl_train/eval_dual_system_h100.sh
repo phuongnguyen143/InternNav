@@ -21,7 +21,7 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-DEFAULT_DATA_ROOT="${REPO_ROOT}/data/InternData-N1/vln_pe"
+DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
@@ -44,8 +44,8 @@ resize_w="${RESIZE_W:-384}"
 num_history="${NUM_HISTORY:-8}"
 model_max_length="${MODEL_MAX_LENGTH:-8192}"
 data_augmentation="${DATA_AUGMENTATION:-False}"
-dataloader_workers="${DATALOADER_WORKERS:-8}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+dataloader_workers="${DATALOADER_WORKERS:-2}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 
 print_gpu_preflight() {
     echo ""
@@ -66,7 +66,7 @@ print_gpu_preflight() {
     echo ""
 }
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%30,r2r_60cm_15_15%30,rxr_125cm_0_30%30,rxr_60cm_15_15%30,scalevln_125cm_0_30%30,scalevln_60cm_30_30%30}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%10}"
 
 run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval}"
 output_dir="${OUTPUT_DIR:-logs/${run_name}}"

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+torch.backends.cudnn.enabled = False
 import transformers
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
@@ -204,7 +205,7 @@ def my_eval(
     eval_args: EvalArguments,
     output_dir: str,
 ) -> Dict[str, float]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     model.to(device)
 
     log_name = os.environ.get("EVAL_LOG_FILE", "eval_metrics.jsonl")

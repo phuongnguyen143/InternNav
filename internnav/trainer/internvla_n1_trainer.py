@@ -216,6 +216,14 @@ def train(attn_implementation="sdpa"):
 
     if is_rank0():
         print_jetson_summary()
+        print("\n=== Model tune flags (from CLI) ===")
+        print(
+            f"tune_mm_vision={model_args.tune_mm_vision}  "
+            f"tune_mm_mlp={model_args.tune_mm_mlp}  "
+            f"tune_mm_llm={model_args.tune_mm_llm}  "
+            f"system1={model_args.system1!r}"
+        )
+        print("=== End model tune flags ===\n")
         print("\n=== Training data env ===")
         print(f"vln_dataset_use: {data_args.vln_dataset_use}")
         print(f"INTERNAV_R2R_DATA_PATH: {os.environ.get('INTERNAV_R2R_DATA_PATH', '(not set)')}")
@@ -327,6 +335,7 @@ def train(attn_implementation="sdpa"):
     set_model(model_args, model)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"trainable_params: {trainable_params}")
     frozen_smoke = trainable_params == 0
     # DeepSpeed needs an optimizer; skip it when running forward-only smoke test.
     if frozen_smoke and training_args.deepspeed:
@@ -378,6 +387,7 @@ def train(attn_implementation="sdpa"):
         print_status_block("before_train_loop")
 
     if frozen_smoke:
+        print("We running frozen smoke test")
         run_frozen_smoke_test(trainer)
     elif list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")

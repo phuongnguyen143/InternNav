@@ -1,21 +1,23 @@
 #!/bin/bash
-#   chmod +x scripts/train/qwenvl_train/train_dual_system_h100.sh
-#   bash scripts/train/qwenvl_train/train_dual_system_h100.sh
+# System 2 (VLM planner) training on H100.
 #
-#   MAX_STEPS=1 bash scripts/train/qwenvl_train/train_dual_system_h100.sh
+#   chmod +x scripts/train/qwenvl_train/train_system2_h100.sh
+#   FREEZE_ALL=False bash scripts/train/qwenvl_train/train_system2_h100.sh
 #
-#   NPROC_PER_NODE=8 bash scripts/train/qwenvl_train/train_dual_system_h100.sh
+#   MAX_STEPS=1 FREEZE_ALL=True bash scripts/train/qwenvl_train/train_system2_h100.sh
+
 #
-#   BATCH_SIZE=1 DEEPSPEED_CONFIG=scripts/train/qwenvl_train/zero3.json bash ...
+#   NPROC_PER_NODE=8 bash scripts/train/qwenvl_train/train_system2_h100.sh
 #
-#   sbatch scripts/train/qwenvl_train/train_dual_system_h100.sh
+#
+#   sbatch scripts/train/qwenvl_train/train_system2_h100.sh
 #
 #   if we currently on srun
 #   srun --pty --partition=main --nodes=1 --ntasks=1 --gpus=nvidia_h100_80gb_hbm3:1 \
 #        --cpus-per-task=16 --mem=128G --time=48:00:00 bash -i
-#   bash scripts/train/qwenvl_train/train_dual_system_h100.sh
+#   bash scripts/train/qwenvl_train/train_system2_h100.sh
 
-# #SBATCH -J internvla-dual-h100
+# #SBATCH -J internvla-system2-h100
 # #SBATCH -p gpu_partition
 # #SBATCH -N 1
 # #SBATCH --gres=gpu:1
@@ -49,21 +51,20 @@ export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/tr
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
 
-deepspeed="${DEEPSPEED_CONFIG:-scripts/train/qwenvl_train/zero2.json}"
+total_gpus=$((NPROC_PER_NODE * NNODES))
+deepspeed="scripts/train/qwenvl_train/zero2.json"
 
-system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-System2}"
-if [[ -d "${system2_ckpt}" ]]; then
-    system2_ckpt="$(cd "${system2_ckpt}" && pwd)"
-elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
-    system2_ckpt="$(cd "${REPO_ROOT}/${system2_ckpt}" && pwd)"
+llm="${MODEL_NAME:-Qwen/Qwen2.5-VL-7B-Instruct}"
+if [[ -d "${llm}" ]]; then
+    llm="$(cd "${llm}" && pwd)"
+elif [[ -d "${REPO_ROOT}/${llm}" ]]; then
+    llm="$(cd "${REPO_ROOT}/${llm}" && pwd)"
 fi
 
-# system1 options: navdp_async, nextdit_async, nextdit
-system1="${SYSTEM1:-navdp_async}"
-
-lr="${LR:-1e-4}"
-batch_size="${BATCH_SIZE:-4}"
-grad_accum_steps="${GRAD_ACCUM_STEPS:-4}"
+lr="${LR:-2e-5}"
+vision_tower_lr="${VISION_TOWER_LR:-5e-6}"
+batch_size="${BATCH_SIZE:-8}"
+grad_accum_steps="${GRAD_ACCUM_STEPS:-8}"
 max_pixels="${MAX_PIXELS:-313600}"
 min_pixels="${MIN_PIXELS:-3136}"
 resize_h="${RESIZE_H:-384}"
@@ -72,7 +73,29 @@ num_history="${NUM_HISTORY:-8}"
 model_max_length="${MODEL_MAX_LENGTH:-8192}"
 data_augmentation="${DATA_AUGMENTATION:-True}"
 dataloader_workers="${DATALOADER_WORKERS:-2}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+
+if [[ "${FREEZE_ALL:-False}" == "True" ]]; then
+    tune_mm_vision=False
+    tune_mm_mlp=False
+    tune_mm_llm=False
+else
+    tune_mm_vision="${TUNE_MM_VISION:-True}"
+    tune_mm_mlp="${TUNE_MM_MLP:-True}"
+    tune_mm_llm="${TUNE_MM_LLM:-False}"
+fi
+frozen_smoke=false
+if [[ "${tune_mm_vision}" == "False" && "${tune_mm_mlp}" == "False" && "${tune_mm_llm}" == "False" ]]; then
+    frozen_smoke=true
+fi
+if [[ "${frozen_smoke}" == "true" && "${FREEZE_ALL:-False}" != "True" && -z "${MAX_STEPS:-}" ]]; then
+    echo "ERROR: All System2 tune flags are False (vision/mlp/llm) but FREEZE_ALL is not True." >&2
+    echo "       Unset TUNE_MM_* overrides or set FREEZE_ALL=False for real training:" >&2
+    echo "         unset FREEZE_ALL TUNE_MM_VISION TUNE_MM_MLP TUNE_MM_LLM" >&2
+    echo "         FREEZE_ALL=False bash scripts/train/qwenvl_train/train_system2_h100.sh" >&2
+    exit 1
+fi
 
 print_gpu_preflight() {
     echo ""
@@ -93,9 +116,9 @@ print_gpu_preflight() {
     echo ""
 }
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%5,r2r_60cm_15_15%5}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30,r2r_125cm_0_45,r2r_60cm_15_15,r2r_60cm_30_30}"
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-train}"
+run_name="${RUN_NAME:-InternVLA-N1-System2-train}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -111,14 +134,16 @@ else
 fi
 
 echo "Repo root:       ${REPO_ROOT}"
-echo "System 2 ckpt:   ${system2_ckpt}"
-if [[ "${system2_ckpt}" == /* ]] && [[ ! -d "${system2_ckpt}" ]]; then
-    echo "ERROR: System 2 checkpoint path does not exist: ${system2_ckpt}" >&2
-    echo "Download from https://huggingface.co/InternRobotics/InternVLA-N1-System2" >&2
+echo "Model:           ${llm}"
+if [[ "${llm}" == /* ]] && [[ ! -d "${llm}" ]]; then
+    echo "ERROR: Local model path does not exist: ${llm}" >&2
     exit 1
 fi
-echo "System 1:        ${system1} (train NavDP, System 2 frozen)"
-echo "DeepSpeed:       ${deepspeed}"
+if [[ "${frozen_smoke}" == "true" ]]; then
+    echo "Mode:            frozen smoke (no DeepSpeed, no optimizer updates)"
+else
+    echo "DeepSpeed:       ${deepspeed}"
+fi
 echo "Data root:       ${DEFAULT_DATA_ROOT}"
 echo "R2R data path:   ${INTERNAV_R2R_DATA_PATH}"
 if [[ ! -d "${INTERNAV_R2R_DATA_PATH}" ]]; then
@@ -127,9 +152,13 @@ if [[ ! -d "${INTERNAV_R2R_DATA_PATH}" ]]; then
 fi
 
 echo "Datasets:        ${vln_datasets}"
-echo "Batch size:      ${batch_size} (per device)  grad_accum=${grad_accum_steps}"
+effective_batch=$((batch_size * grad_accum_steps * NPROC_PER_NODE * NNODES))
+echo "Batch size:      ${batch_size} (per device)  grad_accum=${grad_accum_steps}  effective=${effective_batch}"
+echo "Launch:          ${NNODES} node(s) x ${NPROC_PER_NODE} GPU(s)"
 echo "Resize:          ${resize_h}x${resize_w}  history=${num_history}  max_len=${model_max_length}"
-echo "Tune System 2:   vision=False mlp=False llm=False  aug=${data_augmentation}"
+echo "Attention:       ${ATTN_IMPLEMENTATION}"
+echo "FREEZE_ALL:      ${FREEZE_ALL:-False}"
+echo "Tune System 2:   vision=${tune_mm_vision} mlp=${tune_mm_mlp} llm=${tune_mm_llm}  aug=${data_augmentation}"
 echo "Output dir:      ${output_dir}"
 echo "Metrics log:     ${output_dir}/training_metrics.jsonl"
 if [ -n "${MAX_STEPS:-}" ]; then
@@ -139,6 +168,11 @@ else
 fi
 
 print_gpu_preflight
+
+deepspeed_args=()
+if [[ "${frozen_smoke}" != "true" ]]; then
+    deepspeed_args=(--deepspeed "${deepspeed}")
+fi
 
 torchrun_args=(
     --nnodes="${NNODES}"
@@ -164,13 +198,13 @@ fi
 
 "${launch_cmd[@]}" \
     internnav/trainer/internvla_n1_trainer.py \
-    --deepspeed "${deepspeed}" \
-    --model_name_or_path "${system2_ckpt}" \
+    "${deepspeed_args[@]}" \
+    --model_name_or_path "${llm}" \
     --vln_dataset_use "${vln_datasets}" \
     --data_flatten False \
-    --tune_mm_vision False \
-    --tune_mm_mlp False \
-    --tune_mm_llm False \
+    --tune_mm_vision "${tune_mm_vision}" \
+    --tune_mm_mlp "${tune_mm_mlp}" \
+    --tune_mm_llm "${tune_mm_llm}" \
     --bf16 \
     --num_history "${num_history}" \
     --data_augmentation "${data_augmentation}" \
@@ -179,8 +213,8 @@ fi
     --sample_step 4 \
     --num_future_steps 4 \
     --predict_step_num 32 \
-    --pixel_goal_only True \
-    --system1 "${system1}" \
+    --pixel_goal_only False \
+    --system1 "none" \
     --output_dir "${output_dir}" \
     --num_train_epochs "${num_epochs}" \
     --per_device_train_batch_size "${batch_size}" \
@@ -193,11 +227,11 @@ fi
     --save_steps "${save_steps}" \
     --save_total_limit 5 \
     --learning_rate "${lr}" \
+    --vision_tower_lr "${vision_tower_lr}" \
     --weight_decay 0 \
     --warmup_ratio 0.003 \
     --max_grad_norm 1 \
-    --lr_scheduler_type "cosine_with_min_lr" \
-    --lr_scheduler_kwargs '{"min_lr": 1e-05}' \
+    --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --logging_first_step True \
     --include_num_input_tokens_seen True \
