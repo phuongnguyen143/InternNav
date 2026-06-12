@@ -23,7 +23,11 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
-from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
+from internnav.dataset.internvla_n1_lerobot_dataset import (
+    IGNORE_INDEX,
+    TRAJ_TOKEN_INDEX,
+    make_supervised_data_module,
+)
 from internnav.model.basemodel.internvla_n1.internvla_n1 import (
     InternVLAN1ForCausalLM,
     InternVLAN1ModelConfig,
@@ -187,6 +191,87 @@ def _tensorboard_log_dir(output_dir: str, eval_args: EvalArguments) -> str:
     return os.path.join(output_dir, "tensorboard")
 
 
+def _tensor_shape_str(value: Any) -> str:
+    if torch.is_tensor(value):
+        return f"shape={tuple(value.shape)} dtype={value.dtype} device={value.device}"
+    if isinstance(value, (list, tuple)):
+        return f"{type(value).__name__}(len={len(value)})"
+    return repr(value)
+
+
+def debug_batch_shapes(
+    batch: Dict[str, Any],
+    outputs: Any,
+    model: InternVLAN1ForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    batch_idx: int = 0,
+) -> None:
+    """Print batch/output tensor shapes and decode S2 supervised text (step 0 only)."""
+    if not is_rank0():
+        return
+
+    print("\n" + "=" * 60)
+    print(f"[eval debug] batch {batch_idx} — inputs, outputs, and loss supervision")
+    print("=" * 60)
+
+    system1 = model.get_system1_type()
+    n_query = model.get_n_query()
+    print(f"  system1={system1!r}  n_query={n_query}  vocab_size={model.config.vocab_size}")
+
+    print("\n--- batch tensors ---")
+    for key in sorted(batch.keys()):
+        print(f"  {key}: {_tensor_shape_str(batch[key])}")
+        if key == "t_s_pos":
+            print(f"    values={batch[key]}")
+        if key == "video_frame_num" and torch.is_tensor(batch[key]):
+            print(f"    values={batch[key].tolist()}")
+
+    print("\n--- model outputs (CausalLMOutputWithPast) ---")
+    loss = getattr(outputs, "loss", None)
+    logits = getattr(outputs, "logits", None)
+    if loss is not None:
+        print(f"  loss: scalar={float(loss.item()):.6f} {_tensor_shape_str(loss)}")
+    else:
+        print("  loss: None")
+    if logits is not None:
+        print(f"  logits: {_tensor_shape_str(logits)}")
+    for attr in ("past_key_values", "hidden_states", "attentions"):
+        val = getattr(outputs, attr, None)
+        if val is not None:
+            if attr == "hidden_states" and isinstance(val, (tuple, list)):
+                print(f"  hidden_states: tuple(len={len(val)}) last={_tensor_shape_str(val[-1])}")
+            else:
+                print(f"  {attr}: {type(val).__name__}")
+
+    print("\n--- loss supervision (S1 trajectory; NOT token CE on batch['labels']) ---")
+    if "traj_poses" in batch:
+        traj_poses = batch["traj_poses"]
+        print(f"  traj_poses (GT): {_tensor_shape_str(traj_poses)}")
+        print("    layout: (batch, T_frames, predict_step_num, 3) with (dx, dy, d_yaw) per step")
+        if torch.is_tensor(traj_poses) and traj_poses.numel() > 0:
+            sample = traj_poses[0, 0, :3].tolist()
+            print(f"    sample[0,0,:3] first 3 steps: {sample}")
+    else:
+        print("  traj_poses: missing — dual-system / pixel_goal_only batch expected for eval loss")
+
+    print("\n--- S2 supervised text (batch['labels'] != IGNORE_INDEX, excluding traj tokens) ---")
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    batch_size = input_ids.shape[0]
+    for b in range(min(batch_size, 2)):
+        supervised_mask = (labels[b] != IGNORE_INDEX) & (labels[b] != TRAJ_TOKEN_INDEX)
+        n_supervised = int(supervised_mask.sum().item())
+        tok_ids = input_ids[b][supervised_mask].tolist()
+        decoded = tokenizer.decode(tok_ids, skip_special_tokens=False)
+        print(f"  sample[{b}]: {n_supervised} supervised token(s)")
+        print(f"    decoded: {decoded!r}")
+        if "t_s_pos" in batch:
+            t_start = batch["t_s_pos"][b]
+            print(f"    traj latent slots: input_ids[{t_start}:{t_start + n_query}]")
+
+    print("=" * 60 + "\n")
+
+
 def create_eval_tensorboard_writer(
     output_dir: str,
     eval_args: EvalArguments,
@@ -204,6 +289,7 @@ def my_eval(
     dataloader: DataLoader,
     eval_args: EvalArguments,
     output_dir: str,
+    tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
 ) -> Dict[str, float]:
     device = torch.device("cuda")
     model.to(device)
@@ -268,6 +354,9 @@ def my_eval(
                 enabled=eval_args.bf16 and device.type == "cuda",
             ):
                 outputs = model(**batch)
+
+            if step == 0 and tokenizer is not None:
+                debug_batch_shapes(batch, outputs, model, tokenizer, batch_idx=step)
 
             loss = outputs.loss
             if loss is None:
@@ -469,8 +558,15 @@ def evaluate(attn_implementation: str = "sdpa"):
         pin_memory=torch.cuda.is_available(),
     )
 
-    my_eval(model, dataloader, eval_args, eval_args.output_dir)
+    tokenizer = getattr(collator, "tokenizer", None)
+    my_eval(model, dataloader, eval_args, eval_args.output_dir, tokenizer=tokenizer)
 
 
 if __name__ == "__main__":
     evaluate()
+
+
+
+# batch keys dict_keys(['input_ids', 'labels', 'attention_mask', 'pixel_values', 
+# 'image_grid_thw', 'pixel_values_videos', 'video_grid_thw', 'position_ids', 
+# 't_s_pos', 'traj_images', 'traj_depths', 'traj_poses', 'video_frame_num'])

@@ -68,7 +68,7 @@ print_gpu_preflight() {
 
 vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%10}"
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval-v2}"
 output_dir="${OUTPUT_DIR:-logs/${run_name}}"
 
 extra_args=()

@@ -157,6 +157,8 @@ result/
 assets/bkhn_data1/
 assets/realworld_sample_data1/
 assets/realworld_sample_data2/
+internnav/training_comparison
+internnav/compare_training_runs.py
 
 # Docker image exports
 internnav-thor-060626.tar

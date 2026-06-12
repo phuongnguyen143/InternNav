@@ -70,6 +70,9 @@ from internnav.trainer.jetson_monitor import (
     train_tensorboard_log_dir,
 )
 
+#lora
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+#####
 
 # Alias kept for backwards compatibility; JetsonTrainingCallback extends TrainerCallback.
 JetsonTrainerCallback = JetsonTrainingCallback
@@ -156,6 +159,7 @@ def set_model(model_args, model):
       nextdit: traj_dit, action encoder/decoder, cond_projector, latent_queries, ...
       navdp: navdp policy + latent_queries (rgb_model stays frozen)
     """
+
     if model_args.tune_mm_vision:
         for n, p in model.visual.named_parameters():
             p.requires_grad = True
@@ -201,6 +205,32 @@ def set_model(model_args, model):
                 p.requires_grad = True
         model.model.latent_queries.requires_grad = True
 
+
+
+def apply_lora(model, r=16, alpha=32, dropout=0.05):
+    for p in model.parameters():
+        p.requires_grad = False
+
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model
 
 def train(attn_implementation="sdpa"):
     global local_rank
@@ -277,6 +307,7 @@ def train(attn_implementation="sdpa"):
             model_args.model_name_or_path,
         ).image_processor
         data_args.model_type = "internvla-n1"
+
     elif "qwen2.5" in model_args.model_name_or_path.lower():
         print(f"We are using {model_args.model_name_or_path}")
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -286,6 +317,15 @@ def train(attn_implementation="sdpa"):
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             low_cpu_mem_usage=True,
         )
+
+        # lora
+        model = apply_lora(
+                model,
+                r=16,
+                alpha=32,
+                dropout=0.05,
+            )
+
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
         ).image_processor
@@ -333,14 +373,17 @@ def train(attn_implementation="sdpa"):
     # Lazy-build S1 modules after S2 weights are loaded
     if data_args.model_type == "internvla-n1":
         model.get_model().initialize_vision_modules(model_args=model_args)
-    set_model(model_args, model)
+        set_model(model_args, model)
+    else:
+        print(f"We are using {data_args.model_type} setting LoRA")
+        for n, p in model.visual.merger.named_parameters():
+            p.requires_grad = True
+
+        for n, p in model.visual.named_parameters():
+            p.requires_grad = True
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable_params: {trainable_params}")
-
-    print(model.print_trainable_parameters()) # : 676550144
-
-    '''
     frozen_smoke = trainable_params == 0
     # DeepSpeed needs an optimizer; skip it when running forward-only smoke test.
     if frozen_smoke and training_args.deepspeed:
@@ -349,9 +392,16 @@ def train(attn_implementation="sdpa"):
         training_args.deepspeed = None
 
     if is_rank0():
-        model.visual.print_trainable_parameters()
-        model.model.print_trainable_parameters()
+        # model.visual.print_trainable_parameters()
+        # model.model.print_trainable_parameters()
         print_status_block("after_model_load")
+
+        # trainable params: 47,589,376 || all params: 8,339,756,032 || trainable%: 0.5706
+
+        # trainable_params: 676550144, 676 550 144
+        # trainable params: 724,139,520 / 8,339,756,032
+
+
 
     # data_packing=True uses a packed-batch collator (make_supervised_data_module_packed).
     if data_args.data_packing:
@@ -391,6 +441,7 @@ def train(attn_implementation="sdpa"):
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
         print_status_block("before_train_loop")
 
+    '''
     if frozen_smoke:
         print("We running frozen smoke test")
         run_frozen_smoke_test(trainer)

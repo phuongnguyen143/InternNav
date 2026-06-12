@@ -118,7 +118,7 @@ print_gpu_preflight() {
 
 vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%50,r2r_125cm_0_45%50,r2r_60cm_15_15,r2r_60cm_30_30%50}"
 
-run_name="${RUN_NAME:-InternVLA-N1-System2-train-freeze-llm-v1}"
+run_name="${RUN_NAME:-InternVLA-N1-System2-train-lora-v1}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -197,7 +197,7 @@ if [[ -n "${SLURM_JOB_ID:-}" ]] && [[ -z "${INTERNAV_NO_SRUN:-}" ]] && [[ ! -t 0
 fi
 
 "${launch_cmd[@]}" \
-    internnav/trainer/internvla_n1_trainer.py \
+    internnav/trainer/internvla_n1_trainer_lora_s2.py \
     "${deepspeed_args[@]}" \
     --model_name_or_path "${llm}" \
     --vln_dataset_use "${vln_datasets}" \
