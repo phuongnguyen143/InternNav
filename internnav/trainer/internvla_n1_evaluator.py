@@ -50,6 +50,7 @@ from internnav.trainer.jetson_monitor import (
     print_jetson_summary,
     print_status_block,
 )
+from internnav.trainer.system2_metrics import compute_system2_metrics
 
 
 class RunningStats:
@@ -123,6 +124,7 @@ def load_model(model_args: ModelArguments, eval_args: EvalArguments):
         inner = model.get_model()
         has_system1 = getattr(inner, "navdp", None) is not None or getattr(inner, "traj_dit", None) is not None
         if not has_system1:
+            print("Initializing System1 modules")
             inner.initialize_vision_modules(model_args=model_args)
 
     model.eval()
@@ -314,6 +316,17 @@ def my_eval(
     baseline_mean: Optional[float] = None
     spikes = 0
     spikes_by_ratio = 0
+    total_samples = 0
+    total_supervised_tokens = 0
+    s2_metric_keys = (
+        "turn_accuracy",
+        "stop_accuracy",
+        "discrete_action_accuracy",
+        "pixel_coord_parse_rate",
+        "pixel_coord_l2",
+    )
+    s2_metric_sum = {k: 0.0 for k in s2_metric_keys}
+    s2_metric_count = {k: 0 for k in s2_metric_keys}
 
     if is_rank0():
         max_steps = eval_args.max_eval_steps if eval_args.max_eval_steps > 0 else len(dataloader)
@@ -348,6 +361,9 @@ def my_eval(
                 break
 
             batch = move_batch_to_device(batch, device)
+            sample_types = batch.pop("sample_types", None)
+            pixel_coords_gt = batch.pop("pixel_coords_gt", None)
+            # Collator metadata — not accepted by InternVLAN1ForCausalLM.forward (see system2_vl_trainer).
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -368,6 +384,27 @@ def my_eval(
             total_loss += loss_value
             total_batches += 1
             stats.update(loss_value)
+            total_samples += int(batch["labels"].shape[0])
+            total_supervised_tokens += int((batch["labels"] != IGNORE_INDEX).sum().item())
+            if (
+                tokenizer is not None
+                and sample_types is not None
+                and hasattr(outputs, "logits")
+                and outputs.logits is not None
+            ):
+                with torch.no_grad():
+                    s2_metrics = compute_system2_metrics(
+                        outputs.logits,
+                        batch["labels"],
+                        sample_types,
+                        pixel_coords_gt,
+                        tokenizer,
+                    )
+                for key in s2_metric_keys:
+                    value = s2_metrics.get(key)
+                    if value is not None:
+                        s2_metric_sum[key] += float(value)
+                        s2_metric_count[key] += 1
 
             if baseline_mean is None and stats.n >= loss_baseline_steps:
                 baseline_mean = stats.mean
@@ -436,6 +473,11 @@ def my_eval(
                     "alert_reason": alert_reason,
                     "loss_spikes_total": spikes,
                     "loss_spikes_by_ratio": spikes_by_ratio,
+                    "turn_accuracy": (s2_metric_sum["turn_accuracy"] / s2_metric_count["turn_accuracy"]) if s2_metric_count["turn_accuracy"] > 0 else None,
+                    "stop_accuracy": (s2_metric_sum["stop_accuracy"] / s2_metric_count["stop_accuracy"]) if s2_metric_count["stop_accuracy"] > 0 else None,
+                    "discrete_action_accuracy": (s2_metric_sum["discrete_action_accuracy"] / s2_metric_count["discrete_action_accuracy"]) if s2_metric_count["discrete_action_accuracy"] > 0 else None,
+                    "pixel_coord_parse_rate": (s2_metric_sum["pixel_coord_parse_rate"] / s2_metric_count["pixel_coord_parse_rate"]) if s2_metric_count["pixel_coord_parse_rate"] > 0 else None,
+                    "pixel_coord_l2": (s2_metric_sum["pixel_coord_l2"] / s2_metric_count["pixel_coord_l2"]) if s2_metric_count["pixel_coord_l2"] > 0 else None,
                     "elapsed_sec": time.time() - started,
                 }
                 append_jsonl(log_path, step_record)
@@ -454,6 +496,11 @@ def my_eval(
                         "alert": alert,
                         "loss_spikes_total": spikes,
                         "loss_spikes_by_ratio": spikes_by_ratio,
+                        "turn_accuracy": step_record["turn_accuracy"],
+                        "stop_accuracy": step_record["stop_accuracy"],
+                        "discrete_action_accuracy": step_record["discrete_action_accuracy"],
+                        "pixel_coord_parse_rate": step_record["pixel_coord_parse_rate"],
+                        "pixel_coord_l2": step_record["pixel_coord_l2"],
                         "elapsed_sec": step_record["elapsed_sec"],
                     },
                 )
@@ -474,12 +521,21 @@ def my_eval(
         "eval_loss": total_loss / total_batches,
         "eval_batches": float(total_batches),
         "eval_runtime_sec": time.time() - started,
+        "eval_steps_per_sec": total_batches / max(time.time() - started, 1e-12),
+        "eval_samples_per_sec": total_samples / max(time.time() - started, 1e-12),
+        "eval_supervised_tokens_per_sec": total_supervised_tokens / max(time.time() - started, 1e-12),
         "eval_loss_std": stats.std(),
         "eval_loss_min": stats.min,
         "eval_loss_max": stats.max,
+        "eval_perplexity": float(torch.exp(torch.tensor(total_loss / total_batches)).item()),
         "loss_spikes_total": float(spikes),
         "loss_spikes_by_ratio": float(spikes_by_ratio),
         "loss_baseline_mean": baseline_mean if baseline_mean is not None else float("nan"),
+        "turn_accuracy": (s2_metric_sum["turn_accuracy"] / s2_metric_count["turn_accuracy"]) if s2_metric_count["turn_accuracy"] > 0 else float("nan"),
+        "stop_accuracy": (s2_metric_sum["stop_accuracy"] / s2_metric_count["stop_accuracy"]) if s2_metric_count["stop_accuracy"] > 0 else float("nan"),
+        "discrete_action_accuracy": (s2_metric_sum["discrete_action_accuracy"] / s2_metric_count["discrete_action_accuracy"]) if s2_metric_count["discrete_action_accuracy"] > 0 else float("nan"),
+        "pixel_coord_parse_rate": (s2_metric_sum["pixel_coord_parse_rate"] / s2_metric_count["pixel_coord_parse_rate"]) if s2_metric_count["pixel_coord_parse_rate"] > 0 else float("nan"),
+        "pixel_coord_l2": (s2_metric_sum["pixel_coord_l2"] / s2_metric_count["pixel_coord_l2"]) if s2_metric_count["pixel_coord_l2"] > 0 else float("nan"),
     }
 
     if is_rank0():
@@ -506,7 +562,20 @@ def my_eval(
         print(f"  eval_loss: {metrics['eval_loss']:.6f}")
         print(f"  min/max:   {metrics['eval_loss_min']:.6f} / {metrics['eval_loss_max']:.6f}")
         print(f"  std:       {metrics['eval_loss_std']:.6f}")
+        print(f"  ppl:       {metrics['eval_perplexity']:.6f}")
         print(f"  spikes:    {int(metrics['loss_spikes_total'])} (ratio={int(metrics['loss_spikes_by_ratio'])})")
+        print(f"  speed:     {metrics['eval_steps_per_sec']:.2f} steps/s, {metrics['eval_samples_per_sec']:.2f} samples/s")
+        print(f"  tok/s:     {metrics['eval_supervised_tokens_per_sec']:.2f}")
+        if metrics["turn_accuracy"] == metrics["turn_accuracy"]:
+            print(f"  turn_acc:  {metrics['turn_accuracy']:.6f}")
+        if metrics["stop_accuracy"] == metrics["stop_accuracy"]:
+            print(f"  stop_acc:  {metrics['stop_accuracy']:.6f}")
+        if metrics["discrete_action_accuracy"] == metrics["discrete_action_accuracy"]:
+            print(f"  act_acc:   {metrics['discrete_action_accuracy']:.6f}")
+        if metrics["pixel_coord_parse_rate"] == metrics["pixel_coord_parse_rate"]:
+            print(f"  px_parse:  {metrics['pixel_coord_parse_rate']:.6f}")
+        if metrics["pixel_coord_l2"] == metrics["pixel_coord_l2"]:
+            print(f"  pixel_l2:  {metrics['pixel_coord_l2']:.6f}")
         print(f"  runtime:   {metrics['eval_runtime_sec']:.1f}s")
         print(f"  log_file:  {log_path}")
         if tb_writer is not None and tb_writer.writer is not None:

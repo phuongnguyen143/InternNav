@@ -1,27 +1,32 @@
 #!/bin/bash
-# System 2 (VLM planner) training on H100.
+# System 2 VLM training on H100.
 #
 #   chmod +x scripts/train/qwenvl_train/train_system2_h100.sh
-#   FREEZE_ALL=False bash scripts/train/qwenvl_train/train_system2_h100.sh
+#   FREEZE_ALL=False NPROC_PER_NODE=1 bash scripts/train/qwenvl_train/train_system2_h100.sh
 #
 #   MAX_STEPS=1 FREEZE_ALL=True bash scripts/train/qwenvl_train/train_system2_h100.sh
 
 #
-#   NPROC_PER_NODE=8 bash scripts/train/qwenvl_train/train_system2_h100.sh
+#   LOW_MEM preset (ZeRO-3 offload, shorter seq, freeze vision by default):
+#   LOW_MEM=True FREEZE_ALL=False bash scripts/train/qwenvl_train/train_system2_h100.sh
 #
+#   Tune memory without preset (examples):
+#   MODEL_MAX_LENGTH=4096 NUM_HISTORY=4 MAX_PIXELS=200704 BATCH_SIZE=1 GRAD_ACCUM_STEPS=8 \
+#     TUNE_MM_VISION=False DEEPSPEED=scripts/train/qwenvl_train/zero3_offload_opt_lowmem.json \
+#     bash scripts/train/qwenvl_train/train_system2_h100.sh
 #
 #   sbatch scripts/train/qwenvl_train/train_system2_h100.sh
 #
-#   if we currently on srun
-#   srun --pty --partition=main --nodes=1 --ntasks=1 --gpus=nvidia_h100_80gb_hbm3:1 \
-#        --cpus-per-task=16 --mem=128G --time=48:00:00 bash -i
+#   srun
+#   srun --pty --partition=main --nodes=1 --ntasks=1 --gpus=nvidia_h100_80gb_hbm3:2 \
+#        --cpus-per-task=32 --mem=256G --time=48:00:00 bash -i
 #   bash scripts/train/qwenvl_train/train_system2_h100.sh
 
 # #SBATCH -J internvla-system2-h100
 # #SBATCH -p gpu_partition
 # #SBATCH -N 1
-# #SBATCH --gres=gpu:1
-# #SBATCH --cpus-per-task=16
+# #SBATCH --gres=gpu:2
+# #SBATCH --cpus-per-task=32
 # #SBATCH --ntasks-per-node=1
 # #SBATCH -o ./slurm-%j.out
 # #SBATCH -e ./slurm-%j.err
@@ -35,9 +40,9 @@ cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 NNODES="${NNODES:-1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29500}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.2}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     NNODES="${SLURM_NNODES:-${NNODES}}"
@@ -46,13 +51,41 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     MASTER_PORT="${MASTER_PORT:-$((RANDOM % 101 + 20001))}"
 fi
 
+
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%0}"
 DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
 
+vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30%5}"
+DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
+export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bkhn_ver2.0}"
+
 total_gpus=$((NPROC_PER_NODE * NNODES))
-deepspeed="scripts/train/qwenvl_train/zero2.json"
+
+if [[ "${LOW_MEM:-False}" == "True" ]]; then
+    _default_deepspeed="scripts/train/qwenvl_train/zero2.json"
+    _default_model_max_length=4096
+    _default_max_pixels=200704
+    _default_tune_vision=True
+    _default_data_aug=False
+    _default_grad_accum=8
+    _default_attn="sdpa"
+    _default_s2_metrics_steps=2
+    _default_torch_empty_cache=50
+else
+    _default_deepspeed="scripts/train/qwenvl_train/zero2.json"
+    _default_model_max_length=8192
+    _default_max_pixels=313600
+    _default_data_aug=True
+    _default_grad_accum=1
+    _default_attn="sdpa"
+    _default_s2_metrics_steps=1
+    _default_torch_empty_cache=0
+fi
+
+deepspeed="${DEEPSPEED:-${_default_deepspeed}}"
 
 llm="${MODEL_NAME:-Qwen/Qwen2.5-VL-7B-Instruct}"
 if [[ -d "${llm}" ]]; then
@@ -63,25 +96,27 @@ fi
 
 lr="${LR:-2e-5}"
 vision_tower_lr="${VISION_TOWER_LR:-5e-6}"
-batch_size="${BATCH_SIZE:-4}"
-grad_accum_steps="${GRAD_ACCUM_STEPS:-8}"
-max_pixels="${MAX_PIXELS:-313600}"
+batch_size="${BATCH_SIZE:-1}"
+grad_accum_steps="${GRAD_ACCUM_STEPS:-${_default_grad_accum}}"
+max_pixels="${MAX_PIXELS:-${_default_max_pixels}}"
 min_pixels="${MIN_PIXELS:-3136}"
 resize_h="${RESIZE_H:-224}"
 resize_w="${RESIZE_W:-224}"
-num_history="${NUM_HISTORY:-8}"
-model_max_length="${MODEL_MAX_LENGTH:-8192}"
-data_augmentation="${DATA_AUGMENTATION:-True}"
-dataloader_workers="${DATALOADER_WORKERS:-2}"
+num_history="${NUM_HISTORY:-4}"
+model_max_length="${MODEL_MAX_LENGTH:-${_default_model_max_length}}"
+data_augmentation="${DATA_AUGMENTATION:-${_default_data_aug}}"
+dataloader_workers="${DATALOADER_WORKERS:-4}"
+torch_empty_cache_steps="${TORCH_EMPTY_CACHE_STEPS:-${_default_torch_empty_cache}}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-${_default_attn}}"
+export S2_METRICS_STEPS="${S2_METRICS_STEPS:-${_default_s2_metrics_steps}}"
 
 if [[ "${FREEZE_ALL:-False}" == "True" ]]; then
     tune_mm_vision=False
     tune_mm_mlp=False
     tune_mm_llm=False
 else
-    tune_mm_vision="${TUNE_MM_VISION:-True}"
+    tune_mm_vision="${TUNE_MM_VISION:-False}"
     tune_mm_mlp="${TUNE_MM_MLP:-True}"
     tune_mm_llm="${TUNE_MM_LLM:-False}"
 fi
@@ -116,12 +151,15 @@ print_gpu_preflight() {
     echo ""
 }
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%50,r2r_125cm_0_45%50,r2r_60cm_15_15,r2r_60cm_30_30%50}"
+# vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%50,r2r_125cm_0_45%50,r2r_60cm_15_15,r2r_60cm_30_30%50}"
 
-run_name="${RUN_NAME:-InternVLA-N1-System2-train-freeze-llm-v1}"
+run_name="${RUN_NAME:-InternVLA-N1-System2-train-full-only-testing}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
+if [[ "${torch_empty_cache_steps}" -gt 0 ]]; then
+    extra_args+=(--torch_empty_cache_steps "${torch_empty_cache_steps}")
+fi
 if [ -n "${MAX_STEPS:-}" ]; then
     extra_args+=(--max_steps "${MAX_STEPS}")
     num_epochs="1.0"
@@ -129,7 +167,7 @@ if [ -n "${MAX_STEPS:-}" ]; then
     report_to="none"
 else
     num_epochs="${NUM_TRAIN_EPOCHS:-1.0}"
-    save_steps=5000
+    save_steps=300
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
@@ -144,18 +182,12 @@ if [[ "${frozen_smoke}" == "true" ]]; then
 else
     echo "DeepSpeed:       ${deepspeed}"
 fi
-echo "Data root:       ${DEFAULT_DATA_ROOT}"
-echo "R2R data path:   ${INTERNAV_R2R_DATA_PATH}"
-if [[ ! -d "${INTERNAV_R2R_DATA_PATH}" ]]; then
-    echo "ERROR: R2R data path does not exist: ${INTERNAV_R2R_DATA_PATH}" >&2
-    exit 1
-fi
 
-echo "Datasets:        ${vln_datasets}"
 effective_batch=$((batch_size * grad_accum_steps * NPROC_PER_NODE * NNODES))
 echo "Batch size:      ${batch_size} (per device)  grad_accum=${grad_accum_steps}  effective=${effective_batch}"
 echo "Launch:          ${NNODES} node(s) x ${NPROC_PER_NODE} GPU(s)"
-echo "Resize:          ${resize_h}x${resize_w}  history=${num_history}  max_len=${model_max_length}"
+echo "LOW_MEM:         ${LOW_MEM:-False}"
+echo "Resize:          ${resize_h}x${resize_w}  history=${num_history}  max_len=${model_max_length}  max_pixels=${max_pixels}"
 echo "Attention:       ${ATTN_IMPLEMENTATION}"
 echo "FREEZE_ALL:      ${FREEZE_ALL:-False}"
 echo "Tune System 2:   vision=${tune_mm_vision} mlp=${tune_mm_mlp} llm=${tune_mm_llm}  aug=${data_augmentation}"
@@ -201,6 +233,7 @@ fi
     "${deepspeed_args[@]}" \
     --model_name_or_path "${llm}" \
     --vln_dataset_use "${vln_datasets}" \
+    --vln_dataset_custom "${vln_dataset_custom}" \
     --data_flatten False \
     --tune_mm_vision "${tune_mm_vision}" \
     --tune_mm_mlp "${tune_mm_mlp}" \
@@ -237,6 +270,7 @@ fi
     --include_num_input_tokens_seen True \
     --model_max_length "${model_max_length}" \
     --gradient_checkpointing True \
+    --remove_unused_columns False \
     --dataloader_num_workers "${dataloader_workers}" \
     --run_name "${run_name}" \
     --report_to "${report_to}" \

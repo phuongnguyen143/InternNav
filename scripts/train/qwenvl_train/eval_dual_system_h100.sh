@@ -21,12 +21,20 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%0}"
 DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
 
-model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-DualVLN}"
+
+vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30}"
+DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
+export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bk_ver2.0_test}"
+
+
+model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-w-NavDP}"
+#model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-DualVLN}"
 if [[ -d "${model_path}" ]]; then
     model_path="$(cd "${model_path}" && pwd)"
 elif [[ -d "${REPO_ROOT}/${model_path}" ]]; then
@@ -36,7 +44,7 @@ fi
 # system1 options: navdp_async, nextdit_async, nextdit
 system1="${SYSTEM1:-navdp_async}"
 
-batch_size="${BATCH_SIZE:-4}"
+batch_size="${BATCH_SIZE:-8}"
 max_pixels="${MAX_PIXELS:-313600}"
 min_pixels="${MIN_PIXELS:-3136}"
 resize_h="${RESIZE_H:-384}"
@@ -66,9 +74,8 @@ print_gpu_preflight() {
     echo ""
 }
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%10}"
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval-v2}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval-w-NavDP-default}"
 output_dir="${OUTPUT_DIR:-logs/${run_name}}"
 
 extra_args=()
@@ -108,6 +115,7 @@ print_gpu_preflight
 python internnav/trainer/internvla_n1_evaluator.py \
     --model_name_or_path "${model_path}" \
     --vln_dataset_use "${vln_datasets}" \
+    --vln_dataset_custom "${vln_dataset_custom}" \
     --data_flatten False \
     --bf16 \
     --num_history "${num_history}" \

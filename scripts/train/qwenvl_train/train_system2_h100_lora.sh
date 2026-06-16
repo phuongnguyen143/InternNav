@@ -7,7 +7,7 @@
 #   MAX_STEPS=1 FREEZE_ALL=True bash scripts/train/qwenvl_train/train_system2_h100.sh
 
 #
-#   NPROC_PER_NODE=8 bash scripts/train/qwenvl_train/train_system2_h100.sh
+#   NPROC_PER_NODE=2 bash scripts/train/qwenvl_train/train_system2_h100_lora.sh
 #
 #
 #   sbatch scripts/train/qwenvl_train/train_system2_h100.sh
@@ -17,11 +17,11 @@
 #        --cpus-per-task=16 --mem=128G --time=48:00:00 bash -i
 #   bash scripts/train/qwenvl_train/train_system2_h100.sh
 
-# #SBATCH -J internvla-system2-h100
+# #SBATCH -J internvla-system2-h100-lora
 # #SBATCH -p gpu_partition
 # #SBATCH -N 1
-# #SBATCH --gres=gpu:1
-# #SBATCH --cpus-per-task=16
+# #SBATCH --gres=gpu:2
+# #SBATCH --cpus-per-task=32
 # #SBATCH --ntasks-per-node=1
 # #SBATCH -o ./slurm-%j.out
 # #SBATCH -e ./slurm-%j.err
@@ -34,8 +34,20 @@ cd "${REPO_ROOT}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+detect_gpus_on_node() {
+    if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
+        echo "${SLURM_GPUS_ON_NODE}"
+    elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}'
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi -L 2>/dev/null | wc -l
+    else
+        echo 1
+    fi
+}
+
 NNODES="${NNODES:-1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-$(detect_gpus_on_node)}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -72,9 +84,10 @@ resize_w="${RESIZE_W:-224}"
 num_history="${NUM_HISTORY:-8}"
 model_max_length="${MODEL_MAX_LENGTH:-8192}"
 data_augmentation="${DATA_AUGMENTATION:-True}"
-dataloader_workers="${DATALOADER_WORKERS:-2}"
+dataloader_workers="${DATALOADER_WORKERS:-4}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+export S2_METRICS_STEPS="${S2_METRICS_STEPS:-1}"
 
 if [[ "${FREEZE_ALL:-False}" == "True" ]]; then
     tune_mm_vision=False
@@ -117,8 +130,10 @@ print_gpu_preflight() {
 }
 
 vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%50,r2r_125cm_0_45%50,r2r_60cm_15_15,r2r_60cm_30_30%50}"
+# vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%5}"
 
-run_name="${RUN_NAME:-InternVLA-N1-System2-train-lora-v1}"
+
+run_name="${RUN_NAME:-InternVLA-N1-System2-train-lora-v2}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -129,7 +144,7 @@ if [ -n "${MAX_STEPS:-}" ]; then
     report_to="none"
 else
     num_epochs="${NUM_TRAIN_EPOCHS:-1.0}"
-    save_steps=5000
+    save_steps=1000
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
@@ -237,6 +252,8 @@ fi
     --include_num_input_tokens_seen True \
     --model_max_length "${model_max_length}" \
     --gradient_checkpointing True \
+    --remove_unused_columns False \
+    --ddp_find_unused_parameters False \
     --dataloader_num_workers "${dataloader_workers}" \
     --run_name "${run_name}" \
     --report_to "${report_to}" \

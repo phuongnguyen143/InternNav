@@ -27,7 +27,7 @@ import torch
 import transformers
 from decord import VideoReader
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from torchcodec.decoders import VideoDecoder
 from transformers.image_utils import to_numpy_array
 
@@ -70,6 +70,34 @@ R2R_125CM_0_30 = {
     "data_path": "traj_data/r2r",
     "height": 125,
     "pitch_1": 0,
+    "pitch_2": 30,
+}
+
+BKHN_125CM_0_30 = {
+    "data_path": "bkhn_ver2.0",
+    "height": 125,
+    "pitch_1": 0,
+    "pitch_2": 30,
+}
+
+BKHN_125CM_0_45 = {
+    "data_path": "bkhn_ver2.0",
+    "height": 125,
+    "pitch_1": 0,
+    "pitch_2": 45,
+}
+
+BKHN_60CM_15_15 = {
+    "data_path": "bkhn_ver2.0",
+    "height": 60,
+    "pitch_1": 15,
+    "pitch_2": 15,
+}
+
+BKHN_60CM_30_30 = {
+    "data_path": "bkhn_ver2.0",
+    "height": 60,
+    "pitch_1": 30,
     "pitch_2": 30,
 }
 
@@ -150,6 +178,10 @@ data_dict = {
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
     "r2r_125cm_0_30": R2R_125CM_0_30,
+    "bkhn_125cm_0_30": BKHN_125CM_0_30,
+    "bkhn_125cm_0_45": BKHN_125CM_0_45,
+    "bkhn_60cm_15_15": BKHN_60CM_15_15,
+    "bkhn_60cm_30_30": BKHN_60CM_30_30,
     "r2r_125cm_0_45": R2R_125CM_0_45,
     "r2r_60cm_15_15": R2R_60CM_15_15,
     "r2r_60cm_30_30": R2R_60CM_30_30,
@@ -187,9 +219,18 @@ _DATA_PATH_OVERRIDES = {
     "traj_data/scalevln": os.environ.get("INTERNAV_SCALEVLN_DATA_PATH", ""),
 }
 
+_CUSTOM_DATA_PATH_OVERRIDES = {
+    "traj_data/r2r": os.environ.get("INTERNAV_CUSTOM_R2R_DATA_PATH", ""),
+    "traj_data/rxr": os.environ.get("INTERNAV_CUSTOM_RXR_DATA_PATH", ""),
+    "traj_data/scalevln": os.environ.get("INTERNAV_CUSTOM_SCALEVLN_DATA_PATH", ""),
+    "bkhn_ver2.0": os.environ.get("INTERNAV_CUSTOM_BKHN_DATA_PATH", ""),
+}
 
-def data_list(dataset_names):
+
+def data_list(dataset_names, path_overrides=None):
     """Resolve comma-separated dataset keys into config dicts with paths and sampling_rate."""
+    if path_overrides is None:
+        path_overrides = _DATA_PATH_OVERRIDES
     config_list = []
     for dataset_name in dataset_names:
         sampling_rate = parse_sampling_rate(dataset_name)
@@ -198,8 +239,9 @@ def data_list(dataset_names):
         if dataset_name in data_dict.keys():
             config = data_dict[dataset_name].copy()
             config["sampling_rate"] = sampling_rate
-            default_path = config["data_path"]
-            override = _DATA_PATH_OVERRIDES.get(default_path, "").strip()
+            default_path = config["data_path"] # e.g., bkhn_ver2.0, traj_data/r2r
+
+            override = path_overrides.get(default_path, "").strip()
             if override:
                 config["data_path"] = override
             rank0_print(
@@ -979,11 +1021,27 @@ class NavPixelGoalDataset(Dataset):
     when pixel_goal_only=True, future lookdown frames + traj_poses for System-1.
     """
 
-    def __init__(self, tokenizer: transformers.PreTrainedTokenizer, data_args):
+    def __init__(
+        self,
+        tokenizer: transformers.PreTrainedTokenizer,
+        data_args,
+        dataset_name: str = None,
+    ):
         super(NavPixelGoalDataset, self).__init__()
-        dataset = data_args.vln_dataset_use.split(",")
-        dataset_list = data_list(dataset)
-        rank0_print(f"Loading datasets: {dataset_list}")
+
+        # dataset = data_args.vln_dataset_use.split(",")
+        if dataset_name == "vln_original":
+            dataset = data_args.vln_dataset_use.split(",")
+            path_overrides = _DATA_PATH_OVERRIDES
+        elif dataset_name == "vln_custom":
+            dataset = data_args.vln_dataset_custom.split(",")
+            path_overrides = _CUSTOM_DATA_PATH_OVERRIDES
+        else:
+            raise ValueError(f"Invalid dataset name: {dataset_name}")
+
+        self.dataset_name = dataset_name
+        dataset_list = data_list(dataset, path_overrides=path_overrides)
+        rank0_print(f"Loading datasets ({self.dataset_name}): {dataset_list}")
         self.video_max_total_pixels = getattr(data_args, "video_max_total_pixels", 1664 * 28 * 28)
         self.video_min_total_pixels = getattr(data_args, "video_min_total_pixels", 256 * 28 * 28)
         self.model_type = data_args.model_type
@@ -1117,9 +1175,14 @@ class NavPixelGoalDataset(Dataset):
             )
             self.list_data_dict.extend(list_data_dict)
 
-        rank0_print(f"NavPixelGoalDataset total samples: {len(self.list_data_dict)}")
+        rank0_print(
+            f"NavPixelGoalDataset ({self.dataset_name}) total samples: {len(self.list_data_dict)}"
+        )
         if len(self.list_data_dict) == 0:
-            rank0_print("ERROR: NavPixelGoalDataset is empty — check data path and parquet schema above.")
+            rank0_print(
+                f"ERROR: NavPixelGoalDataset ({self.dataset_name}) is empty, so"
+                "check data path and parquet schema above."
+            )
 
         self.num_history = data_args.num_history
         self.idx2actions = {0: 'STOP', 1: "↑", 2: "←", 3: "→", 5: "↓"}
@@ -1249,6 +1312,8 @@ class NavPixelGoalDataset(Dataset):
             chat_sources[0][0]['value'] = chat_sources[0][0]['value'].replace('<instruction>', instruction)
 
         if pose is not None:
+            sample_type = "pixel_goal"
+            pixel_coords_gt = torch.tensor([float(action[0]), float(action[1])], dtype=torch.float32)
             chat_sources[0].extend(
                 [
                     {'from': 'gpt', 'value': self.idx2actions[5]},
@@ -1257,8 +1322,12 @@ class NavPixelGoalDataset(Dataset):
                 ]
             )
         elif action == 0:
+            sample_type = "stop"
+            pixel_coords_gt = None
             chat_sources[0].extend([{'from': 'gpt', 'value': self.idx2actions[action]}])
         else:
+            sample_type = "turn"
+            pixel_coords_gt = None
             turn_action_text = ''.join([self.idx2actions[idx] for idx in action])
             chat_sources[0].extend([{'from': 'gpt', 'value': turn_action_text}])
 
@@ -1289,6 +1358,9 @@ class NavPixelGoalDataset(Dataset):
         data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
         data_dict["pixel_values"] = torch.cat(images, dim=0)
         data_dict["image_grid_thw"] = torch.cat([thw.unsqueeze(0) for thw in grid_thws], dim=0)
+        data_dict["sample_type"] = sample_type
+        if pixel_coords_gt is not None:
+            data_dict["pixel_coords_gt"] = pixel_coords_gt
 
         # System-1 trajectory supervision (dual-system training only).
         if self.pixel_goal_only:
@@ -1438,6 +1510,19 @@ class DataCollatorForSupervisedDataset(object):
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
 
+        if "sample_type" in instances[0]:
+            batch["sample_types"] = [instance["sample_type"] for instance in instances]
+            coords = []
+            for instance in instances:
+                if "pixel_coords_gt" in instance:
+                    coords.append(instance["pixel_coords_gt"])
+                else:
+                    coords.append(torch.tensor([float("nan"), float("nan")], dtype=torch.float32))
+            batch["pixel_coords_gt"] = torch.stack(coords, dim=0)
+
+            # print("coords: ", batch["pixel_coords_gt"])
+            # print("\n ", batch["sample_types"])
+
         if "traj_images" in instances[0]:
             traj_images, traj_depths, traj_poses = tuple(
                 [instance[key] for instance in instances] for key in ("traj_images", "traj_depths", "traj_poses")
@@ -1571,6 +1656,23 @@ class CombinedDataset(Dataset):
         raise ValueError(f"Index {real_idx} out of bound")
 
 
+def split_train_eval_dataset(dataset, eval_ratio, seed):
+    """Split train/eval"""
+    n = len(dataset)
+    if eval_ratio <= 0 or n <= 1:
+        return dataset, None
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n)
+    eval_size = int(n * eval_ratio)
+    if eval_size < 1:
+        eval_size = 1
+    if eval_size >= n:
+        eval_size = n - 1
+    eval_indices = perm[:eval_size].tolist()
+    train_indices = perm[eval_size:].tolist()
+    return Subset(dataset, train_indices), Subset(dataset, eval_indices)
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Entry point: build train_dataset + data_collator for HuggingFace Trainer.
 
@@ -1581,16 +1683,35 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     if data_args.iign_dataset_use:
         train_datasets.append(VLLNDataset(tokenizer=tokenizer, data_args=data_args))
     if data_args.vln_dataset_use:
-        train_datasets.append(NavPixelGoalDataset(tokenizer=tokenizer, data_args=data_args))
+        train_datasets.append(
+            NavPixelGoalDataset(tokenizer=tokenizer, data_args=data_args, dataset_name="vln_original")
+        )
+    if data_args.vln_dataset_custom:
+        train_datasets.append(
+            NavPixelGoalDataset(
+                tokenizer=tokenizer,
+                data_args=data_args,
+                dataset_name="vln_custom",
+            )
+        )
     for i, ds in enumerate(train_datasets):
         rank0_print(f"train_datasets[{i}] ({type(ds).__name__}): {len(ds)} samples")
-    train_dataset = CombinedDataset(train_datasets, shuffle=False)
-    rank0_print(f"CombinedDataset total: {len(train_dataset)} samples")
+    full_dataset = CombinedDataset(train_datasets, shuffle=False)
+    rank0_print(f"CombinedDataset total: {len(full_dataset)} samples")
+    train_dataset, eval_dataset = split_train_eval_dataset(
+        full_dataset,
+        eval_ratio=0.0,
+        seed=42,
+    )
+    if eval_dataset is not None:
+        rank0_print(
+            f"Split train/eval: {len(train_dataset)}/{len(eval_dataset)} "
+        )
     if data_args.data_flatten:
         data_collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+        return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 if __name__ == "__main__":

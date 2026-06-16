@@ -50,6 +50,7 @@ from transformers import (
     Qwen2VLImageProcessor,
     Trainer,
 )
+from internnav.trainer.system2_vl_trainer import System2VLTrainer
 
 import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
@@ -115,7 +116,7 @@ def is_rank0() -> bool:
     return True
 
 
-def run_frozen_smoke_test(trainer: Trainer) -> None:
+def run_frozen_smoke_test(trainer: System2VLTrainer) -> None:
     """Forward-only sanity check when every parameter has requires_grad=False.
 
     Runs a few dataloader batches through compute_loss() without backprop orweight updates.
@@ -181,6 +182,7 @@ def set_model(model_args, model):
         for n, p in model.lm_head.named_parameters():
             p.requires_grad = False
 
+    print("model_args.system1: ", model_args.system1)
     if 'nextdit' in model_args.system1:
         modules = [
             'action_encoder',
@@ -194,6 +196,8 @@ def set_model(model_args, model):
         for n, p in model.model.named_parameters():
             if any(k in n for k in modules):
                 p.requires_grad = True
+
+        print("Training latent queries")
         model.model.latent_queries.requires_grad = True
     elif 'navdp' in model_args.system1:
         for n, p in model.model.navdp.named_parameters():
@@ -208,6 +212,8 @@ def train(attn_implementation="sdpa"):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    print("model_args: ", model_args.system1)
 
     local_rank = training_args.local_rank
     lerobot_dataset.local_rank = training_args.local_rank
@@ -248,13 +254,29 @@ def train(attn_implementation="sdpa"):
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
 
-    if 'internvla-n1-system2' in model_args.model_name_or_path.lower():
+    loaded_full_dual_checkpoint = False
+    if 'internvla-n1-w-navdp' in model_args.model_name_or_path.lower():
+        if is_rank0():
+            print(f"Loading full dual-system checkpoint from {model_args.model_name_or_path}")
+        model = InternVLAN1ForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            low_cpu_mem_usage=True,
+        )
+        data_args.image_processor = AutoProcessor.from_pretrained(
+            model_args.model_name_or_path,
+        ).image_processor
+        data_args.model_type = "internvla-n1"
+        loaded_full_dual_checkpoint = True
+    elif 'internvla-n1-system2' in model_args.model_name_or_path.lower():
         internvla_config = InternVLAN1ModelConfig.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
         )
         # System2 checkpoints ship with nextdit in config. Defer System1 construction
-        # until after checkpoint load — ZeRO-3 partitions params during from_pretrained
+        # until after checkpoint load, ZeRO-3 partitions params during from_pretrained
         # and breaks NavDP backbone weight loading if S1 modules are built too early.
         if model_args.system1 and model_args.system1 != "none":
             if internvla_config.system1 != "none":
@@ -330,17 +352,14 @@ def train(attn_implementation="sdpa"):
         use_fast=False,
     )
 
-    # Lazy-build S1 modules after S2 weights are loaded
-    if data_args.model_type == "internvla-n1":
+    # Lazy-build S1 modules after S2 weights are loaded (skip for full w-NavDP checkpoint).
+    if data_args.model_type == "internvla-n1" and not loaded_full_dual_checkpoint:
         model.get_model().initialize_vision_modules(model_args=model_args)
     set_model(model_args, model)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable_params: {trainable_params}")
 
-    print(model.print_trainable_parameters()) # : 676550144
-
-    '''
     frozen_smoke = trainable_params == 0
     # DeepSpeed needs an optimizer; skip it when running forward-only smoke test.
     if frozen_smoke and training_args.deepspeed:
@@ -370,7 +389,7 @@ def train(attn_implementation="sdpa"):
         )
 
 
-    trainer = Trainer(
+    trainer = System2VLTrainer(
         model=model,
         processing_class=tokenizer,
         args=training_args,
@@ -407,7 +426,6 @@ def train(attn_implementation="sdpa"):
         data_args.image_processor.save_pretrained(training_args.output_dir)
         model.config.use_cache = True
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-    '''
 
 
 if __name__ == "__main__":

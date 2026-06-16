@@ -160,6 +160,11 @@ assets/realworld_sample_data2/
 internnav/training_comparison
 internnav/compare_training_runs.py
 
+internnav/trainer/system1_metrics.py
+internnav/trainer/system2_metrics.py
+internnav/trainer/test_system2_metrics.py
+internnav/trainer/test_system1_metrics.py
+
 # Docker image exports
 internnav-thor-060626.tar
 internnav-thor-ready-050626.tar.gz

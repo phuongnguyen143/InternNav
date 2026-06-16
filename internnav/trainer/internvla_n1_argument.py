@@ -11,7 +11,7 @@ class ModelArguments:
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
 
-    system1: Optional[str] = field(default='nextdit')
+    system1: Optional[str] = field(default='')
     n_query: int = field(default=4)
 
 
@@ -29,6 +29,7 @@ class DataArguments:
     video_min_frame_pixels: int = field(default=4 * 28 * 28)
 
     vln_dataset_use: str = field(default="")
+    vln_dataset_custom: str = field(default="")
     iign_dataset_use: str = field(default="")
     sample_step: int = field(default=4)
     num_history: Optional[int] = field(default=8)

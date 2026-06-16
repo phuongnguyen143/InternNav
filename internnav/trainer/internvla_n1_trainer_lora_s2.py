@@ -31,7 +31,7 @@ import os
 import pathlib
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import transformers
@@ -50,6 +50,7 @@ from transformers import (
     Qwen2VLImageProcessor,
     Trainer,
 )
+from internnav.trainer.system2_vl_trainer import System2VLTrainer
 
 import internnav.dataset.internvla_n1_lerobot_dataset as lerobot_dataset
 from internnav.dataset.internvla_n1_lerobot_dataset import make_supervised_data_module
@@ -71,29 +72,59 @@ from internnav.trainer.jetson_monitor import (
 )
 
 #lora
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, get_peft_model
 #####
 
 # Alias kept for backwards compatibility; JetsonTrainingCallback extends TrainerCallback.
 JetsonTrainerCallback = JetsonTrainingCallback
 
 
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """Save model weights after training.
-    DeepSpeed manages its own sharded state, delegate to trainer.save_model().
-    Otherwise gather weights to CPU first to avoid GPU OOM on large checkpoints.
-    """
+def save_peft_adapter(trainer: transformers.Trainer, output_dir: str) -> None:
+    """Save LoRA adapter weights and adapter_config.json (PEFT checkpoint layout)."""
+    if not trainer.args.should_save:
+        return
 
+    model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    if not isinstance(model, PeftModel):
+        _save_full_model_for_hf_trainer(trainer, output_dir)
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    if trainer.deepspeed:
+        torch.cuda.synchronize()
+    model.save_pretrained(output_dir, safe_serialization=True)
+    if is_rank0():
+        print(f"Saved LoRA adapter + adapter_config.json to {output_dir}")
+
+
+def _save_full_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+    """Save full model weights (non-PEFT path)."""
     if trainer.deepspeed:
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
         return
 
     state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+    cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+    del state_dict
+    trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
+
+def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+    """Save model weights after training."""
+    trainer.model.save_pretrained(
+            output_dir,
+            safe_serialization=True,
+        )
+
+    # tokenizer.save_pretrained(output_dir)
+    # data_args.image_processor.save_pretrained(output_dir)
+
+    # model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    # if isinstance(model, PeftModel):
+    #     save_peft_adapter(trainer, output_dir)
+    #     return
+    # _save_full_model_for_hf_trainer(trainer, output_dir)
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -118,7 +149,7 @@ def is_rank0() -> bool:
     return True
 
 
-def run_frozen_smoke_test(trainer: Trainer) -> None:
+def run_frozen_smoke_test(trainer: System2VLTrainer) -> None:
     """Forward-only sanity check when every parameter has requires_grad=False.
 
     Runs a few dataloader batches through compute_loss() without backprop orweight updates.
@@ -226,11 +257,28 @@ def apply_lora(model, r=16, alpha=32, dropout=0.05):
             "up_proj",
             "down_proj",
         ],
+        # Vision tower is fully tuned alongside LoRA; include in PEFT checkpoints.
+        modules_to_save=["visual"],
     )
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     return model
+
+
+class System2LoRATrainer(System2VLTrainer):
+    """Writes adapter_config.json + adapter weights on every Trainer checkpoint."""
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        if output_dir is None:
+            output_dir = self.args.output_dir
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if isinstance(model, PeftModel):
+            #save_peft_adapter(self, output_dir)
+            safe_save_model_for_hf_trainer(self, output_dir)
+            return
+        super().save_model(output_dir, _internal_call=_internal_call)
 
 def train(attn_implementation="sdpa"):
     global local_rank
@@ -326,6 +374,22 @@ def train(attn_implementation="sdpa"):
                 dropout=0.05,
             )
 
+        # START Load from checkpoint
+        # model = PeftModel.from_pretrained(
+        #     model,
+        #     "/home/khangnh11/VR/InternNav/checkpoints/InternVLA-N1-System2-train-lora-v2",
+        #     is_trainable=True,
+        # )
+        # model.config.use_cache = False
+
+        # if training_args.gradient_checkpointing:
+        #     model.enable_input_require_grads()
+        #     model.gradient_checkpointing_enable()
+
+        # model.train()
+        # model.print_trainable_parameters()
+        # END Load from checkpoint
+
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
         ).image_processor
@@ -419,8 +483,8 @@ def train(attn_implementation="sdpa"):
             "train_dataset has 0 samples. Check dataset debug output above for path/schema issues."
         )
 
-
-    trainer = Trainer(
+    training_args.label_names=["labels"]
+    trainer = System2LoRATrainer(
         model=model,
         processing_class=tokenizer,
         args=training_args,
@@ -441,7 +505,14 @@ def train(attn_implementation="sdpa"):
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
         print_status_block("before_train_loop")
 
-    '''
+    # trainer.model.save_pretrained(
+    #         training_args.output_dir,
+    #         safe_serialization=True,
+    #     )
+
+    # tokenizer.save_pretrained(training_args.output_dir)
+    # data_args.image_processor.save_pretrained(training_args.output_dir)
+
     if frozen_smoke:
         print("We running frozen smoke test")
         run_frozen_smoke_test(trainer)
@@ -451,14 +522,28 @@ def train(attn_implementation="sdpa"):
         trainer.save_state()
         data_args.image_processor.save_pretrained(training_args.output_dir)
         model.config.use_cache = True
-        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        #safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        trainer.model.save_pretrained(
+            training_args.output_dir,
+            safe_serialization=True,
+        )
+        tokenizer.save_pretrained(training_args.output_dir)
+        data_args.image_processor.save_pretrained(training_args.output_dir)
+
     else:
         trainer.train()
         trainer.save_state()
         data_args.image_processor.save_pretrained(training_args.output_dir)
         model.config.use_cache = True
-        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-    '''
+        #safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+        trainer.model.save_pretrained(
+            training_args.output_dir,
+            safe_serialization=True,
+        )
+        tokenizer.save_pretrained(training_args.output_dir)
+        data_args.image_processor.save_pretrained(training_args.output_dir)
+
 
 
 if __name__ == "__main__":

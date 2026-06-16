@@ -27,6 +27,11 @@ TRAIN_METRIC_KEYS = (
     "train_runtime",
     "train_samples_per_second",
     "train_steps_per_second",
+    "turn_accuracy",
+    "stop_accuracy",
+    "discrete_action_accuracy",
+    "pixel_coord_l2",
+    "pixel_coord_parse_rate",
 )
 
 
@@ -171,6 +176,10 @@ def format_training_line(metrics: Dict[str, Any]) -> str:
         parts.append(f"lr={_fmt_float(metrics['learning_rate'], 6)}")
     if metrics.get("grad_norm") is not None:
         parts.append(f"grad_norm={_fmt_float(metrics['grad_norm'], 4)}")
+    if metrics.get("turn_accuracy") is not None:
+        parts.append(f"turn_acc={_fmt_float(metrics['turn_accuracy'], 4)}")
+    if metrics.get("pixel_coord_l2") is not None:
+        parts.append(f"pix_l2={_fmt_float(metrics['pixel_coord_l2'], 2)}")
     if metrics.get("train_steps_per_second") is not None:
         parts.append(f"steps/s={_fmt_float(metrics['train_steps_per_second'], 3)}")
     if metrics.get("train_samples_per_second") is not None:
