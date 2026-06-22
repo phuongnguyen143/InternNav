@@ -67,15 +67,15 @@ total_gpus=$((NPROC_PER_NODE * NNODES))
 TARGET_EFFECTIVE_BATCH="${TARGET_EFFECTIVE_BATCH:-64}"
 
 # bkhn_125cm_0_30,bkhn_125cm_0_45,bkhn_60cm_15_15,bkhn_60cm_30_30
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%1}"
 DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
 
-vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30%0}"
+vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30}"
 DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
-export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bkhn_ver2.0}"
+export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bkhn_ver3.0}"
 
 if [[ "${LOW_MEM:-False}" == "True" ]]; then
     _default_deepspeed="scripts/train/qwenvl_train/zero2.json"
@@ -119,7 +119,8 @@ deepspeed="${DEEPSPEED_CONFIG:-${DEEPSPEED:-${_default_deepspeed}}}"
 # if we want o start form their checkpoint
 # /home/khangnh11/VR/InternNav/checkpoints/InternVLA-N1-DualVLN-train-from-internvla-n1-w-navdp-1epoch-v1
 #system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-DualVLN-train-from-internvla-n1-w-navdp-1epoch-v1}"
-system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-System2}"
+# /home/khangnh11/VR/InternNav/checkpoints/InternVLA-N1-w-NavDP
+system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-w-NavDP}"
 if [[ -d "${system2_ckpt}" ]]; then
     system2_ckpt="$(cd "${system2_ckpt}" && pwd)"
 elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
@@ -163,7 +164,7 @@ print_gpu_preflight() {
 }
 
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-train-only-30deg-scratch-navdp-v1}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-bkhn-ver3.0-v1}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -174,7 +175,7 @@ if [ -n "${MAX_STEPS:-}" ]; then
     report_to="none"
 else
     num_epochs="${NUM_TRAIN_EPOCHS:-3.0}"
-    save_steps=1000
+    save_steps=100
     report_to="${REPORT_TO:-tensorboard}"
 fi
 

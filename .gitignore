@@ -158,6 +158,7 @@ assets/bkhn_data1/
 assets/realworld_sample_data1/
 assets/realworld_sample_data2/
 internnav/training_comparison
+internnav/training_comparison2
 internnav/compare_training_runs.py
 
 internnav/trainer/system1_metrics.py

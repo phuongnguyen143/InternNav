@@ -50,7 +50,7 @@ from internnav.trainer.jetson_monitor import (
     print_jetson_summary,
     print_status_block,
 )
-from internnav.trainer.system2_metrics import compute_system2_metrics
+from internnav.trainer.system2_metrics import _decode_supervised_tokens, compute_system2_metrics
 
 
 class RunningStats:
@@ -148,7 +148,21 @@ def build_data_module(model_path: str, model_args: ModelArguments, data_args: Da
     else:
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
-    data_args.image_processor = transformers.AutoProcessor.from_pretrained(model_path).image_processor
+    #data_args.image_processor = transformers.AutoProcessor.from_pretrained(model_path).image_processor
+
+    processor_path = getattr(
+        model_args,
+        model_path,
+        None,
+    ) or "Qwen/Qwen2.5-VL-7B-Instruct"
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=True,
+    )
+
+    data_args.image_processor = processor.image_processor
+
     data_args.model_type = "internvla-n1"
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -266,7 +280,12 @@ def debug_batch_shapes(
         tok_ids = input_ids[b][supervised_mask].tolist()
         decoded = tokenizer.decode(tok_ids, skip_special_tokens=False)
         print(f"  sample[{b}]: {n_supervised} supervised token(s)")
-        print(f"    decoded: {decoded!r}")
+        print(f"    input_ids (GT): {decoded!r}")
+        if logits is not None:
+            pred_text, label_text = _decode_supervised_tokens(logits, labels, b, tokenizer)
+            print(f"    logits pred:    {pred_text!r}")
+            print(f"    labels (GT):    {label_text!r}")
+            print(f"    match:          {pred_text == label_text}")
         if "t_s_pos" in batch:
             t_start = batch["t_s_pos"][b]
             print(f"    traj latent slots: input_ids[{t_start}:{t_start + n_query}]")

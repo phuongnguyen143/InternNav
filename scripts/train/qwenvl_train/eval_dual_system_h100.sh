@@ -32,8 +32,9 @@ vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30}"
 DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
 export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bk_ver2.0_test}"
 
-
-model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-w-NavDP}"
+#/home/khangnh11/VR/InternNav/checkpoints/InternVLA-N1-DualVLN-train-from-internvla-n1-w-navdp-v2
+# /home/khangnh11/VR/InternNav/checkpoints/InternVLA-N1-DualVLN-train-only-30deg-scratch-navdp-v1/checkpoint-1000
+model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-DualVLN-train-only-30deg-scratch-navdp-v1/checkpoint-1000}"
 #model_path="${MODEL_PATH:-checkpoints/InternVLA-N1-DualVLN}"
 if [[ -d "${model_path}" ]]; then
     model_path="$(cd "${model_path}" && pwd)"
@@ -75,7 +76,7 @@ print_gpu_preflight() {
 }
 
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval-w-NavDP-default}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-H100-Eval-w-NavDP-30deg}"
 output_dir="${OUTPUT_DIR:-logs/${run_name}}"
 
 extra_args=()
