@@ -154,6 +154,7 @@ internnav/model/basemodel/LongCLIP/
 result/
 
 # Local datasets / real-world samples
+assets/
 assets/bkhn_data1/
 assets/realworld_sample_data1/
 assets/realworld_sample_data2/
@@ -174,3 +175,5 @@ python=3.10
 
 # Notebook test data
 scripts/notebooks/test_data/
+scripts/notebooks/inference_only_w_gt_compare_v2.py
+scripts/notebooks/gt-path_vis.py

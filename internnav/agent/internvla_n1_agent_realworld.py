@@ -37,6 +37,43 @@ from internnav.model.utils.device import model_load_dtype, resolve_torch_device
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
+ACTION_IDX_TO_NAME = {0: "STOP", 1: "↑", 2: "←", 3: "→", 5: "↓"}
+
+
+def describe_s2_output(output: S2Output) -> str:
+    """Human-readable summary of dual-system outputs for debug logging."""
+    lines = []
+    has_action = output.output_action is not None and output.output_action != []
+    has_pixel = output.output_pixel is not None
+    has_traj = output.output_trajectory is not None
+    has_latent = output.output_latent is not None
+
+    if has_action:
+        names = [ACTION_IDX_TO_NAME.get(a, str(a)) for a in output.output_action]
+        lines.append(f"  output_action={output.output_action} ({names})")
+    if has_pixel:
+        lines.append(f"  output_pixel=[row,col]={list(output.output_pixel)}")
+    if has_traj:
+        traj = np.asarray(output.output_trajectory)
+        lines.append(f"  output_trajectory shape={traj.shape}")
+        if traj.size > 0:
+            lines.append(f"    first_xy={traj[0].tolist()}  last_xy={traj[-1].tolist()}")
+    if has_latent:
+        lines.append(f"  output_latent shape={tuple(output.output_latent.shape)} dtype={output.output_latent.dtype}")
+
+    if not (has_action or has_pixel or has_traj or has_latent):
+        lines.append("  (empty — no action, pixel, trajectory, or latent)")
+
+    if has_action and (has_pixel or has_traj):
+        lines.append("  NOTE: discrete actions and pixel/trajectory both set (unusual)")
+    elif has_pixel and not has_traj and not has_action:
+        lines.append("  path=S2_pixel_only (S1 trajectory not produced this step)")
+    elif has_pixel and has_traj:
+        lines.append("  path=S2_pixel + S1_trajectory")
+    elif has_action:
+        lines.append("  path=S2_discrete_action (S1 skipped)")
+
+    return "\n".join(lines)
 
 
 class InternVLAN1AsyncAgent:
@@ -64,7 +101,11 @@ class InternVLAN1AsyncAgent:
         self.model.eval()
         self.model.to(self.device)
 
-        self.processor = AutoProcessor.from_pretrained(args.model_path)
+        self.model_path_original = args.model_path_original
+
+        #self.processor = AutoProcessor.from_pretrained(args.model_path if args.model_path else "checkpoints/InternVLA-N1-w-NavDP")
+        self.processor = AutoProcessor.from_pretrained(self.model_path_original)
+
         self.processor.tokenizer.padding_side = 'left'
 
         self.resize_w = args.resize_w
@@ -169,8 +210,17 @@ class InternVLAN1AsyncAgent:
         """
         dual_sys_output = S2Output()
         no_output_flag = self.output_action is None and self.output_latent is None
+        ran_s2 = (self.episode_idx - self.last_s2_idx > self.PLAN_STEP_GAP) or look_down or no_output_flag
 
-        if (self.episode_idx - self.last_s2_idx > self.PLAN_STEP_GAP) or look_down or no_output_flag:
+        print(
+            f"[InternVLAN1AsyncAgent] step enter episode_idx={self.episode_idx} "
+            f"last_s2_idx={self.last_s2_idx} plan_gap={self.PLAN_STEP_GAP} "
+            f"look_down={look_down} ran_s2={ran_s2} "
+            f"pending_action={self.output_action is not None} "
+            f"pending_latent={self.output_latent is not None}"
+        )
+    
+        if ran_s2:
             self.output_action, self.output_latent, self.output_pixel = self.step_s2(
                 rgb, depth, pose, instruction, intrinsic, look_down
             )
@@ -181,10 +231,15 @@ class InternVLAN1AsyncAgent:
             self.pixel_goal_depth = copy.deepcopy(depth)
         else:
             self.step_no_infer(rgb, depth, pose)
+            print(f"[InternVLAN1AsyncAgent] step skipped S2 (buffer frame only) episode_idx={self.episode_idx}")
 
         if self.output_action is not None:
             # Discrete actions are one-shot: return them and clear so S2 runs next cycle.
             dual_sys_output.output_action = copy.deepcopy(self.output_action)
+            print(
+                f"[InternVLAN1AsyncAgent] step returning S2 discrete actions: "
+                f"{dual_sys_output.output_action}"
+            )
             self.output_action = None
         elif self.output_latent is not None:
             # S1 expects two RGB-D pairs: [pixel-goal frame, current frame], 224x224.
@@ -203,10 +258,22 @@ class InternVLAN1AsyncAgent:
                 .unsqueeze(-1)
                 .to(self.device)
             )
+            print(
+                f"[InternVLAN1AsyncAgent] step running S1 "
+                f"latent={tuple(self.output_latent.shape)} "
+                f"rgbs={tuple(rgbs.shape)} depths={tuple(depths.shape)}"
+            )
             trajectories = self.step_s1(self.output_latent, rgbs, depths)
             # Continuous XY path (not discretized to turn/forward symbols).
             dual_sys_output.output_trajectory = traj_to_actions(trajectories, use_discrate_action=False)
+            print(
+                f"[InternVLAN1AsyncAgent] step S1 done raw_traj={tuple(trajectories.shape)} "
+                f"xy_path={np.asarray(dual_sys_output.output_trajectory).shape}"
+            )
+        else:
+            print("[InternVLAN1AsyncAgent] step no S1/S2 output produced this tick")
 
+        print(f"[InternVLAN1AsyncAgent] step exit:\n{describe_s2_output(dual_sys_output)}")
         return dual_sys_output
 
     def step_s2(self, rgb, depth, pose, instruction, intrinsic, look_down=False):
@@ -316,7 +383,11 @@ class InternVLAN1AsyncAgent:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
         self.past_key_values = copy.deepcopy(outputs.past_key_values)
-        print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
+        print(
+            f"[InternVLAN1AsyncAgent] S2 generate episode_idx={self.episode_idx} "
+            f"look_down={look_down} num_images={len(self.input_images)} "
+            f"llm_output={self.llm_output!r} cost={t1 - t0:.3f}s"
+        )
 
         #  5. Parse VLM output into one of two branches 
         if bool(re.search(r'\d', self.llm_output)):
@@ -325,6 +396,10 @@ class InternVLAN1AsyncAgent:
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
             # Model outputs (col, row); swap to [row, col] for image indexing.
             pixel_goal = [int(coord[1]), int(coord[0])]
+            print(
+                f"[InternVLAN1AsyncAgent] S2 branch=pixel_goal "
+                f"parsed_digits={coord} pixel_goal=[row,col]={pixel_goal}"
+            )
 
             # Re-run the model's hidden states to extract trajectory latents for S1.
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
@@ -332,6 +407,13 @@ class InternVLAN1AsyncAgent:
             t0 = time.time()
             with torch.no_grad():
                 traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+            t1 = time.time()
+            print(
+                f"[InternVLAN1AsyncAgent] S2 generate_latents "
+                f"shape={tuple(traj_latents.shape)} dtype={traj_latents.dtype} "
+                f"device={traj_latents.device} cost={t1 - t0:.3f}s "
+                f"mean={traj_latents.float().mean().item():.4f} std={traj_latents.float().std().item():.4f}"
+            )
             # No discrete actions; S1 will produce a continuous trajectory from the latents.
             return None, traj_latents, pixel_goal
 
@@ -339,6 +421,11 @@ class InternVLAN1AsyncAgent:
             # discrete symbols (STOP, ↑, ←, →, ↓)
             # Execute immediately; no S1 trajectory needed.
             action_seq = self.parse_actions(self.llm_output)
+            action_names = [ACTION_IDX_TO_NAME.get(a, str(a)) for a in action_seq]
+            print(
+                f"[InternVLAN1AsyncAgent] S2 branch=discrete_action "
+                f"parsed={action_seq} ({action_names})"
+            )
             return action_seq, None, None
 
     def step_s1(self, latent, rgb, depth):
@@ -350,5 +437,20 @@ class InternVLAN1AsyncAgent:
 
         Returns raw trajectory deltas; step() converts them to an XY path via traj_to_actions().
         """
+        system1 = getattr(self.model, "get_system1_type", lambda: "?")()
+        t0 = time.time()
         all_trajs = self.model.generate_traj(latent, rgb, depth)
+        t1 = time.time()
+        traj_np = all_trajs.detach().float().cpu().numpy() if torch.is_tensor(all_trajs) else np.asarray(all_trajs)
+        print(
+            f"[InternVLAN1AsyncAgent] S1 generate_traj system1={system1!r} "
+            f"latent_in={tuple(latent.shape)} rgb_in={tuple(rgb.shape)} depth_in={tuple(depth.shape)} "
+            f"raw_out={traj_np.shape} cost={t1 - t0:.3f}s"
+        ) 
+        if traj_np.size > 0:
+            sample0 = traj_np[0]
+            print(
+                f"[InternVLAN1AsyncAgent] S1 sample[0] first_waypoint={sample0[0].tolist()} "
+                f"last_waypoint={sample0[-1].tolist()}"
+            )
         return all_trajs

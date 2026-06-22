@@ -12,6 +12,7 @@ Prerequisites (not handled by this script):
   - DepthAnything checkpoint in checkpoints/
   - Scene folder prepared with instruction.txt and debug_raw_*.jpg images
     + example: debug_raw_0001.jpg | debug_raw_0002_look_down.jpg
+  - Optional: LeRobot episode parquet with pose.{setting} for GT trajectory overlay
 
 Notes:
   - Without --depth-dir, a constant dummy depth map is used (see DUMMY_DEPTH_METERS).
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +41,7 @@ from pathlib import Path
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from InternNav.scripts.notebooks import inference_only_w_gt_compare
 import torch
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PIL import Image, ImageDraw, ImageFont
@@ -117,6 +120,21 @@ VIDEO_FPS = 2.0
 
 # Warm up the model with a dummy forward pass before processing the scene.
 WARMUP_MODEL = True
+
+# Optional ground-truth trajectory overlay (LeRobot parquet with camera poses).
+# Set GT_LEROBOT_ROOT + episode index, or pass --gt-parquet on the CLI.
+GT_LEROBOT_ROOT: Path | None = Path("/home/khang/Documents/VR/bk_ver2.0_test/round2_bkhn")
+GT_EPISODE_INDEX: int | None = 7
+GT_CAMERA_SETTING = "125cm_30deg"
+GT_CAMERA_PITCH_DEG = 30
+GT_PREDICT_STEP_NUM = 32
+
+# Save a dedicated pred-vs-GT comparison figure per frame (RGB + trajectory plot).
+SAVE_TRAJ_COMPARE_FIG = True
+TRAJ_COMPARE_FIG_DPI = 120
+
+# Rotate GT [x, y] -> [-y, x] before plotting so odometry paths align with +X-forward pred.
+GT_ROTATE_FOR_VIS = False
 
 
 # ==========================================================
@@ -356,6 +374,359 @@ def validate_depth_dir(rgb_paths: list[str], depth_dir: Path) -> None:
         )
 
 
+def parse_episode_index_from_scene(scene_dir: Path) -> int | None:
+    """Parse episode id from scene folder names like bkhn_data_round2_125cm_30deg_e7_rgb."""
+    match = re.search(r"_e(\d+)(?:_|$)", scene_dir.name)
+    return int(match.group(1)) if match else None
+
+
+def resolve_gt_parquet_path(
+    gt_parquet: Path | None,
+    lerobot_root: Path | None,
+    episode_index: int | None,
+) -> Path | None:
+    if gt_parquet is not None:
+        path = gt_parquet.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Ground-truth parquet not found: {path}")
+        return path
+
+    if lerobot_root is None or episode_index is None:
+        return None
+
+    lerobot_root = lerobot_root.resolve()
+    chunk = episode_index // 1000
+    path = PROJECT_ROOT / "assets" / "bkhn_data_round2_125cm_30deg_e7_rgb" / f"episode_{episode_index:06d}.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(f"Ground-truth parquet not found: {path}")
+    return path
+
+
+def load_gt_episode(parquet_path: Path, camera_setting: str) -> dict:
+    """Load per-frame camera poses and pixel-goal segment lengths from LeRobot parquet."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError(
+            "Ground-truth overlay requires pyarrow. Install with: pip install pyarrow"
+        ) from exc
+
+    table = pq.read_table(parquet_path)
+    pose_key = f"pose.{camera_setting}"
+    rel_goal_key = f"relative_goal_frame_id.{camera_setting}"
+    if pose_key not in table.column_names:
+        available = [name for name in table.column_names if name.startswith("pose.")]
+        raise KeyError(
+            f"Column {pose_key!r} not found in {parquet_path}. "
+            f"Available pose columns: {available}"
+        )
+    if rel_goal_key not in table.column_names:
+        raise KeyError(f"Column {rel_goal_key!r} not found in {parquet_path}")
+
+    poses = [
+        np.asarray(table.column(pose_key)[i].as_py(), dtype=np.float64)
+        for i in range(table.num_rows)
+    ]
+    relative_goal_lens = [table.column(rel_goal_key)[i].as_py() for i in range(table.num_rows)]
+    return {
+        "poses": poses,
+        "relative_goal_lens": relative_goal_lens,
+        "num_frames": table.num_rows,
+        "parquet_path": parquet_path,
+        "camera_setting": camera_setting,
+    }
+
+
+def get_trajectory_relative_to_frame(extrinsics: np.ndarray, camera_deg: float = 0) -> np.ndarray:
+    """Match training: express future poses in the current robot frame as (x, y, yaw)."""
+    t_camera2robot = np.array(
+        [[[0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+    t_robot2camera = np.array(
+        [[[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+    if camera_deg is not None:
+        camera_rad = np.radians(camera_deg)
+        t_deg = np.array(
+            [
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, np.cos(-camera_rad), -np.sin(-camera_rad), 0.0],
+                    [0.0, np.sin(-camera_rad), np.cos(-camera_rad), 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        t_robot2camera = np.matmul(t_robot2camera, t_deg)
+        t_camera2robot = np.linalg.inv(t_robot2camera)
+
+    extrinsics_robot = np.matmul(extrinsics, t_camera2robot)
+    t_ref = extrinsics_robot[0]
+    t_ref_inv = np.linalg.inv(t_ref)
+    relative_to_ref = np.matmul(t_ref_inv[np.newaxis, :, :], extrinsics_robot)
+    relative_translations = relative_to_ref[:, :2, 3]
+    relative_yaws = np.arctan2(relative_to_ref[:, 1, 0], relative_to_ref[:, 0, 0])
+    return np.concatenate((relative_translations, relative_yaws.reshape(-1, 1)), axis=-1)
+
+
+def smooth_and_resample_trajectory(
+    points: np.ndarray,
+    sample_length: int = 33,
+    interval: float = 0.1,
+) -> np.ndarray:
+    from scipy.interpolate import CubicSpline
+
+    total_distance = sample_length * interval
+    if len(points) == 0:
+        return np.zeros((sample_length, 2))
+    if len(points) == 1:
+        return np.tile(points[0], (sample_length, 1))
+
+    diff = np.diff(points, axis=0)
+    segment_lengths = np.sqrt(np.sum(diff**2, axis=1))
+    cumulative_distances = np.cumsum(segment_lengths)
+    cumulative_distances = np.insert(cumulative_distances, 0, 0)
+
+    if len(points) > 3:
+        cs_x = CubicSpline(cumulative_distances, points[:, 0])
+        cs_y = CubicSpline(cumulative_distances, points[:, 1])
+        dense_distances = np.linspace(0, cumulative_distances[-1], max(50, len(points) * 2))
+        smoothed_points = np.column_stack((cs_x(dense_distances), cs_y(dense_distances)))
+        smooth_diff = np.diff(smoothed_points, axis=0)
+        smooth_segment_lengths = np.sqrt(np.sum(smooth_diff**2, axis=1))
+        smooth_cumulative_distances = np.cumsum(smooth_segment_lengths)
+        smooth_cumulative_distances = np.insert(smooth_cumulative_distances, 0, 0)
+    else:
+        smoothed_points = points
+        smooth_cumulative_distances = cumulative_distances
+
+    target_distances = np.linspace(0, total_distance, sample_length)
+    resampled = np.zeros((sample_length, 2))
+    for i, target_dist in enumerate(target_distances):
+        if target_dist >= smooth_cumulative_distances[-1]:
+            resampled[i] = smoothed_points[-1]
+            continue
+        segment_idx = np.searchsorted(smooth_cumulative_distances, target_dist, side="right") - 1
+        start_dist = smooth_cumulative_distances[segment_idx]
+        end_dist = smooth_cumulative_distances[segment_idx + 1]
+        t = (target_dist - start_dist) / (end_dist - start_dist)
+        resampled[i] = smoothed_points[segment_idx] + t * (
+            smoothed_points[segment_idx + 1] - smoothed_points[segment_idx]
+        )
+    return resampled
+
+
+def interpolate_and_resample_trajectory(
+    absolute_trajectories: np.ndarray,
+    predict_step_num: int | None = None,
+) -> np.ndarray:
+    start_point = np.array([[0.0, 0.0]])
+    traj = absolute_trajectories[..., :2]
+    steps = traj[1:] - traj[:-1]
+    steps_sq = (steps**2).sum(axis=-1)
+    mask = steps_sq > 0.05
+    filtered_traj = traj[1:][mask]
+    filtered_traj = np.concatenate([start_point, filtered_traj], axis=0)
+    return smooth_and_resample_trajectory(filtered_traj, sample_length=predict_step_num + 1)
+
+
+def find_active_goal_segment(
+    relative_goal_lens: list[int],
+    frame_idx: int,
+) -> tuple[int, int] | None:
+    """Return (start_frame, goal_len) for the pixel-goal segment covering frame_idx."""
+    if frame_idx < 0 or frame_idx >= len(relative_goal_lens):
+        return None
+
+    goal_len = relative_goal_lens[frame_idx]
+    if goal_len is not None and goal_len >= 3:
+        return frame_idx, goal_len
+
+    for start in range(frame_idx - 1, -1, -1):
+        goal_len = relative_goal_lens[start]
+        if goal_len is not None and goal_len >= 3 and frame_idx <= start + goal_len:
+            return start, goal_len
+    return None
+
+
+def compute_gt_trajectory_xy(
+    gt_episode: dict,
+    frame_idx: int,
+    camera_pitch_deg: float,
+    predict_step_num: int,
+) -> list[list[float]] | None:
+    """Future XY path from recorded poses, aligned with S1 training supervision."""
+    poses = gt_episode["poses"]
+    relative_goal_lens = gt_episode["relative_goal_lens"]
+    if frame_idx < 0 or frame_idx >= len(poses):
+        return None
+
+    segment = find_active_goal_segment(relative_goal_lens, frame_idx)
+    if segment is None:
+        return None
+
+    start_frame, goal_len = segment
+    end_frame = min(start_frame + goal_len + 1, len(poses))
+    if frame_idx >= end_frame - 1:
+        return None
+
+    pose_slice = np.stack(poses[frame_idx:end_frame])
+    if len(pose_slice) < 2:
+        return None
+
+    discrete_traj_pose = get_trajectory_relative_to_frame(pose_slice, camera_deg=camera_pitch_deg)
+    resampled_traj = interpolate_and_resample_trajectory(discrete_traj_pose, predict_step_num)
+    return resampled_traj.tolist()
+
+
+def collect_xy_points(path) -> np.ndarray | None:
+    if path is None or len(path) == 0:
+        return None
+    points = []
+    for point in path:
+        if isinstance(point, (list, tuple, np.ndarray)) and len(point) >= 2:
+            points.append([float(point[0]), float(point[1])])
+    if not points:
+        return None
+    return np.asarray(points)
+
+
+def gt_array_for_plot(
+    gt_array: np.ndarray | None,
+    rotate: bool = GT_ROTATE_FOR_VIS,
+) -> np.ndarray | None:
+    """Visualization-only: map odometry GT (x, y) to camera-forward frame (-y, x)."""
+    if gt_array is None:
+        return None
+    if not rotate:
+        return gt_array
+    return np.column_stack([-gt_array[:, 1], gt_array[:, 0]])
+
+
+def render_trajectory_axes(
+    ax,
+    pred_array: np.ndarray | None,
+    gt_array: np.ndarray | None,
+    *,
+    title: str | None = None,
+    legend: bool = True,
+    rotate_gt_for_vis: bool = GT_ROTATE_FOR_VIS,
+    compact: bool = False,
+) -> None:
+    """Plot trajectories using the same frame as inference_only.py (Y horizontal, X vertical)."""
+    gt_plot = gt_array_for_plot(gt_array, rotate=rotate_gt_for_vis)
+    gt_label = "GT (aligned)" if rotate_gt_for_vis and gt_plot is not None else "GT"
+    label_size = 8 if compact else 10
+    tick_size = 6 if compact else 8
+    origin_size = 10 if compact else 12
+    marker_size = 6 if compact else 7
+
+    if gt_plot is not None:
+        ax.plot(gt_plot[:, 1], gt_plot[:, 0], "r--", linewidth=2, label=gt_label)
+        ax.plot(gt_plot[0, 1], gt_plot[0, 0], "rs", markersize=marker_size)
+        ax.plot(gt_plot[-1, 1], gt_plot[-1, 0], "r^", markersize=marker_size)
+
+    if pred_array is not None:
+        ax.plot(pred_array[:, 1], pred_array[:, 0], "b-", linewidth=2, label="Pred")
+        ax.plot(pred_array[0, 1], pred_array[0, 0], "go", markersize=marker_size)
+        ax.plot(pred_array[-1, 1], pred_array[-1, 0], "ro", markersize=marker_size)
+
+    ax.plot(0, 0, "w+", markersize=origin_size, markeredgewidth=2)
+    ax.set_xlabel("Y", fontsize=label_size)
+    ax.set_ylabel("X", fontsize=label_size)
+    ax.invert_xaxis()
+    ax.tick_params(labelsize=tick_size)
+    ax.grid(True, alpha=0.3, linewidth=0.5)
+    ax.set_aspect("equal", adjustable="box")
+
+    arrays = [arr for arr in (pred_array, gt_plot) if arr is not None]
+    if arrays:
+        all_pts = np.concatenate(arrays, axis=0)
+        x_margin = max(0.1, 0.1 * (all_pts[:, 0].max() - all_pts[:, 0].min() + 1e-6))
+        y_margin = max(0.1, 0.1 * (all_pts[:, 1].max() - all_pts[:, 1].min() + 1e-6))
+        ax.set_xlim(all_pts[:, 1].max() + y_margin, all_pts[:, 1].min() - y_margin)
+        ax.set_ylim(all_pts[:, 0].min() - x_margin, all_pts[:, 0].max() + x_margin)
+
+    if title:
+        ax.set_title(title)
+    if legend and pred_array is not None and gt_plot is not None:
+        ax.legend(fontsize=tick_size, loc="best")
+
+
+def render_trajectory_plot_image(
+    pred_array: np.ndarray | None,
+    gt_array: np.ndarray | None,
+    *,
+    figsize: tuple[float, float] = (2, 2),
+    dpi: int = 100,
+    title: str | None = None,
+    transparent_bg: bool = True,
+) -> np.ndarray:
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    if transparent_bg:
+        fig.patch.set_alpha(0.6)
+        fig.patch.set_facecolor("gray")
+        ax.set_facecolor("lightgray")
+    render_trajectory_axes(
+        ax,
+        pred_array,
+        gt_array,
+        title=title,
+        legend=True,
+        compact=True,
+    )
+    plt.tight_layout(pad=0.3)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    plot_img = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return plot_img
+
+
+def save_trajectory_comparison_figure(
+    rgb: np.ndarray,
+    pred_trajectory,
+    gt_trajectory,
+    output_dir: Path | str,
+    frame_index: int,
+    image_id: str,
+    llm_output=None,
+    dpi: int = TRAJ_COMPARE_FIG_DPI,
+) -> Path | None:
+    pred_array = collect_xy_points(pred_trajectory)
+    gt_array = collect_xy_points(gt_trajectory)
+    if pred_array is None and gt_array is None:
+        return None
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_path = output_dir / f"frame_{frame_index:05d}_traj_compare.png"
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=dpi)
+    axes[0].imshow(rgb.astype(np.uint8))
+    axes[0].set_title(f"Frame {image_id}")
+    axes[0].axis("off")
+
+    subtitle = f"Output: {llm_output}" if llm_output is not None else "Trajectory comparison"
+    render_trajectory_axes(
+        axes[1],
+        pred_array,
+        gt_array,
+        title=subtitle,
+        legend=True,
+        compact=False,
+    )
+    suptitle = "Prediction vs ground truth (robot frame)"
+    if GT_ROTATE_FOR_VIS and gt_array is not None:
+        suptitle += " GT rotated [-y, x] for display"
+    fig.suptitle(suptitle, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
 def create_video_from_frames(
     frames: list[np.ndarray],
     video_path: Path,
@@ -386,13 +757,17 @@ def annotate_image(
     image,
     llm_output=None,
     trajectory=None,
+    gt_trajectory=None,
     pixel_goal=None,
     output_dir="./",
     frame_index: int | None = None,
+    save_compare_figure: bool = SAVE_TRAJ_COMPARE_FIG,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
-    image = Image.fromarray(image.astype(np.uint8)).convert("RGB")
+    original_rgb = np.asarray(image).astype(np.uint8).copy()
+
+    image = Image.fromarray(original_rgb).convert("RGB")
     draw = ImageDraw.Draw(image)
 
     font_size = 20
@@ -433,51 +808,26 @@ def annotate_image(
 
     image = np.array(image)
 
-    if trajectory is not None and len(trajectory) > 0:
+    pred_array = collect_xy_points(trajectory)
+    gt_array = collect_xy_points(gt_trajectory)
+
+    if pred_array is not None or gt_array is not None:
         img_height, img_width = image.shape[:2]
         window_size = 200
         window_x = max(0, img_width - window_size)
         window_y = 0
-
-        traj_points = []
-        for point in trajectory:
-            if isinstance(point, (list, tuple, np.ndarray)) and len(point) >= 2:
-                traj_points.append([float(point[0]), float(point[1])])
-
-        if len(traj_points) > 0:
-            traj_array = np.array(traj_points)
-            x_coords = traj_array[:, 0]
-            y_coords = traj_array[:, 1]
-
-            fig, ax = plt.subplots(figsize=(2, 2), dpi=100)
-            fig.patch.set_alpha(0.6)
-            fig.patch.set_facecolor("gray")
-            ax.set_facecolor("lightgray")
-
-            ax.plot(y_coords, x_coords, "b-", linewidth=2)
-            ax.plot(y_coords[0], x_coords[0], "go", markersize=6)
-            ax.plot(y_coords[-1], x_coords[-1], "ro", markersize=6)
-            ax.plot(0, 0, "w+", markersize=10, markeredgewidth=2)
-
-            ax.set_xlabel("Y", fontsize=8)
-            ax.set_ylabel("X", fontsize=8)
-            ax.invert_xaxis()
-            ax.tick_params(labelsize=6)
-            ax.grid(True, alpha=0.3, linewidth=0.5)
-            ax.set_aspect("equal", adjustable="box")
-
-            plt.tight_layout(pad=0.3)
-
-            canvas = FigureCanvasAgg(fig)
-            canvas.draw()
-            plot_img = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
-            plt.close(fig)
-
-            plot_img = cv2.resize(plot_img, (window_size, window_size))
-            image[
-                window_y : window_y + window_size,
-                window_x : window_x + window_size,
-            ] = plot_img
+        plot_img = render_trajectory_plot_image(
+            pred_array,
+            gt_array,
+            figsize=(2, 2),
+            dpi=100,
+            transparent_bg=True,
+        )
+        plot_img = cv2.resize(plot_img, (window_size, window_size))
+        image[
+            window_y : window_y + window_size,
+            window_x : window_x + window_size,
+        ] = plot_img
 
     if pixel_goal is not None:
         pixel_goal = np.asarray(pixel_goal).astype(int)
@@ -491,6 +841,18 @@ def annotate_image(
     else:
         save_path = os.path.join(output_dir, f"rgb_{idx}_annotated.png")
     Image.fromarray(image).convert("RGB").save(save_path)
+
+    if save_compare_figure and frame_index is not None:
+        save_trajectory_comparison_figure(
+            rgb=original_rgb,
+            pred_trajectory=trajectory,
+            gt_trajectory=gt_trajectory,
+            output_dir=output_dir,
+            frame_index=frame_index,
+            image_id=str(idx),
+            llm_output=llm_output,
+        )
+
     return image
 
 
@@ -545,6 +907,10 @@ def run_inference(
     save_video: bool,
     video_fps: float,
     video_filename: str,
+    gt_episode: dict | None = None,
+    gt_camera_pitch_deg: float = GT_CAMERA_PITCH_DEG,
+    gt_predict_step_num: int = GT_PREDICT_STEP_NUM,
+    save_traj_compare_fig: bool = SAVE_TRAJ_COMPARE_FIG,
 ) -> None:
     from internnav.agent.internvla_n1_agent_realworld import describe_s2_output
 
@@ -558,6 +924,12 @@ def run_inference(
 
     if save_visualizations:
         save_dir.mkdir(parents=True, exist_ok=True)
+
+    if gt_episode is not None:
+        print(
+            f"Ground-truth overlay: {gt_episode['parquet_path']} "
+            f"({gt_episode['num_frames']} frames, setting={gt_episode['camera_setting']})"
+        )
 
     annotated_frames: list[np.ndarray] = []
 
@@ -637,15 +1009,35 @@ def run_inference(
         if output_action is None and output_traj is None and output_pixel is None:
             print("[inference_only] WARN: all outputs None this frame (check plan_step_gap / S2 parse)")
 
+        gt_trajectory = None
+        if gt_episode is not None:
+            frame_idx = int(image_id)
+            gt_trajectory = compute_gt_trajectory_xy(
+                gt_episode,
+                frame_idx,
+                camera_pitch_deg=gt_camera_pitch_deg,
+                predict_step_num=gt_predict_step_num,
+            )
+            if gt_trajectory is not None:
+                gt_arr = np.asarray(gt_trajectory)
+                print(
+                    f"[inference_only] gt_trajectory frame={frame_idx} "
+                    f"len={len(gt_trajectory)} last_xy={gt_arr[-1].tolist()}"
+                )
+            elif trajectory is not None:
+                print(f"[inference_only] gt_trajectory unavailable for frame={frame_idx} (no pixel-goal segment)")
+
         if save_visualizations:
             annotated = annotate_image(
                 image_id,
                 rgb,
                 llm_output=llm_output,
                 trajectory=trajectory,
+                gt_trajectory=gt_trajectory,
                 pixel_goal=pixel_goal,
                 output_dir=str(save_dir),
                 frame_index=frame_index,
+                save_compare_figure=save_traj_compare_fig,
             )
             annotated_frames.append(annotated)
 
@@ -759,6 +1151,48 @@ def parse_args() -> argparse.Namespace:
             "If omitted, auto-detect (uint16 mm -> /1000, uint8 -> 0-10m, etc.)."
         ),
     )
+    parser.add_argument(
+        "--gt-parquet",
+        type=Path,
+        default=None,
+        help="Episode parquet with recorded camera poses for GT trajectory overlay",
+    )
+    parser.add_argument(
+        "--gt-lerobot-root",
+        type=Path,
+        default=GT_LEROBOT_ROOT,
+        help=(
+            "LeRobot dataset root (uses data/chunk-XXX/episode_XXXXXX.parquet). "
+            "Set empty string to disable auto GT lookup."
+        ),
+    )
+    parser.add_argument(
+        "--gt-episode-index",
+        type=int,
+        default=GT_EPISODE_INDEX,
+        help="Episode index for GT parquet when using --gt-lerobot-root",
+    )
+    parser.add_argument(
+        "--gt-camera-setting",
+        default=GT_CAMERA_SETTING,
+        help="Pose column suffix in parquet, e.g. 125cm_30deg -> pose.125cm_30deg",
+    )
+    parser.add_argument(
+        "--gt-camera-pitch-deg",
+        type=float,
+        default=GT_CAMERA_PITCH_DEG,
+        help="Look-down camera pitch used for GT local-frame conversion",
+    )
+    parser.add_argument(
+        "--no-gt",
+        action="store_true",
+        help="Disable ground-truth trajectory overlay even if parquet paths are configured",
+    )
+    parser.add_argument(
+        "--no-traj-compare-fig",
+        action="store_true",
+        help="Skip saving per-frame pred-vs-GT comparison figures",
+    )
     return parser.parse_args()
 
 
@@ -816,6 +1250,27 @@ def main() -> None:
             print(f"Depth scale: {cli.depth_scale} (raw values -> meters)")
     else:
         print(f"Depth: dummy constant ({DUMMY_DEPTH_METERS} m)")
+
+    gt_episode = None
+    if not cli.no_gt:
+        episode_index = cli.gt_episode_index
+        if episode_index is None:
+            episode_index = parse_episode_index_from_scene(scene_dir)
+        lerobot_root = cli.gt_lerobot_root
+        if lerobot_root is not None and str(lerobot_root).strip() == "":
+            lerobot_root = None
+        try:
+            gt_parquet = resolve_gt_parquet_path(cli.gt_parquet, lerobot_root, episode_index)
+        except FileNotFoundError as exc:
+            print(f"Ground-truth overlay: disabled ({exc})")
+            gt_parquet = None
+        if gt_parquet is not None:
+            gt_episode = load_gt_episode(gt_parquet, cli.gt_camera_setting)
+            print(f"Ground-truth parquet: {gt_parquet}")
+        elif cli.gt_parquet is not None or lerobot_root is not None:
+            print("Ground-truth overlay: disabled (could not resolve parquet path)")
+    else:
+        print("Ground-truth overlay: disabled (--no-gt)")
     print()
 
     args = Args(
@@ -845,6 +1300,10 @@ def main() -> None:
         save_video=SAVE_VIDEO and not cli.no_video and save_visualizations,
         video_fps=cli.video_fps,
         video_filename=cli.video_name,
+        gt_episode=gt_episode,
+        gt_camera_pitch_deg=cli.gt_camera_pitch_deg,
+        gt_predict_step_num=GT_PREDICT_STEP_NUM,
+        save_traj_compare_fig=SAVE_TRAJ_COMPARE_FIG and not cli.no_traj_compare_fig,
     )
 
 if __name__ == "__main__":
