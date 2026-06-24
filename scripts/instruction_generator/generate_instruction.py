@@ -3,26 +3,23 @@ import gc
 import json
 import re
 import sys
-import torch
-
 from pathlib import Path
-from PIL import Image
 
+import torch
+from PIL import Image
 from transformers import (
     BitsAndBytesConfig,
     LlavaOnevisionForConditionalGeneration,
     LlavaOnevisionProcessor,
 )
 
-from prompts import TRAJECTORY_PROMPT_BEFORE, TRAJECTORY_PROMPT_AFTER
+from prompts import TRAJECTORY_PROMPT_AFTER, TRAJECTORY_PROMPT_BEFORE
 
 DEFAULT_MAX_NEW_TOKENS = 96
 DEFAULT_WINDOW_SIZE = 6
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
-DEFAULT_ROOT_DIR = Path(
-    "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes"
-)
+DEFAULT_ROOT_DIR = Path("/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes")
 DEFAULT_DEVICE = "cuda:1"
 
 _KEYFRAME_FRAME_IDX_RE = re.compile(r"_(\d{6})\.(?:jpg|png)$", re.IGNORECASE)
@@ -109,6 +106,15 @@ def parse_args():
         default=DEFAULT_DEVICE,
         help=f"CUDA device for inference (default: {DEFAULT_DEVICE})",
     )
+    parser.add_argument(
+        "--flip-horizontal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Mirror each image left↔right before inference (default: on). "
+            "Use --no-flip-horizontal to feed original images."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -123,9 +129,7 @@ class LlavaOnevisionLocal:
         self.max_new_tokens = max_new_tokens
         self.repetition_penalty = repetition_penalty
 
-        self.processor = LlavaOnevisionProcessor.from_pretrained(
-            model_path, local_files_only=True, use_fast=True
-        )
+        self.processor = LlavaOnevisionProcessor.from_pretrained(model_path, local_files_only=True, use_fast=True)
         self.processor.tokenizer.padding_side = "left"
         self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_path,
@@ -152,9 +156,7 @@ class LlavaOnevisionLocal:
                 ),
             }
         ]
-        text_prompt = self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
+        text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
         inputs = self.processor(images=images, text=text_prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
@@ -170,18 +172,19 @@ class LlavaOnevisionLocal:
         )
 
         input_len = inputs["input_ids"].shape[1]
-        response = self.processor.batch_decode(
-            output_ids[:, input_len:], skip_special_tokens=True
-        )[0].strip()
+        response = self.processor.batch_decode(output_ids[:, input_len:], skip_special_tokens=True)[0].strip()
 
         return response
 
 
-def load_images(image_paths):
+def load_images(image_paths, mirror_left_right: bool = True):
+    """Load keyframe images; optionally mirror horizontally (left side ↔ right side)."""
     images = []
     for p in image_paths:
         try:
             img = Image.open(p).convert("RGB")
+            if mirror_left_right:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
             img.thumbnail((384, 384))
             images.append(img)
         except Exception as e:
@@ -189,9 +192,16 @@ def load_images(image_paths):
     return images
 
 
-def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int):
+def run_episode(
+    episode_dir: Path,
+    llava: LlavaOnevisionLocal,
+    window_size: int,
+    flip_horizontal: bool = True,
+):
     print(f"\n{'=' * 80}")
     print(f"EPISODE: {episode_dir.name}")
+    if flip_horizontal:
+        print("  Image preprocessing: mirror left↔right")
 
     for stale in (episode_dir / "instructions.json", episode_dir / "instructions.txt"):
         if stale.exists():
@@ -205,11 +215,7 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
 
     print(f"Found {len(frame_paths)} keyframe images, window_size={window_size}")
 
-    # chunk into non-overlapping windows: [0:8], [8:16], [16:24], ...
-    chunks = [
-        frame_paths[i : i + window_size]
-        for i in range(0, len(frame_paths), window_size)
-    ]
+    chunks = [frame_paths[i : i + window_size] for i in range(0, len(frame_paths), window_size)]
     print(f"Total chunks: {len(chunks)}")
 
     results = []
@@ -217,11 +223,9 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
     for chunk_idx, chunk_paths in enumerate(chunks):
         start = chunk_idx * window_size
         end = start + len(chunk_paths) - 1
-        print(
-            f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)"
-        )
+        print(f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)")
 
-        images = load_images(chunk_paths)
+        images = load_images(chunk_paths, mirror_left_right=flip_horizontal)
         if len(images) == 0:
             print("  No valid images, skipping chunk.")
             continue
@@ -249,18 +253,14 @@ def run_episode(episode_dir: Path, llava: LlavaOnevisionLocal, window_size: int)
         print("No instructions generated.")
         return
 
-    # save JSON with all chunk results
     save_json = episode_dir / "instructions.json"
     with open(save_json, "w") as f:
         json.dump(results, f, indent=2)
 
-    # save TXT with one instruction per line, ready for summarization
     save_txt = episode_dir / "instructions.txt"
     with open(save_txt, "w") as f:
         for item in results:
-            f.write(
-                f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n"
-            )
+            f.write(f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n")
 
     print(f"\nSaved {len(results)} chunk instructions:")
     print(f"  {save_json}")
@@ -285,33 +285,22 @@ def run_episodes(
     llava: LlavaOnevisionLocal,
     window_size: int,
     root_dir: Path,
+    flip_horizontal: bool = True,
 ):
     if input_path is None:
-        episode_dirs = sorted(
-            [
-                x
-                for x in root_dir.iterdir()
-                if x.is_dir() and x.name.startswith("episode_")
-            ]
-        )
+        episode_dirs = sorted([x for x in root_dir.iterdir() if x.is_dir() and x.name.startswith("episode_")])
         print(f"Found {len(episode_dirs)} episodes in {root_dir}")
     else:
-        episode_dirs = sorted(
-            [
-                x
-                for x in input_path.iterdir()
-                if x.is_dir() and x.name.startswith("episode_")
-            ]
-        )
+        episode_dirs = sorted([x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")])
         if episode_dirs:
             print(f"Found {len(episode_dirs)} episodes in {input_path}")
         else:
-            run_episode(input_path, llava, window_size=window_size)
+            run_episode(input_path, llava, window_size=window_size, flip_horizontal=flip_horizontal)
             return
 
     for ep in episode_dirs:
         try:
-            run_episode(ep, llava, window_size=window_size)
+            run_episode(ep, llava, window_size=window_size, flip_horizontal=flip_horizontal)
         except Exception as e:
             print(f"Episode failed: {ep.name} — {e}")
 
@@ -328,5 +317,9 @@ if __name__ == "__main__":
 
     input_path = resolve_input_path(args.input, args.root_dir)
     run_episodes(
-        input_path, llava, window_size=args.window_size, root_dir=args.root_dir
+        input_path,
+        llava,
+        window_size=args.window_size,
+        root_dir=args.root_dir,
+        flip_horizontal=args.flip_horizontal,
     )
