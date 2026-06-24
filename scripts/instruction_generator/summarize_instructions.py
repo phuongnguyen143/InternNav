@@ -1,9 +1,10 @@
 import gc
 import sys
-import torch
-
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from prompts import SUMMARIZE_PROMPT
 
 QWEN_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/Qwen2-72B-Instruct-AWQ"
@@ -70,7 +71,6 @@ def process_txt(txt_path: Path, qwen: QwenLocal):
 
 
 if __name__ == "__main__":
-
     if len(sys.argv) < 2:
         print("Usage:")
         print("  # single txt file")
