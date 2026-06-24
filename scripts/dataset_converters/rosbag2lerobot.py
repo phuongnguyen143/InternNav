@@ -23,22 +23,24 @@ from datasets import concatenate_datasets
 from loguru import logger
 
 _CONVERTERS = Path(__file__).resolve().parent
+_SCRIPTS_ROOT = _CONVERTERS.parent
 sys.path.insert(0, str(_CONVERTERS))
 sys.path.insert(0, "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot/src")
-_INSTR_GEN = Path(__file__).resolve().parents[1] / "instruction_generator"
-sys.path.insert(0, str(_INSTR_GEN))
+sys.path.insert(0, str(_SCRIPTS_ROOT))
 
-from floor_pose import (  # noqa: E402
-    FLOOR_CALIBRATION_FILENAME,
+from utils.config import get_config, load_config
+from utils.floor_pose import (  # noqa: E402
     floor_2d_pose_to_action_matrix,
-    load_floor_calibration,
+    enrich_poses_from_floor_trajectory,
+    resolve_floor_plane_for_keyframe_root,
 )
 
-from depth_codec import legacy_depth_vis_to_uint16_mm, resize_depth_nearest  # noqa: E402
+from utils.depth_codec import legacy_depth_vis_to_uint16_mm, resize_depth_nearest  # noqa: E402
 from internvla_labels import (  # noqa: E402
     CAMERA_SETTINGS,
     DEFAULT_LOOKAHEAD_FRAMES,
     build_frame_labels,
+    resolve_goal_use_ground_contact,
     setting_key,
 )
 
@@ -200,6 +202,29 @@ def load_camera_intrinsic(path: Optional[str]) -> np.ndarray:
     if len(vals) != 9:
         raise ValueError("camera_intrinsic must be 9 floats or a JSON file")
     return np.array(vals, dtype=np.float32).reshape(3, 3)
+
+
+def load_camera_intrinsic_from_droid_cfg(
+    cfg_path: str | Path,
+    target_size: Tuple[int, int] = (TGT_W, TGT_H),
+) -> np.ndarray:
+    """Load pinhole K from DROID-W cfg.yaml and scale to export resolution."""
+    import yaml
+
+    cfg = yaml.safe_load(Path(cfg_path).read_text())
+    cam = cfg["cam"]
+    K = np.array(
+        [
+            [float(cam["fx"]), 0.0, float(cam["cx"])],
+            [0.0, float(cam["fy"]), float(cam["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    # fx/cx/cy in cfg are for full RGB (cam.W x cam.H), not SLAM crop (W_out x H_out).
+    native_w = int(cam.get("W", target_size[0]))
+    native_h = int(cam.get("H", target_size[1]))
+    return scale_camera_intrinsic(K, (native_w, native_h), target_size)
 
 
 def get_video_frame_count(video_path: Path) -> int:
@@ -674,6 +699,11 @@ def convert_episode(
     pitch_lookdown: int,
     height_cm: int,
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
+    goal_lookahead_adaptive: bool = True,
+    apply_body2optical: bool = True,
+    camera_pitch_deg: float = 30.0,
+    ground_offset_y: float = 1.5,
+    use_ground_contact: bool = True,
 ) -> bool:
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
@@ -736,6 +766,11 @@ def convert_episode(
             TGT_H,
             goal_setting=(height_cm, pitch_lookdown),
             goal_lookahead_frames=goal_lookahead_frames,
+            goal_lookahead_adaptive=goal_lookahead_adaptive,
+            apply_body2optical=apply_body2optical,
+            camera_pitch_deg=camera_pitch_deg,
+            ground_offset_y=ground_offset_y,
+            use_ground_contact=use_ground_contact,
         )
 
         print(f"  Adding {n_frames} frames …", end=" ", flush=True)
@@ -770,14 +805,11 @@ def resolve_floor_plane(
     keyframe_root: Path,
     floor_calibration: Optional[Path],
 ) -> Optional[tuple]:
-    cal_path = floor_calibration
-    if cal_path is None:
-        cal_path = keyframe_root / FLOOR_CALIBRATION_FILENAME
-    if not cal_path.exists():
-        return None
-    cal = load_floor_calibration(cal_path)
-    print(f"Loaded floor calibration from {cal_path}")
-    return cal["floor_plane"]
+    return resolve_floor_plane_for_keyframe_root(
+        keyframe_root,
+        floor_calibration=floor_calibration,
+        derive_if_missing=True,
+    )
 
 
 def main(
@@ -792,6 +824,11 @@ def main(
     overwrite: bool,
     floor_calibration: Optional[Path] = None,
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
+    goal_lookahead_adaptive: bool = True,
+    apply_body2optical: bool = True,
+    camera_pitch_deg: float = 30.0,
+    ground_offset_y: float = 1.5,
+    use_ground_contact: bool = True,
 ) -> None:
     episodes_dir = keyframe_root / "episodes"
     if not episodes_dir.exists():
@@ -819,16 +856,25 @@ def main(
     print(f"Resolution        : {TGT_W}×{TGT_H}")
     print(f"Camera setting    : {height_cm}cm horizon {pitch_horizon}° / lookdown {pitch_lookdown}°")
     print(f"Goal lookahead    : {goal_lookahead_frames} frames")
+    print(f"Goal adaptive     : {'yes' if goal_lookahead_adaptive else 'no (fixed offset only)'}")
+    print(f"Body→optical      : {'yes' if apply_body2optical else 'no (SLAM optical odom)'}")
+    print(f"Goal ground point : {'SLAM pitch+offset' if use_ground_contact else 'floor trajectory world xyz'}")
+    print(f"Goal ground pitch : {camera_pitch_deg}° offset_y={ground_offset_y}m")
     print(f"Output            : {scene_root}")
 
     poses_by_frame_idx = load_poses_json(keyframe_root)
     print(f"Loaded {len(poses_by_frame_idx)} poses from poses.json")
 
+    traj_path = keyframe_root / get_config().floor_trajectory_filename()
+    if traj_path.is_file():
+        enriched = enrich_poses_from_floor_trajectory(poses_by_frame_idx, traj_path)
+        print(f"Enriched {enriched} poses with world_x/y/z from {traj_path.name}")
+
     floor_plane = resolve_floor_plane(keyframe_root, floor_calibration)
     if floor_plane is not None:
-        print("Using floor calibration for base poses and camera extrinsics")
+        print("Using floor plane for base poses, camera extrinsics, and pixel goals")
     else:
-        print("No floor_calibration.json — using floor x,y,yaw from poses.json")
+        print("No floor plane available — pixel goals will be invalid (-1)")
 
     features = get_internvla_features()
     lerobot_dataset = NavDataset.create(
@@ -854,6 +900,11 @@ def main(
                 pitch_lookdown=pitch_lookdown,
                 height_cm=height_cm,
                 goal_lookahead_frames=goal_lookahead_frames,
+                goal_lookahead_adaptive=goal_lookahead_adaptive,
+                apply_body2optical=apply_body2optical,
+                camera_pitch_deg=camera_pitch_deg,
+                ground_offset_y=ground_offset_y,
+                use_ground_contact=use_ground_contact,
             ):
                 success += 1
         except Exception as e:
@@ -899,7 +950,12 @@ if __name__ == "__main__":
         "--goal_lookahead",
         type=int,
         default=DEFAULT_LOOKAHEAD_FRAMES,
-        help="Fixed frame lookahead for relative_goal_frame_id and pixel goals",
+        help="Max frame lookahead for pixel goals (adaptive mode may use a smaller offset)",
+    )
+    parser.add_argument(
+        "--no-goal-lookahead-adaptive",
+        action="store_true",
+        help="Use fixed lookahead only; invalid if exact offset is past episode end or off-screen",
     )
     parser.add_argument(
         "--floor_calibration",
@@ -908,7 +964,55 @@ if __name__ == "__main__":
         help="Path to floor_calibration.json (default: <keyframe_root>/floor_calibration.json)",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--scene",
+        type=str,
+        default=None,
+        help="Scene config name (e.g. office_round1); reads odom_apply_body2optical default",
+    )
+    body2optical_group = parser.add_mutually_exclusive_group()
+    body2optical_group.add_argument(
+        "--body2optical",
+        action="store_true",
+        help="Apply ROS body→OpenCV optical transform on camera_matrix (LiDAR odom)",
+    )
+    body2optical_group.add_argument(
+        "--no-body2optical",
+        action="store_true",
+        help="Skip body→optical transform (SLAM/DROID optical odom)",
+    )
     args = parser.parse_args()
+
+    apply_body2optical = True
+    camera_pitch_deg = 30.0
+    ground_offset_y = 1.5
+    use_ground_contact: Optional[bool] = None
+    camera_intrinsic = load_camera_intrinsic(args.camera_intrinsic)
+
+    scene_cfg = None
+    if args.scene:
+        scene_cfg = load_config(args.scene)
+        b2o_val = scene_cfg.get("odom_apply_body2optical")
+        apply_body2optical = True if b2o_val is None else bool(b2o_val)
+        slam_path = scene_cfg.get("slam_path", default={})
+        camera_pitch_deg = float(slam_path.get("camera_pitch_deg", camera_pitch_deg))
+        ground_offset_y = float(slam_path.get("ground_offset_y", ground_offset_y))
+        gc_val = scene_cfg.get("goal_use_ground_contact")
+        if gc_val is not None:
+            use_ground_contact = bool(gc_val)
+        paths = scene_cfg.get("paths", default={})
+        droid_cfg = paths.get("droid_cfg")
+        if args.camera_intrinsic is None and droid_cfg and Path(droid_cfg).is_file():
+            camera_intrinsic = load_camera_intrinsic_from_droid_cfg(droid_cfg)
+            print(f"Camera intrinsics  : {droid_cfg}")
+    if args.no_body2optical:
+        apply_body2optical = False
+    elif args.body2optical:
+        apply_body2optical = True
+
+    use_ground_contact = resolve_goal_use_ground_contact(
+        apply_body2optical, use_ground_contact
+    )
 
     floor_cal = Path(args.floor_calibration) if args.floor_calibration else None
 
@@ -917,11 +1021,16 @@ if __name__ == "__main__":
         lerobot_out=Path(args.lerobot_out),
         scene_id=args.scene_id,
         fps=args.fps,
-        camera_intrinsic=load_camera_intrinsic(args.camera_intrinsic),
+        camera_intrinsic=camera_intrinsic,
         height_cm=args.height,
         pitch_horizon=args.pitch_horizon,
         pitch_lookdown=args.pitch_lookdown,
         overwrite=args.overwrite,
         floor_calibration=floor_cal,
         goal_lookahead_frames=args.goal_lookahead,
+        goal_lookahead_adaptive=not args.no_goal_lookahead_adaptive,
+        apply_body2optical=apply_body2optical,
+        camera_pitch_deg=camera_pitch_deg,
+        ground_offset_y=ground_offset_y,
+        use_ground_contact=use_ground_contact,
     )
