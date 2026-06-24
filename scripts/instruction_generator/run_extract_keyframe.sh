@@ -1,37 +1,67 @@
 #!/bin/bash
-# run_keyframe_extraction.sh
+# Config-driven keyframe extraction launcher.
 #
-# STEP 0 (once per scene, offline — can take several minutes on large PCD):
-#   python precompute_floor_trajectory.py \
-#     --pcd /path/to/scene.pcd \
-#     --camera_odom /path/to/odometry_camera.txt \
-#     --output_dir /path/to/scene_dir/
+# STEP 0 (once per scene, PCD-free SLAM path):
+#   python ../process_odom/project_slam_path.py --scene office_round1 --export-floor-trajectory ...
+#   # writes floor_trajectory.txt + floor_calibration.json
+#   # or if you only have floor_trajectory.txt:
+#   python ../process_odom/derive_floor_calibration.py --scene office_round1
 #
-# STEP 1 (live bag playback):
-#   ./run.sh <bag_path> <camera_odom.txt> <floor_trajectory.txt>
+# STEP 0 (PCD path):
+#   python ../process_odom/precompute_floor_trajectory.py --scene office_round1
 #
-# EXAMPLE:
-#   ./run.sh .../bkhn_round2 \
-#            .../odometry_bkhn_round2_point2plane.txt \
-#            .../floor_trajectory.txt
+# STEP 1:
+#   ./run_extract_keyframe.sh office_round1
 #
-# SHUTDOWN: Press Ctrl+B then S to gracefully stop keyframe_extractor.py
+# SHUTDOWN: Press Ctrl+B then S
+
+set -euo pipefail
 
 SESSION="keyframe"
-WORK_DIR="/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator"
-KEYFRAME_OUT="$WORK_DIR/keyframe_output"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPTS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORK_DIR="$SCRIPT_DIR"
 
-BAG_PATH="${1}"
-CAMERA_ODOM="${2}"
-FLOOR_TRAJ="${3}"
+SCENE="${1:-${VLN_SCENE:-}}"
+if [[ -z "$SCENE" || "$SCENE" == "--scene" ]]; then
+    if [[ "${1:-}" == "--scene" && -n "${2:-}" ]]; then
+        SCENE="$2"
+    else
+        echo "ERROR: scene name required."
+        echo ""
+        echo "USAGE: $0 <scene>"
+        echo "       $0 --scene <scene>"
+        echo "       VLN_SCENE=<scene> $0"
+        echo ""
+        echo "Example: $0 office_round1"
+        exit 1
+    fi
+fi
 
-if [[ -z "$BAG_PATH" || -z "$CAMERA_ODOM" || -z "$FLOOR_TRAJ" ]]; then
-    echo "ERROR: Missing arguments."
-    echo ""
-    echo "USAGE: $0 <bag_path> <camera_odom.txt> <floor_trajectory.txt>"
-    echo ""
-    echo "  Run precompute_floor_trajectory.py first to create floor_trajectory.txt"
-    echo "  and floor_calibration.json in the same directory as the trajectory."
+export PYTHONPATH="$SCRIPTS_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export VLN_SCENE="$SCENE"
+
+read_paths() {
+    python3 - <<PY
+from utils.config import load_config
+cfg = load_config("${SCENE}")
+paths = cfg.get("paths", default={})
+for key in ("bag", "camera_odom", "floor_trajectory", "output_dir"):
+  print(paths.get(key, ""))
+ros = cfg.get("ros", default={})
+print(ros.get("bag_play_rate", 5.0))
+PY
+}
+
+mapfile -t _CFG_LINES < <(read_paths)
+BAG_PATH="${_CFG_LINES[0]}"
+CAMERA_ODOM="${_CFG_LINES[1]}"
+FLOOR_TRAJ="${_CFG_LINES[2]}"
+KEYFRAME_OUT="${_CFG_LINES[3]}"
+BAG_RATE="${_CFG_LINES[4]}"
+
+if [[ -z "$BAG_PATH" || -z "$CAMERA_ODOM" || -z "$FLOOR_TRAJ" || -z "$KEYFRAME_OUT" ]]; then
+    echo "ERROR: scene config missing required paths (bag, camera_odom, floor_trajectory, output_dir)"
     exit 1
 fi
 
@@ -49,37 +79,62 @@ if [[ ! -f "$FLOOR_TRAJ" ]]; then
 fi
 
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")
-CONDA_INIT="source $CONDA_BASE/etc/profile.d/conda.sh && conda activate internnav"
+ROS_DISTRO="${ROS_DISTRO:-humble}"
+ROS_SETUP_ZSH="/opt/ros/${ROS_DISTRO}/setup.zsh"
+PANE_ENV="$WORK_DIR/keyframe_pane_env.zsh"
+TMUX_SHELL="$(command -v zsh || command -v bash)"
 
-mkdir -p "$KEYFRAME_OUT"
-FLOOR_CAL="$(dirname "$FLOOR_TRAJ")/floor_calibration.json"
-if [[ -f "$FLOOR_CAL" ]]; then
-    cp "$FLOOR_CAL" "$KEYFRAME_OUT/"
-    echo "  copied floor_calibration.json -> keyframe_output/"
+if [[ ! -f "$ROS_SETUP_ZSH" ]]; then
+    echo "ERROR: ROS setup not found: $ROS_SETUP_ZSH"
+    echo "       Install ROS 2 ${ROS_DISTRO} or set ROS_DISTRO to your distro."
+    exit 1
+fi
+if [[ ! -x "$PANE_ENV" ]]; then
+    chmod +x "$PANE_ENV"
 fi
 
+export CONDA_BASE ROS_DISTRO VLN_SCENE
+PANE_CMD="$PANE_ENV"
+
+mkdir -p "$KEYFRAME_OUT"
+FLOOR_CAL="$(dirname "$FLOOR_TRAJ")/$(python3 -c "from utils.config import load_config; print(load_config('${SCENE}').floor_calibration_filename())")"
+if [[ ! -f "$FLOOR_CAL" && -f "$FLOOR_TRAJ" ]]; then
+    echo "  deriving floor_calibration from floor_trajectory (no PCD) ..."
+    python3 "$SCRIPTS_ROOT/process_odom/derive_floor_calibration.py" \
+        --floor_trajectory "$FLOOR_TRAJ" \
+        --output_dir "$(dirname "$FLOOR_TRAJ")"
+fi
+if [[ -f "$FLOOR_CAL" ]]; then
+    cp "$FLOOR_CAL" "$KEYFRAME_OUT/"
+    echo "  copied $(basename "$FLOOR_CAL") -> $KEYFRAME_OUT/"
+fi
+cp "$FLOOR_TRAJ" "$KEYFRAME_OUT/" 2>/dev/null || true
+
 echo ""
+echo "  scene:        $SCENE"
 echo "  bag:          $BAG_PATH"
 echo "  camera odom:  $CAMERA_ODOM"
 echo "  floor traj:   $FLOOR_TRAJ"
+echo "  output_dir:   $KEYFRAME_OUT"
 echo ""
 
-tmux kill-session -t $SESSION 2>/dev/null
+tmux kill-session -t $SESSION 2>/dev/null || true
 sleep 0.5
 
 tmux new-session  -d -s $SESSION -x 220 -y 50
+tmux set-option -t $SESSION default-shell "$TMUX_SHELL"
 tmux split-window -v -t $SESSION:0.0
 tmux split-window -v -t $SESSION:0.1
 tmux select-layout -t $SESSION even-vertical
 
 tmux send-keys -t $SESSION:0.0 \
-  "$CONDA_INIT && ros2 bag play $BAG_PATH --rate 5" Enter
+  "$PANE_CMD ros2 bag play $BAG_PATH --rate $BAG_RATE" Enter
 
 tmux send-keys -t $SESSION:0.1 \
-  "$CONDA_INIT && cd $WORK_DIR && python3 trajectory_publishers.py floor --ros-args -p floor_trajectory_file:=$FLOOR_TRAJ" Enter
+  "$PANE_CMD python3 trajectory_publishers.py floor --ros-args -p floor_trajectory_file:=$FLOOR_TRAJ" Enter
 
 tmux send-keys -t $SESSION:0.2 \
-  "$CONDA_INIT && cd $WORK_DIR && python3 keyframe_extractor.py --ros-args -p camera_odom_file:=$CAMERA_ODOM -p output_dir:=$KEYFRAME_OUT" Enter
+  "$PANE_CMD python3 keyframe_extractor.py --ros-args -p camera_odom_file:=$CAMERA_ODOM -p output_dir:=$KEYFRAME_OUT" Enter
 
 tmux bind-key -T prefix S run-shell " \
   tmux send-keys -t $SESSION:0.2 C-c ; \
@@ -92,8 +147,8 @@ tmux select-pane -t $SESSION:0.2
 
 echo "=== tmux session '$SESSION' started ==="
 echo "  Pane 0 → ros2 bag play"
-  echo "  Pane 1 → trajectory_publishers.py floor (fast, no PCD)"
-  echo "  Pane 2 → keyframe_extractor.py"
+echo "  Pane 1 → trajectory_publishers.py floor"
+echo "  Pane 2 → keyframe_extractor.py"
 echo ""
 echo "  When done: Ctrl+B then S"
 echo ""
