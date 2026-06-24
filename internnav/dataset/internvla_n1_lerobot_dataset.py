@@ -74,7 +74,7 @@ R2R_125CM_0_30 = {
 }
 
 BKHN_125CM_0_30 = {
-    "data_path": "bkhn_ver2.0",
+    "data_path": "vr-office",
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,

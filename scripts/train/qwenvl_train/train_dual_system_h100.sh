@@ -67,7 +67,7 @@ total_gpus=$((NPROC_PER_NODE * NNODES))
 TARGET_EFFECTIVE_BATCH="${TARGET_EFFECTIVE_BATCH:-64}"
 
 # bkhn_125cm_0_30,bkhn_125cm_0_45,bkhn_60cm_15_15,bkhn_60cm_30_30
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%1}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%0}"
 DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
@@ -75,7 +75,7 @@ export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DAT
 
 vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30}"
 DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
-export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/bkhn_ver3.0}"
+export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/vr-office}"
 
 if [[ "${LOW_MEM:-False}" == "True" ]]; then
     _default_deepspeed="scripts/train/qwenvl_train/zero2.json"
@@ -164,7 +164,7 @@ print_gpu_preflight() {
 }
 
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-bkhn-ver3.0-v1}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-office-round1-v1}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -175,7 +175,7 @@ if [ -n "${MAX_STEPS:-}" ]; then
     report_to="none"
 else
     num_epochs="${NUM_TRAIN_EPOCHS:-3.0}"
-    save_steps=100
+    save_steps=5
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
@@ -240,8 +240,8 @@ fi
     --vln_dataset_use "${vln_datasets}" \
     --vln_dataset_custom "${vln_dataset_custom}" \
     --data_flatten False \
-    --tune_mm_vision False \
-    --tune_mm_mlp False \
+    --tune_mm_vision True \
+    --tune_mm_mlp True \
     --tune_mm_llm False \
     --bf16 \
     --num_history "${num_history}" \
