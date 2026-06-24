@@ -31,12 +31,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parents[1]
+_SCRIPTS_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_SCRIPT_DIR))
-sys.path.insert(0, str(_REPO_ROOT / "scripts" / "instruction_generator"))
+sys.path.insert(0, str(_SCRIPTS_ROOT))
 
-from floor_pose import load_floor_calibration  # noqa: E402
-from floor_pose import pose_floor_world_xyz  # noqa: E402
+from utils.floor_pose import (
+    load_floor_calibration,
+    resolve_floor_plane_for_keyframe_root,
+)  # noqa: E402
 from internvla_labels import (  # noqa: E402
     DEFAULT_LOOKAHEAD_FRAMES,
     INVALID_GOAL,
@@ -47,7 +49,11 @@ from internvla_labels import (  # noqa: E402
 )
 
 DEFAULT_INTRINSIC = np.array(
-    [[323.52050781, 0.0, 318.65130615], [0.0, 430.93546549, 247.24151611], [0.0, 0.0, 1.0]],
+    [
+        [323.52050781, 0.0, 318.65130615],
+        [0.0, 430.93546549, 247.24151611],
+        [0.0, 0.0, 1.0],
+    ],
     dtype=np.float64,
 )
 IMG_W, IMG_H = 640, 480
@@ -60,7 +66,9 @@ def load_poses_json(path: Path) -> Dict[int, Dict]:
 
 
 def get_episode_frame_range(episode_dir: Path) -> Tuple[int, int]:
-    kf_paths = sorted(episode_dir.glob("kf_*.jpg")) or sorted(episode_dir.glob("kf_*.png"))
+    kf_paths = sorted(episode_dir.glob("kf_*.jpg")) or sorted(
+        episode_dir.glob("kf_*.png")
+    )
     if not kf_paths:
         return 0, -1
     idxs = [int(p.stem.split("_")[-1]) for p in kf_paths]
@@ -147,6 +155,7 @@ def draw_floor_path_on_image(
     floor_plane: tuple,
     camera_intrinsic: np.ndarray,
     path_horizon: int = 120,
+    apply_body2optical: bool = True,
 ) -> np.ndarray:
     """Overlay projected on-floor trajectory segment (green) from current frame."""
     out = rgb.copy()
@@ -160,7 +169,7 @@ def draw_floor_path_on_image(
     for f in range(local_i, end):
         tgt = pose_floor_world_xyz(poses[f], floor_plane)
         goal, ok = project_world_point_with_camera(
-            cam_i, tgt, camera_intrinsic, w, h
+            cam_i, tgt, camera_intrinsic, w, h, apply_body2optical=apply_body2optical
         )
         if ok:
             pts.append((int(goal[0]), int(goal[1]), f))
@@ -197,11 +206,22 @@ def draw_goal_on_image(
     poses: Optional[List[Dict]] = None,
     floor_plane: Optional[tuple] = None,
     camera_intrinsic: Optional[np.ndarray] = None,
+    apply_body2optical: bool = True,
 ) -> np.ndarray:
     out = rgb.copy()
-    if draw_path and poses is not None and floor_plane is not None and camera_intrinsic is not None:
+    if (
+        draw_path
+        and poses is not None
+        and floor_plane is not None
+        and camera_intrinsic is not None
+    ):
         out = draw_floor_path_on_image(
-            out, poses, frame_idx, floor_plane, camera_intrinsic
+            out,
+            poses,
+            frame_idx,
+            floor_plane,
+            camera_intrinsic,
+            apply_body2optical=apply_body2optical,
         )
 
     h, w = out.shape[:2]
@@ -292,7 +312,11 @@ def load_parquet_goals(
     out: Dict[int, Tuple[int, int, int]] = {}
     for i in range(len(df)):
         g = df[goal_col].iloc[i]
-        rel = int(df[rel_col].iloc[i][0]) if hasattr(df[rel_col].iloc[i], "__len__") else int(df[rel_col].iloc[i])
+        rel = (
+            int(df[rel_col].iloc[i][0])
+            if hasattr(df[rel_col].iloc[i], "__len__")
+            else int(df[rel_col].iloc[i])
+        )
         out[i] = (int(g[0]), int(g[1]), rel)
     return out
 
@@ -352,7 +376,9 @@ def make_contact_sheet(images: List[np.ndarray], out_path: Path, cols: int = 4) 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize pixel goals on navigation frames.")
+    parser = argparse.ArgumentParser(
+        description="Visualize pixel goals on navigation frames."
+    )
     parser.add_argument(
         "--keyframe_root",
         type=str,
@@ -373,7 +399,9 @@ def main() -> None:
         default=30,
         help="Sample every N local frames for debug images",
     )
-    parser.add_argument("--max_frames", type=int, default=12, help="Max annotated frames to save")
+    parser.add_argument(
+        "--max_frames", type=int, default=12, help="Max annotated frames to save"
+    )
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument(
         "--draw_path",
@@ -386,7 +414,24 @@ def main() -> None:
         default=None,
         help="9 floats or JSON path; default matches rosbag2lerobot",
     )
+    body2optical_group = parser.add_mutually_exclusive_group()
+    body2optical_group.add_argument(
+        "--body2optical",
+        action="store_true",
+        help="Apply ROS body→OpenCV optical on camera_matrix (LiDAR odom)",
+    )
+    body2optical_group.add_argument(
+        "--no-body2optical",
+        action="store_true",
+        help="Skip body→optical transform (SLAM/DROID optical odom)",
+    )
     args = parser.parse_args()
+
+    apply_body2optical = True
+    if args.no_body2optical:
+        apply_body2optical = False
+    elif args.body2optical:
+        apply_body2optical = True
 
     keyframe_root = Path(args.keyframe_root)
     lerobot_root = Path(args.lerobot_root) if args.lerobot_root else None
@@ -394,15 +439,23 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     poses_by_idx = load_poses_json(keyframe_root / "poses.json")
-    cal = load_floor_calibration(keyframe_root / "floor_calibration.json")
-    floor_plane = cal["floor_plane"]
+    floor_plane = resolve_floor_plane_for_keyframe_root(
+        keyframe_root, derive_if_missing=True
+    )
+    if floor_plane is None:
+        raise FileNotFoundError(
+            f"No floor plane in {keyframe_root}; add floor_calibration.json or floor_trajectory.txt"
+        )
 
     if args.camera_intrinsic:
         p = Path(args.camera_intrinsic)
         if p.suffix == ".json":
             K = np.array(json.loads(p.read_text()), dtype=np.float64).reshape(3, 3)
         else:
-            K = np.array([float(x) for x in args.camera_intrinsic.replace(",", " ").split()], dtype=np.float64).reshape(3, 3)
+            K = np.array(
+                [float(x) for x in args.camera_intrinsic.replace(",", " ").split()],
+                dtype=np.float64,
+            ).reshape(3, 3)
     else:
         K = DEFAULT_INTRINSIC.copy()
 
@@ -432,6 +485,7 @@ def main() -> None:
         IMG_H,
         primary=True,
         lookahead_frames=args.lookahead,
+        apply_body2optical=apply_body2optical,
     )
     parquet = load_parquet_goals(lerobot_root, args.episode_index)
 
@@ -466,6 +520,7 @@ def main() -> None:
             poses=poses,
             floor_plane=floor_plane,
             camera_intrinsic=K,
+            apply_body2optical=apply_body2optical,
         )
         out_path = out_dir / f"frame_{local_i:04d}_g{global_i}.jpg"
         cv2.imwrite(str(out_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
@@ -478,7 +533,11 @@ def main() -> None:
             "relative_goal_frame_id": int(rel_ids[local_i]),
             "projected_goal": goals[local_i].tolist(),
             "action": int(actions[local_i]),
-            "floor_xy_yaw_current": [poses[local_i]["x"], poses[local_i]["y"], poses[local_i]["yaw"]],
+            "floor_xy_yaw_current": [
+                poses[local_i]["x"],
+                poses[local_i]["y"],
+                poses[local_i]["yaw"],
+            ],
             "floor_xy_yaw_target": (
                 [
                     poses[local_i + rel]["x"],
