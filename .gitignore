@@ -162,7 +162,6 @@ internnav/training_comparison2
 internnav/compare_training_runs.py
 
 internnav/trainer/system1_metrics.py
-internnav/trainer/system2_metrics.py
 internnav/trainer/test_system2_metrics.py
 internnav/trainer/test_system1_metrics.py
 
