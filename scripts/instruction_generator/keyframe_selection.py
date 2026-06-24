@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 
 
@@ -63,22 +62,12 @@ def merge_close_keyframes(keyframes, window):
     return merged
 
 
-def get_frame_from_video(cap, frame_idx):
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ok, frame = cap.read()
-    if not ok:
-        return None
-    return frame
-
-
 def extract_keyframes(poses, config: KeyframeConfig):
     if len(poses) < 2:
         return []
 
     keyframes = []
-    keyframes.append(
-        KeyframeResult(frame_idx=poses[0]["frame_idx"], reason="start", pose=poses[0])
-    )
+    keyframes.append(KeyframeResult(frame_idx=poses[0]["frame_idx"], reason="start", pose=poses[0]))
     last_kf_pose = poses[0]
 
     delta_yaws = [0.0]
@@ -129,9 +118,7 @@ def extract_keyframes(poses, config: KeyframeConfig):
                 f"dist={dist:.2f} dyaw={delta_yaws[i]:.1f} accum={accum:.1f}"
             )
 
-    keyframes.append(
-        KeyframeResult(frame_idx=poses[-1]["frame_idx"], reason="end", pose=poses[-1])
-    )
+    keyframes.append(KeyframeResult(frame_idx=poses[-1]["frame_idx"], reason="end", pose=poses[-1]))
     keyframes = merge_close_keyframes(keyframes, config.merge_window_frames)
     print(f"[KF] Total keyframes after merge: {len(keyframes)}")
 
