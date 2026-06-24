@@ -1,0 +1,63 @@
+# Override with env VLN_DATA_ROOT on other machines.
+data_root: /home/lenguyen1/hoangpqn/vln/DATA
+
+# LiDAR / legacy odom is ROS body frame; SLAM (DROID-W) is already OpenCV optical.
+odom_apply_body2optical: true
+
+filenames:
+  floor_trajectory: floor_trajectory.txt
+  floor_calibration: floor_calibration.json
+
+robot:
+  camera_to_base_translation: [0.1067, 0.0, 0.77566]
+  camera_pitch_rad: 0.0
+  r_body2optical:
+    - [0.0, -1.0, 0.0, 0.0]
+    - [0.0, 0.0, -1.0, 0.0]
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+
+ros:
+  rgb_topic: /camera/camera/color/image_raw/compressed
+  depth_topic: /camera/camera/aligned_depth_to_color/image_raw/compressedDepth
+  odom_matched_topic: /odom_txt/matched
+  frame_id: map
+  child_frame_id: base_link
+  max_time_diff: 0.05
+  sync_slop_sec: 0.05
+  offline_match_max_dt: 0.5
+  bag_play_rate: 5.0
+
+keyframe:
+  sharp_turn_thresh_deg: 10.0
+  curvature_thresh_deg: 10.0
+  curvature_window: 10
+  max_dist_between_keyframes: 0.8
+  min_dist_between_keyframes: 0.3
+  merge_window_frames: 2
+  keyframes_per_episode: 10
+  record_fps: 15
+
+depth:
+  compressed_header_size: 12
+  vis_scale: 10000.0
+
+camera:
+  native_rgb_width: 640
+  native_rgb_height: 480
+
+slam_path:
+  camera_pitch_deg: 30.0
+  ground_offset_y: 1.5
+  lookahead_m: 10.0
+  lookahead_s: 10.0
+  smooth_window: 5
+  floor_smooth_window: 5
+  floor_smooth_s: 1.0
+  smooth: moving_average
+
+precompute:
+  voxel_size: 0.1
+  smooth: moving_average
+  smooth_window: 5
+  smooth_s: 1.0
