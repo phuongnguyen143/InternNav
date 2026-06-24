@@ -122,7 +122,7 @@ SCALEVLN_60CM_30_30 = {
     "pitch_2": 30,
 }
 BKHN = {
-    "data_path": "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/lerobot_data_2",
+    "data_path": "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/bkhn_ver2.0",
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
