@@ -22,23 +22,20 @@ Keyframe Extraction  →  Subclip Division  →  Instruction Generation  →  Su
 ## Repository Structure
 
 ```
-scripts/instruction_generator/
-├── constants.py                  # Shared filenames, ROS topics, robot extrinsics
-├── geometry_utils.py             # Vendored floor-estimation helpers (from GaussTrace)
-├── floor_estimator.py            # Vendored FloorEstimator (local, no GaussTrace import)
-├── floor_pose.py                 # Floor plane math, calibration, cam2base projection
-├── trajectory_io.py              # Camera/floor trajectory txt parse + timestamp matching
-├── trajectory_publishers.py      # ROS2 publishers (floor + camera odom txt)
-├── keyframe_selection.py         # KeyframeConfig and extract_keyframes()
-├── depth_codec.py                # RealSense compressedDepth decode + uint16 mm PNG I/O
-├── keyframe_extractor.py         # Stage 1 — ROS2 node for keyframe extraction
-├── precompute_floor_trajectory.py  # Offline floor plane + floor_trajectory.txt
-├── generate_instruction.py       # Stage 2+3 — instruction generation (LLaVA)
-├── summarize_instructions.py     # Stage 4 — long-horizon summarization (Qwen2-72B)
-├── prompts.py                    # LLM prompt templates
-└── run.sh                        # tmux launcher for bag playback
+scripts/
+├── utils/                        # Shared library (config, trajectory_io, floor_pose, …)
+│   └── configs/scenes/office_round1.yaml
+├── instruction_generator/
+│   ├── frame_utils.py            # RGB/depth decode, mp4 helpers
+│   ├── keyframe_extractor.py
+│   ├── run_extract_keyframe.sh   # ./run_extract_keyframe.sh office_round1
+│   └── …
+└── process_odom/
+    ├── precompute_floor_trajectory.py
+    ├── project_slam_path.py
+    └── mapping/
 
-keyframe_output/
+keyframe output (example: DATA/process_keyframe/office_round1/)
 ├── all_frames/                 # All raw frames saved during recording
 ├── keyframes/                  # Labelled keyframe images
 ├── keyframes.json              # Keyframe metadata (position, yaw, timestamp)
@@ -109,11 +106,14 @@ Floor estimation is **offline** (slow on large PCDs). Do not run it inside ROS n
 #### Step 0 — Precompute (once per scene)
 
 ```bash
-python precompute_floor_trajectory.py \
-  --pcd /path/to/scene.pcd \
-  --camera_odom /path/to/odometry_camera.txt \
-  --output_dir /path/to/scene_dir/ \
-  --smooth moving_average --smooth_window 5
+cd scripts/process_odom
+export PYTHONPATH="$(cd .. && pwd):$PYTHONPATH"
+
+# PCD-based floor (slow):
+python precompute_floor_trajectory.py --scene office_round1
+
+# Or odometry-only export (no PCD):
+python project_slam_path.py --scene office_round1 --export-floor-trajectory
 ```
 
 Writes `floor_calibration.json` and `floor_trajectory.txt`.
@@ -156,8 +156,28 @@ Requires `open3d` in the `internnav` conda environment.
 #### Step 1 — Live bag + keyframes
 
 ```bash
-./run.sh <bag_path> <camera_odom.txt> <floor_trajectory.txt>
+cd scripts/instruction_generator
+export PYTHONPATH="$(cd .. && pwd):$PYTHONPATH"
+./run_extract_keyframe.sh office_round1
 ```
+
+**Alternative — offline frame extraction (no live ROS playback):**
+
+```bash
+source /opt/ros/humble/setup.bash
+conda activate internnav
+cd scripts/instruction_generator
+
+python extract_bag_frames.py /path/to/bkhn_round2 \
+  --output-dir ./keyframe_output_offline \
+  --storage-id mcap \
+  --write-depth-preview
+```
+
+Writes `tmp/rgb_full.mp4`, `tmp/depth_frames/frame_*.png`, and `frames.json`.
+Run keyframe finalize / pose merge separately, or continue with the live tmux flow below.
+
+Live tmux flow:
 
 - Pane 1: `trajectory_publishers.py floor` (loads txt only, no PCD at startup)
 - Pane 2: `keyframe_extractor.py` merges camera odom and floor trajectory at `finalize()` into `poses.json`
@@ -192,16 +212,17 @@ python ../dataset_converters/rosbag2lerobot.py \
 - `goal.125cm_30deg` ← project `world_x/y/z` at frame `i + lookahead` into image `i` (640×480)
 - `relative_goal_frame_id.125cm_30deg` ← fixed lookahead (e.g. 200) or `-1`
 
-**Tuning keyframe density** (edit `KeyframeConfig` in `keyframe_selection.py`; episode size in `constants.py`):
+**Tuning keyframe density** (edit `utils/configs/base.yaml` under `keyframe`, or override in a scene yaml):
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `sharp_turn_thresh_deg` | 25.0 | Lower = more keyframes on turns |
-| `curvature_thresh_deg` | 25.0 | Lower = more keyframes on curves |
-| `max_dist_between_keyframes` | 6.0 m | Lower = denser keyframes |
-| `min_dist_between_keyframes` | 3.0 m | Higher = fewer keyframes |
-| `DEFAULT_KEYFRAMES_PER_EPISODE` | 10 | Keyframes per episode (~11 with shared boundary) |
-| `merge_window_frames` | 10 | Higher = fewer keyframes after merge |
+| `keyframe.sharp_turn_thresh_deg` | 25.0 | Lower = more keyframes on turns |
+| `keyframe.curvature_thresh_deg` | 25.0 | Lower = more keyframes on curves |
+| `keyframe.max_dist_between_keyframes` | 6.0 m | Lower = denser keyframes |
+| `keyframe.min_dist_between_keyframes` | 3.0 m | Higher = fewer keyframes |
+| `keyframe.keyframes_per_episode` | 10 | Keyframes per episode (~11 with shared boundary) |
+
+`merge_window_frames` remains in `keyframe_selection.py` (`KeyframeConfig`).
 
 Re-running keyframe extraction clears stale `kf_*.jpg` and episode videos in each `episode_XXXX/` folder automatically.
 
