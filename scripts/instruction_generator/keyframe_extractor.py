@@ -3,44 +3,36 @@ import shutil
 from pathlib import Path
 
 import cv2
-import numpy as np
 import matplotlib.pyplot as plt
-
+import numpy as np
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile
-from rclpy.qos import ReliabilityPolicy
-from rclpy.qos import HistoryPolicy
-from rclpy.qos import qos_profile_sensor_data
-
-from scipy.spatial.transform import Rotation
-
-from sensor_msgs.msg import CompressedImage
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry
-from message_filters import Subscriber
-from message_filters import ApproximateTimeSynchronizer
-from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from scipy.spatial.transform import Rotation
+from sensor_msgs.msg import CompressedImage
 
-from constants import (
-    DEFAULT_DEPTH_TOPIC,
-    DEFAULT_DEPTH_VIS_SCALE,
-    DEFAULT_KEYFRAMES_PER_EPISODE,
-    DEFAULT_ODOM_MATCHED_TOPIC,
-    DEFAULT_OFFLINE_MATCH_MAX_DT,
-    DEFAULT_RECORD_FPS,
-    DEFAULT_RGB_TOPIC,
-    DEFAULT_SYNC_SLOP_SEC,
-    FLOOR_CALIBRATION_FILENAME,
-    FLOOR_TRAJECTORY_FILENAME,
-)
-from floor_pose import (
+from utils.config import get_config
+from utils.floor_pose import (
+    derive_floor_calibration_from_trajectory,
     floor_2d_pose_to_action_matrix,
     floor_xy_to_world_on_plane,
     load_floor_calibration,
 )
-from depth_codec import decode_compressed_depth, save_depth_png_mm
-from keyframe_selection import KeyframeConfig, extract_keyframes, get_frame_from_video
-from trajectory_io import FloorMatcher, OdomMatcher, parse_floor_trajectory_txt, parse_odom_txt
+from utils.depth_codec import decode_compressed_depth
+from keyframe_selection import KeyframeConfig, extract_keyframes
+from utils.trajectory_io import FloorMatcher, OdomMatcher, parse_floor_trajectory_txt, parse_odom_txt
+from frame_utils import (
+    align_depth_to_rgb,
+    copy_depth_frame_range,
+    decode_rgb_compressed,
+    depth_m_to_preview_bgr,
+    get_frame_from_video,
+    open_mp4_writer,
+    ros_stamp_to_sec,
+    save_depth_frame_mm,
+)
 
 
 def _clear_episode_dir(episode_dir: Path) -> None:
@@ -57,17 +49,19 @@ class KeyframeExtractor(Node):
     def __init__(self):
         super().__init__("keyframe_extractor")
 
-        self.bridge = CvBridge()
         self.frame_idx = 0
         self.frame_metadata = []
         self.rgb_writer = None
         self.depth_writer = None
-        self.fps = DEFAULT_RECORD_FPS
+        cfg = get_config()
+        ros = cfg.ros
+        keyframe_cfg = cfg.keyframe
 
-        self.declare_parameter("rgb_topic", DEFAULT_RGB_TOPIC)
-        self.declare_parameter("odom_topic", DEFAULT_ODOM_MATCHED_TOPIC)
-        # Depth arrives as CompressedImage (compressedDepth transport).
-        self.declare_parameter("depth_topic", DEFAULT_DEPTH_TOPIC)
+        self.fps = float(keyframe_cfg.get("record_fps", 10.0))
+
+        self.declare_parameter("rgb_topic", ros.get("rgb_topic"))
+        self.declare_parameter("odom_topic", ros.get("odom_matched_topic"))
+        self.declare_parameter("depth_topic", ros.get("depth_topic"))
         self.declare_parameter("output_dir", "./keyframe_output")
         self.declare_parameter("camera_odom_file", "")
 
@@ -80,16 +74,7 @@ class KeyframeExtractor(Node):
 
         self.floor_plane = None
         self.pose_frame = "floor"
-        cal_path = self.output_dir / FLOOR_CALIBRATION_FILENAME
-        if cal_path.exists():
-            cal = load_floor_calibration(cal_path)
-            self.floor_plane = cal["floor_plane"]
-            self.get_logger().info(f"Loaded floor calibration from {cal_path}")
-        else:
-            self.get_logger().info(
-                "No floor_calibration.json in output_dir; action_matrix "
-                "will be built at finalize if calibration is added."
-            )
+        self._load_floor_plane()
 
         self.tmp_dir = self.output_dir / "tmp"
         self.tmp_dir.mkdir(exist_ok=True)
@@ -100,10 +85,18 @@ class KeyframeExtractor(Node):
 
         self.kf_dir = self.output_dir / "keyframes"
         self.kf_dir.mkdir(exist_ok=True)
-        self.keyframes_per_episode = DEFAULT_KEYFRAMES_PER_EPISODE
+        self.keyframes_per_episode = int(keyframe_cfg.get("keyframes_per_episode", 10))
 
         self.poses = []
-        self.config = KeyframeConfig()
+        kf = keyframe_cfg
+        self.config = KeyframeConfig(
+            sharp_turn_thresh_deg=float(kf.get("sharp_turn_thresh_deg", 25.0)),
+            curvature_thresh_deg=float(kf.get("curvature_thresh_deg", 25.0)),
+            curvature_window=int(kf.get("curvature_window", 10)),
+            max_dist_between_keyframes=float(kf.get("max_dist_between_keyframes", 6.0)),
+            min_dist_between_keyframes=float(kf.get("min_dist_between_keyframes", 3.0)),
+            merge_window_frames=int(kf.get("merge_window_frames", 5)),
+        )
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -134,10 +127,35 @@ class KeyframeExtractor(Node):
         self.sync = ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub, self.odom_sub],
             queue_size=20,
-            slop=DEFAULT_SYNC_SLOP_SEC,
+            slop=float(ros.get("sync_slop_sec", 0.05)),
         )
 
         self.sync.registerCallback(self.synced_callback)
+
+    def _load_floor_plane(self) -> None:
+        cfg = get_config()
+        cal_path = self.output_dir / cfg.floor_calibration_filename()
+        if cal_path.exists():
+            self.floor_plane = load_floor_calibration(cal_path)["floor_plane"]
+            self.get_logger().info(f"Loaded floor calibration from {cal_path}")
+            return
+
+        traj_path = self.output_dir / cfg.floor_trajectory_filename()
+        if traj_path.is_file():
+            try:
+                derived = derive_floor_calibration_from_trajectory(traj_path, self.output_dir)
+                self.floor_plane = load_floor_calibration(derived)["floor_plane"]
+                self.get_logger().info(
+                    f"Derived floor calibration from {traj_path} -> {derived}"
+                )
+                return
+            except (ValueError, OSError) as exc:
+                self.get_logger().warn(f"Could not derive floor plane from {traj_path}: {exc}")
+
+        self.get_logger().info(
+            "No floor calibration; place floor_calibration.json or floor_trajectory.txt "
+            "with world_x/y/z in output_dir before finalize."
+        )
 
     @staticmethod
     def _decode_compressed_depth(depth_msg: CompressedImage):
@@ -164,15 +182,15 @@ class KeyframeExtractor(Node):
 
     def _merge_camera_and_action_poses(self) -> None:
         """Attach camera_matrix (pose) and action_matrix (embodiment on floor)."""
+        cfg = get_config()
+        ros = cfg.ros
         if self.floor_plane is None:
-            cal_path = self.output_dir / FLOOR_CALIBRATION_FILENAME
-            if cal_path.exists():
-                self.floor_plane = load_floor_calibration(cal_path)["floor_plane"]
+            self._load_floor_plane()
 
         camera_matcher = None
         if self.camera_odom_file and Path(self.camera_odom_file).is_file():
             camera_entries = parse_odom_txt(self.camera_odom_file)
-            camera_matcher = OdomMatcher(camera_entries, max_dt=DEFAULT_OFFLINE_MATCH_MAX_DT)
+            camera_matcher = OdomMatcher(camera_entries, max_dt=float(ros.get("offline_match_max_dt", 0.5)))
             self.get_logger().info(
                 f"Merging camera odom from {self.camera_odom_file} " f"({len(camera_entries)} entries)"
             )
@@ -180,13 +198,11 @@ class KeyframeExtractor(Node):
             self.get_logger().warn("camera_odom_file not set; poses.json will lack camera_matrix.")
 
         floor_matcher = None
-        floor_traj_path = self.output_dir / FLOOR_TRAJECTORY_FILENAME
+        floor_traj_path = self.output_dir / get_config().floor_trajectory_filename()
         if floor_traj_path.is_file():
             floor_entries = parse_floor_trajectory_txt(floor_traj_path)
-            floor_matcher = FloorMatcher(floor_entries, max_dt=DEFAULT_OFFLINE_MATCH_MAX_DT)
-            self.get_logger().info(
-                f"Merging floor world xyz from {floor_traj_path} ({len(floor_entries)} entries)"
-            )
+            floor_matcher = FloorMatcher(floor_entries, max_dt=float(get_config().ros.get("offline_match_max_dt", 0.5)))
+            self.get_logger().info(f"Merging floor world xyz from {floor_traj_path} ({len(floor_entries)} entries)")
 
         merged = 0
         for pose in self.poses:
@@ -206,12 +222,7 @@ class KeyframeExtractor(Node):
                 if floor_matcher is not None:
                     floor_entry = floor_matcher.find_closest(ts)
                     if floor_entry is not None:
-                        if (
-                            abs(floor_entry.world_x)
-                            + abs(floor_entry.world_y)
-                            + abs(floor_entry.world_z)
-                            > 1e-9
-                        ):
+                        if abs(floor_entry.world_x) + abs(floor_entry.world_y) + abs(floor_entry.world_z) > 1e-9:
                             world_xyz = np.array(
                                 [floor_entry.world_x, floor_entry.world_y, floor_entry.world_z],
                                 dtype=np.float64,
@@ -222,9 +233,7 @@ class KeyframeExtractor(Node):
                         pose["z"] = float(floor_entry.z)
 
                 if world_xyz is None:
-                    world_xyz = floor_xy_to_world_on_plane(
-                        pose["x"], pose["y"], self.floor_plane
-                    )
+                    world_xyz = floor_xy_to_world_on_plane(pose["x"], pose["y"], self.floor_plane)
 
                 pose["world_x"] = float(world_xyz[0])
                 pose["world_y"] = float(world_xyz[1])
@@ -250,8 +259,7 @@ class KeyframeExtractor(Node):
         depth_msg: CompressedImage,
         odom_msg: Odometry,
     ):
-        np_arr = np.frombuffer(rgb_msg.data, np.uint8)
-        rgb = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        rgb = decode_rgb_compressed(bytes(rgb_msg.data))
         if rgb is None:
             self.get_logger().warn("Failed to decode RGB image.")
             return
@@ -263,31 +271,17 @@ class KeyframeExtractor(Node):
 
         if self.rgb_writer is None:
             h, w = rgb.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-            self.rgb_writer = cv2.VideoWriter(str(self.tmp_rgb_video), fourcc, self.fps, (w, h))
-            self.depth_writer = cv2.VideoWriter(str(self.tmp_depth_video), fourcc, self.fps, (w, h))
-
-            if not self.rgb_writer.isOpened():
-                raise RuntimeError(f"Cannot open RGB writer: {self.tmp_rgb_video}")
-            if not self.depth_writer.isOpened():
-                raise RuntimeError(f"Cannot open Depth writer: {self.tmp_depth_video}")
-
+            self.rgb_writer = open_mp4_writer(self.tmp_rgb_video, self.fps, (w, h))
+            self.depth_writer = open_mp4_writer(self.tmp_depth_video, self.fps, (w, h))
             self.get_logger().info(f"Video writers initialized ({w}x{h})")
 
         self.rgb_writer.write(rgb)
 
-        h, w = rgb.shape[:2]
-        if depth.shape[0] != h or depth.shape[1] != w:
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        depth = align_depth_to_rgb(depth, rgb)
+        save_depth_frame_mm(self.tmp_depth_frames_dir / f"frame_{self.frame_idx:06d}.png", depth)
+        self.depth_writer.write(depth_m_to_preview_bgr(depth))
 
-        save_depth_png_mm(self.tmp_depth_frames_dir / f"frame_{self.frame_idx:06d}.png", depth)
-
-        depth_vis = cv2.convertScaleAbs(depth, alpha=255.0 / DEFAULT_DEPTH_VIS_SCALE)
-        depth_vis = cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)
-        self.depth_writer.write(depth_vis)
-
-        timestamp = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+        timestamp = ros_stamp_to_sec(rgb_msg.header.stamp)
         pose = self._odom_to_pose(odom_msg, self.frame_idx, timestamp)
         self.poses.append(pose)
         self.frame_metadata.append(
@@ -335,7 +329,6 @@ class KeyframeExtractor(Node):
 
         width = int(rgb_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(rgb_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
         for episode_start_idx in range(0, len(keyframes) - 1, self.keyframes_per_episode):
             episode_id = episode_start_idx // self.keyframes_per_episode
@@ -355,7 +348,7 @@ class KeyframeExtractor(Node):
 
             self.get_logger().info(f"Creating episode {episode_id} frames [{start_frame}, {end_frame}]")
 
-            rgb_writer = cv2.VideoWriter(str(episode_dir / "rgb.mp4"), fourcc, self.fps, (width, height))
+            rgb_writer = open_mp4_writer(episode_dir / "rgb.mp4", self.fps, (width, height))
             episode_depth_dir = episode_dir / "depth_frames"
             episode_depth_dir.mkdir(exist_ok=True)
 
@@ -367,14 +360,10 @@ class KeyframeExtractor(Node):
                 if not ok_rgb:
                     break
                 rgb_writer.write(rgb_frame)
-
-                src_depth = self.tmp_depth_frames_dir / f"frame_{current:06d}.png"
-                if not src_depth.exists():
-                    raise RuntimeError(f"Missing depth frame: {src_depth}")
-                shutil.copy2(src_depth, episode_depth_dir / f"frame_{current:06d}.png")
                 current += 1
 
             rgb_writer.release()
+            copy_depth_frame_range(self.tmp_depth_frames_dir, episode_depth_dir, start_frame, end_frame)
 
             for local_idx, kf in enumerate(episode_keyframes):
                 frame = get_frame_from_video(rgb_cap, kf.frame_idx)
@@ -473,4 +462,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Finalize error: {e}")
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
