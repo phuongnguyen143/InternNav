@@ -16,14 +16,9 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 
-from constants import (
-    DEFAULT_CHILD_FRAME_ID,
-    DEFAULT_FRAME_ID,
-    DEFAULT_MAX_TIME_DIFF,
-    DEFAULT_RGB_TOPIC,
-)
-from floor_pose import floor_xyyaw_to_quaternion
-from trajectory_io import (
+from utils.config import get_config
+from utils.floor_pose import floor_xyyaw_to_quaternion
+from utils.trajectory_io import (
     FloorEntry,
     FloorMatcher,
     OdomEntry,
@@ -31,10 +26,11 @@ from trajectory_io import (
     parse_floor_trajectory_txt,
     parse_odom_txt,
 )
+from frame_utils import ros_stamp_to_sec
 
 
 def rgb_msg_timestamp(rgb_msg: CompressedImage) -> float:
-    return rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec * 1e-9
+    return ros_stamp_to_sec(rgb_msg.header.stamp)
 
 
 def make_qos_best_effort(depth: int = 10) -> QoSProfile:
@@ -47,28 +43,29 @@ def make_qos_best_effort(depth: int = 10) -> QoSProfile:
 
 class OdomTxtPublisher(Node):
     def __init__(self):
-        super().__init__('odom_txt_publisher')
+        super().__init__("odom_txt_publisher")
+        ros = get_config().ros
 
-        self.declare_parameter('odom_file', '')
-        self.declare_parameter('frame_id', DEFAULT_FRAME_ID)
-        self.declare_parameter('child_frame_id', DEFAULT_CHILD_FRAME_ID)
-        self.declare_parameter('publish_rate_hz', 10.0)
-        self.declare_parameter('max_time_diff', DEFAULT_MAX_TIME_DIFF)
-        self.declare_parameter('enable_timer_playback', False)
-        self.declare_parameter('timer_loop', False)
-        self.declare_parameter('rgb_topic', DEFAULT_RGB_TOPIC)
-        odom_file = self.get_parameter('odom_file').value
-        self.frame_id = self.get_parameter('frame_id').value
-        self.child_frame_id = self.get_parameter('child_frame_id').value
-        publish_rate = self.get_parameter('publish_rate_hz').value
-        max_dt = self.get_parameter('max_time_diff').value
-        self.enable_timer = self.get_parameter('enable_timer_playback').value
-        self.timer_loop = self.get_parameter('timer_loop').value
-        rgb_topic = self.get_parameter('rgb_topic').value
+        self.declare_parameter("odom_file", "")
+        self.declare_parameter("frame_id", ros.get("frame_id"))
+        self.declare_parameter("child_frame_id", ros.get("child_frame_id"))
+        self.declare_parameter("publish_rate_hz", 10.0)
+        self.declare_parameter("max_time_diff", ros.get("max_time_diff"))
+        self.declare_parameter("enable_timer_playback", False)
+        self.declare_parameter("timer_loop", False)
+        self.declare_parameter("rgb_topic", ros.get("rgb_topic"))
+        odom_file = self.get_parameter("odom_file").value
+        self.frame_id = self.get_parameter("frame_id").value
+        self.child_frame_id = self.get_parameter("child_frame_id").value
+        publish_rate = self.get_parameter("publish_rate_hz").value
+        max_dt = self.get_parameter("max_time_diff").value
+        self.enable_timer = self.get_parameter("enable_timer_playback").value
+        self.timer_loop = self.get_parameter("timer_loop").value
+        rgb_topic = self.get_parameter("rgb_topic").value
 
         if not odom_file:
-            self.get_logger().error('odom_file parameter is required!')
-            raise RuntimeError('odom_file not set')
+            self.get_logger().error("odom_file parameter is required!")
+            raise RuntimeError("odom_file not set")
 
         self.entries = parse_odom_txt(odom_file)
         self.matcher = OdomMatcher(self.entries, max_dt=max_dt)
@@ -77,30 +74,30 @@ class OdomTxtPublisher(Node):
 
         qos = make_qos_best_effort()
 
-        self.odom_pub = self.create_publisher(Odometry, '/odom_txt/odometry', 10)
-        self.path_pub = self.create_publisher(PathMsg, '/odom_txt/path', 10)
-        self.matched_pub = self.create_publisher(Odometry, '/odom_txt/matched', 10)
-        self.xy_yaw_pub = self.create_publisher(Pose2D, '/odom_txt/xy_yaw', 10)
-        self.xy_yaw_timer_pub = self.create_publisher(Pose2D, '/odom_txt/xy_yaw_timer', 10)
+        self.odom_pub = self.create_publisher(Odometry, "/odom_txt/odometry", 10)
+        self.path_pub = self.create_publisher(PathMsg, "/odom_txt/path", 10)
+        self.matched_pub = self.create_publisher(Odometry, "/odom_txt/matched", 10)
+        self.xy_yaw_pub = self.create_publisher(Pose2D, "/odom_txt/xy_yaw", 10)
+        self.xy_yaw_timer_pub = self.create_publisher(Pose2D, "/odom_txt/xy_yaw_timer", 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.path_msg = self._build_path_msg()
 
         self.rgb_sub = self.create_subscription(CompressedImage, rgb_topic, self._rgb_callback, qos)
-        self.get_logger().info(f'Subscribed to RGB: {rgb_topic}')
+        self.get_logger().info(f"Subscribed to RGB: {rgb_topic}")
 
         self.timer = None
         if self.enable_timer:
             period = 1.0 / publish_rate
             self.timer = self.create_timer(period, self._timer_callback)
-            self.get_logger().info(f'Timer playback enabled at {publish_rate:.1f} Hz ' f'(loop={self.timer_loop})')
+            self.get_logger().info(f"Timer playback enabled at {publish_rate:.1f} Hz (loop={self.timer_loop})")
         else:
-            self.get_logger().info('Timer playback disabled; /odom_txt/xy_yaw is RGB-matched only')
+            self.get_logger().info("Timer playback disabled; /odom_txt/xy_yaw is RGB-matched only")
 
         self._matched_count = 0
         self._missed_count = 0
 
-        self.get_logger().info(f'OdomTxtPublisher ready. ' f'{len(self.entries)} entries loaded.')
+        self.get_logger().info(f"OdomTxtPublisher ready. {len(self.entries)} entries loaded.")
 
     def _build_path_msg(self) -> PathMsg:
         msg = PathMsg()
@@ -140,13 +137,13 @@ class OdomTxtPublisher(Node):
         t.header.stamp = stamp
         t.header.frame_id = self.frame_id
         t.child_frame_id = self.child_frame_id
-        t.transform.translation.x = x
-        t.transform.translation.y = y
-        t.transform.translation.z = z
-        t.transform.rotation.x = qx
-        t.transform.rotation.y = qy
-        t.transform.rotation.z = qz
-        t.transform.rotation.w = qw
+        t.transform.translation.x = entry.x
+        t.transform.translation.y = entry.y
+        t.transform.translation.z = entry.z
+        t.transform.rotation.x = entry.qx
+        t.transform.rotation.y = entry.qy
+        t.transform.rotation.z = entry.qz
+        t.transform.rotation.w = entry.qw
         self.tf_broadcaster.sendTransform(t)
 
     def _timer_callback(self):
@@ -181,7 +178,7 @@ class OdomTxtPublisher(Node):
         if matched is None:
             self._missed_count += 1
             if self._missed_count % 10 == 1:
-                self.get_logger().warn(f'No odom match for RGB ts={rgb_ts:.3f} ' f'(missed={self._missed_count})')
+                self.get_logger().warn(f"No odom match for RGB ts={rgb_ts:.3f} (missed={self._missed_count})")
             return
 
         self._matched_count += 1
@@ -198,13 +195,12 @@ class OdomTxtPublisher(Node):
 
         if self._matched_count % 50 == 1:
             self.get_logger().info(
-                f'[Match] rgb_ts={rgb_ts:.3f} | '
-                f'odom_ts={matched.timestamp:.3f} | '
-                f'dt={dt*1000:.1f}ms | '
-                f'pos=({matched.x:.2f}, {matched.y:.2f}) | '
-                f'yaw={math.degrees(matched.yaw):.1f}° | '
-                f'matched={self._matched_count} '
-                f'missed={self._missed_count}'
+                f"[Match] rgb_ts={rgb_ts:.3f} | "
+                f"odom_ts={matched.timestamp:.3f} | "
+                f"dt={dt * 1000:.1f}ms | "
+                f"pos=({matched.x:.2f}, {matched.y:.2f}) | "
+                f"yaw={math.degrees(matched.yaw):.1f}° | "
+                f"matched={self._matched_count} missed={self._missed_count}"
             )
 
     def _entry_to_xyyaw(self, entry: OdomEntry):
@@ -218,12 +214,13 @@ class OdomTxtPublisher(Node):
 class FloorTrajectoryPublisher(Node):
     def __init__(self):
         super().__init__("floor_trajectory_publisher")
+        ros = get_config().ros
 
         self.declare_parameter("floor_trajectory_file", "")
-        self.declare_parameter("frame_id", DEFAULT_FRAME_ID)
-        self.declare_parameter("child_frame_id", DEFAULT_CHILD_FRAME_ID)
-        self.declare_parameter("max_time_diff", DEFAULT_MAX_TIME_DIFF)
-        self.declare_parameter("rgb_topic", DEFAULT_RGB_TOPIC)
+        self.declare_parameter("frame_id", ros.get("frame_id"))
+        self.declare_parameter("child_frame_id", ros.get("child_frame_id"))
+        self.declare_parameter("max_time_diff", ros.get("max_time_diff"))
+        self.declare_parameter("rgb_topic", ros.get("rgb_topic"))
 
         floor_file = self.get_parameter("floor_trajectory_file").value
         self.frame_id = self.get_parameter("frame_id").value
@@ -250,9 +247,7 @@ class FloorTrajectoryPublisher(Node):
 
         self.rgb_sub = self.create_subscription(CompressedImage, rgb_topic, self._rgb_callback, qos)
 
-        self.get_logger().info(
-            f"FloorTrajectoryPublisher ready: {len(self.entries)} entries, " f"no PCD estimation at startup."
-        )
+        self.get_logger().info(f"FloorTrajectoryPublisher ready: {len(self.entries)} entries.")
 
     @staticmethod
     def _entry_to_xyyaw(entry: FloorEntry) -> Pose2D:
@@ -320,24 +315,28 @@ class FloorTrajectoryPublisher(Node):
 
 def main_floor():
     rclpy.init()
+    node = FloorTrajectoryPublisher()
     try:
-        node = FloorTrajectoryPublisher()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        rclpy.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main_camera():
     rclpy.init()
+    node = OdomTxtPublisher()
     try:
-        node = OdomTxtPublisher()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        rclpy.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
