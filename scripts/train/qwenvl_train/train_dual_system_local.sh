@@ -5,7 +5,7 @@ set -euo pipefail
 # Local torchrun launcher for train_dual_system.sh.
  
 RUN_NAME="InternVLA-N1-DualVLN"
-OUTPUT_DIR="checkpoints/InternVLA-N1-DualVLN-local-v2"
+OUTPUT_DIR="checkpoints/InternVLA-N1-DualVLN-local-v3-wnavdp"
 GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"
 NUM_GPUS=""
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
@@ -225,7 +225,7 @@ TRAIN_ARGS=(
     --vln_dataset_use "${VLN_DATASETS}"
     --data_flatten False
     --tune_mm_vision False
-    --tune_mm_mlp True
+    --tune_mm_mlp False
     --tune_mm_llm False
     --bf16
     --num_history 8
