@@ -1,0 +1,22 @@
+scene: office_round1
+
+# DROID-W odometry_camera.txt is already OpenCV optical (no body→optical).
+odom_apply_body2optical: false
+
+# Pitch+offset ground contact under optical camera (not nav-base floor_trajectory xyz).
+goal_use_ground_contact: true
+
+# office_round1 bag uses rs1 RealSense topics (not /camera/camera/...)
+ros:
+  rgb_topic: /rs1/rs1/color/image_raw/compressed
+  depth_topic: /rs1/rs1/depth/image_rect_raw/compressedDepth
+
+paths:
+  bag: ${data_root}/raw_rosbag/office_round1
+  camera_odom: ${data_root}/process_SLAM/office_round1/office/traj/odometry_camera.txt
+  floor_trajectory: ${data_root}/process_SLAM/office_round1/office/traj_nav_test/floor_trajectory.txt
+  output_dir: ${data_root}/process_keyframe/office_round1
+  frames_json: ${data_root}/raw_img_extract/office_round1/frames.json
+  rgb_dir: ${data_root}/raw_img_extract/office_round1/tmp/rgb_frames
+  droid_cfg: ${data_root}/process_SLAM/office_round1/office/cfg.yaml
+  projected_frames: ${data_root}/projected_frame/office_round1
