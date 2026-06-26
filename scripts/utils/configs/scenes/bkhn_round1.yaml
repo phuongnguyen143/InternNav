@@ -3,9 +3,6 @@ scene: bkhn_round1
 # LiDAR point2plane odom is ROS body frame; camera projection needs body→optical.
 odom_apply_body2optical: true
 
-# Floor trajectory world_x/y/z are on the PCD-estimated floor plane.
-goal_use_ground_contact: false
-
 paths:
   bag: ${data_root}/raw_rosbag/bkhn_round1
   camera_odom: ${data_root}/raw_rosbag/bkhn_round1/odometry_bkhn_round1_point2plane.txt

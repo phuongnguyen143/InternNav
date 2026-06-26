@@ -9,7 +9,9 @@ from typing import List, Tuple, Optional, Union
 from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_typestore
 
+from utils.config import get_config
 from utils.extrinsics import apply_body2optical_transform, r_body2optical_4x4
+from utils.slam_ground import floor_world_from_camera_c2w
 
 R_body2optical = r_body2optical_4x4()
 
@@ -52,7 +54,9 @@ def load_odometry_txt(
             continue
 
         T_raw = np.array([row0, row1, row2, row3], dtype=np.longdouble)
-        T = apply_body2optical_transform(T_raw.astype(np.float64), apply=apply_body2optical).astype(np.longdouble)
+        T = apply_body2optical_transform(
+            T_raw.astype(np.float64), apply=apply_body2optical
+        ).astype(np.longdouble)
         entries.append(
             OdomExtrinsicEntry(
                 timestamp=timestamp,
@@ -100,7 +104,12 @@ def world_points_to_pixels(
     v = K[1, 1] * (Yv / Zv) + K[1, 2]
     pts_2d = np.stack([u, v], axis=1)
 
-    in_frame = (pts_2d[:, 0] >= 0) & (pts_2d[:, 0] < W) & (pts_2d[:, 1] >= 0) & (pts_2d[:, 1] < H)
+    in_frame = (
+        (pts_2d[:, 0] >= 0)
+        & (pts_2d[:, 0] < W)
+        & (pts_2d[:, 1] >= 0)
+        & (pts_2d[:, 1] < H)
+    )
 
     valid_indices = np.where(valid)[0]
     for local_i, global_i in enumerate(valid_indices):
@@ -174,15 +183,26 @@ class PathImageProjector:
         path_color: Tuple = (0, 255, 0),
         path_thickness: int = 3,
         lookahead: float = 1000.0,
-        floor_plane: Optional[Tuple[float, float, float, float]] = None,  # (a,b,c,d)
+        camera_pitch_deg: Optional[float] = None,
+        ground_offset_y: Optional[float] = None,
     ):
+        slam = get_config().slam_path
+        self.camera_pitch_deg = float(
+            slam.get("camera_pitch_deg", 30.0)
+            if camera_pitch_deg is None
+            else camera_pitch_deg
+        )
+        self.ground_offset_y = float(
+            slam.get("ground_offset_y", 1.5)
+            if ground_offset_y is None
+            else ground_offset_y
+        )
 
         self.K = camera_matrix
         self.dist_coeffs = dist_coeffs
         self.path_color = path_color
         self.path_thickness = path_thickness
         self.lookahead = lookahead
-        self.floor_plane = floor_plane
 
         self._build_transformation_matrices()
         self.entries = load_odometry_txt(odom_txt_path, apply_body2optical=True)
@@ -212,36 +232,33 @@ class PathImageProjector:
 
     def _build_trajectory(self):
         timestamps = []
-        raw_pts = []
+        traj_pts = []
         for entry in self.entries:
-            t_world_base = entry.t + self.T_cam2base[:3, 3]
-            raw_pts.append(t_world_base)
+            traj_pts.append(
+                floor_world_from_camera_c2w(
+                    entry.T.astype(np.float64),
+                    self.camera_pitch_deg,
+                    self.ground_offset_y,
+                )
+            )
             timestamps.append(entry.timestamp)
 
-        raw_pts = np.array(raw_pts, dtype=np.float64)
-
-        if self.floor_plane is not None:
-            a, b, c, d = self.floor_plane
-            n = np.array([a, b, c], dtype=np.float64)
-            n_norm_sq = float(np.dot(n, n))
-            dist = (raw_pts @ n + d) / n_norm_sq
-            traj_pts = raw_pts - dist[:, None] * n
-            print(
-                f"[traj] Projected {len(traj_pts)} points onto floor plane "
-                f"({a:.4f}, {b:.4f}, {c:.4f}, {d:.4f}). "
-                f"Max deviation before projection: {np.abs(dist).max():.3f} m"
-            )
-        else:
-            traj_pts = raw_pts
-
-        self.trajectory = np.array([{"traj": traj_pts[i], "timestamp": timestamps[i]} for i in range(len(traj_pts))])
+        traj_pts = np.array(traj_pts, dtype=np.float64)
+        self.trajectory = np.array(
+            [
+                {"traj": traj_pts[i], "timestamp": timestamps[i]}
+                for i in range(len(traj_pts))
+            ]
+        )
 
     @staticmethod
     def load_odometry_txt(filepath: str) -> List[OdomExtrinsicEntry]:
         return load_odometry_txt(filepath, apply_body2optical=True)
 
     @staticmethod
-    def load_camera_info_from_bag(bag_path: str, topic: str = "/camera/camera/color/camera_info"):
+    def load_camera_info_from_bag(
+        bag_path: str, topic: str = "/camera/camera/color/camera_info"
+    ):
         typestore = get_typestore(Stores.ROS2_HUMBLE)
         with Reader(bag_path) as reader:
             for conn in reader.connections:
@@ -316,7 +333,7 @@ class PathImageProjector:
                         f"  [{i:5d}/{total}]  "
                         f"rgb={rgb_ts:.6f}  "
                         f"odom={odom_entry.timestamp:.6f}  "
-                        f"diff={time_diff*1000:.3f}ms"
+                        f"diff={time_diff * 1000:.3f}ms"
                     )
 
         print(f"Matched : {len(matched)}  |  Skipped : {skipped}")
@@ -362,7 +379,9 @@ class PathImageProjector:
 
 
 if __name__ == "__main__":
-    BAG_PATH = "/home/lenguyen1/hoangpqn/GaussTrace/dataset/raw/scenes/BKHN_data/bkhn_round1"
+    BAG_PATH = (
+        "/home/lenguyen1/hoangpqn/GaussTrace/dataset/raw/scenes/BKHN_data/bkhn_round1"
+    )
     ODOM_TXT = "/home/lenguyen1/hoangpqn/GaussTrace/dataset/raw/scenes/BKHN_data/bkhn_round1/odometry_bkhn_round1_point2plane.txt"
     RGB_TOPIC = "/camera/camera/color/image_raw/compressed"
     OUTPUT_DIR = "projected_frames1"
@@ -374,7 +393,6 @@ if __name__ == "__main__":
         dist_coeffs=D,
         odom_txt_path=ODOM_TXT,
         lookahead=7.0,
-        floor_plane=(-0.007989, -0.005287, 0.999954, 1.451946),
     )
 
     matched_frames = projector.match_images_to_odom(

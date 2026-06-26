@@ -94,7 +94,7 @@ python scripts/dataset_converters/draw_parquet_goals.py \
 | Column | Source | Notes |
 |--------|--------|-------|
 | `action` | Floor `(x,y,yaw)` trajectory | Habitat-style: `-1` start, `1` forward, `2` left, `3` right |
-| `pose.{h}cm_{p}deg` | `action_matrix` + synthetic mount | 4×4 world camera extrinsic per setting |
+| `pose.{h}cm_{p}deg` | Measured or synthetic **OpenCV optical** `T_world_cam` (c2w) per setting |
 | `goal.{h}cm_{p}deg` | Floor path projection | Pixel `(u,v)` in **640×480**; `[-1,-1]` if invalid |
 | `relative_goal_frame_id.{h}cm_{p}deg` | Lookahead search | e.g. `200`, or `-1` if goal invalid |
 
@@ -111,16 +111,14 @@ For frame `i`, take the on-floor world point at frame `w = i + lookahead`:
 1. Prefer `poses[w].world_x/y/z` from `poses.json` (written by keyframe extractor from `floor_trajectory.txt`).
 2. Else `floor_xy_to_world_on_plane(poses[w].x, poses[w].y, floor_plane)`.
 
-This is the precomputed embodiment path on the floor plane — **not** raw camera odometry.
+This is the precomputed embodiment path on the floor plane (BKHN and SLAM/office use the same rule).
 
 ### Projection
 
-For each frame `i`, project a lookahead ground contact point into image `i`:
+For each frame `i`, project a lookahead floor point into image `i`:
 
-1. **Target 3D** at frame `i + lookahead`:
-   - **SLAM / office** (`odom_apply_body2optical: false`, `goal_use_ground_contact: true`): `ground_world_from_camera_c2w(poses[w].camera_matrix)` — pitch+offset on optical c2w (same as `project_slam_path.py`).
-   - **LiDAR / BKHN** (`odom_apply_body2optical: true`): `poses[w].world_x/y/z` from `floor_trajectory.txt` on the estimated floor plane. If off-screen, falls back to optical ground contact.
-2. **Camera** at frame `i`: `poses[i].camera_matrix` (SLAM optical c2w; skip `R_body2optical` when `odom_apply_body2optical: false`).
+1. **Target 3D** at frame `i + lookahead`: `poses[w].world_x/y/z` (or reconstructed from floor `(x, y)`).
+2. **Camera** at frame `i`: parquet / debug use the same OpenCV optical `T_world_cam` as `pose.{h}cm_{p}deg`.
 3. `p_cam = inv(T_world_cam) @ target`, pinhole `u = fx·X/Z + cx`, `v = fy·Y/Z + cy`.
 4. Valid if `Z > 0` and `(u,v)` inside 640×480.
 
@@ -184,7 +182,7 @@ Dense rosbag frames: sub-steps carry forward the last discrete action when motio
 | `--keyframe_root` | `./keyframe_output` | Dir with `poses.json`, `episodes/`, `floor_calibration.json` |
 | `--lerobot_out` | `./lerobot_data` | Output parent directory |
 | `--scene_id` | `round2_bkhn` | Scene folder name under `lerobot_out` |
-| `--scene` | — | Scene config (e.g. `office_round1`); reads `odom_apply_body2optical`, `goal_use_ground_contact` |
+| `--scene` | — | Scene config (e.g. `office_round1`); reads `odom_apply_body2optical` |
 | `--fps` | `30` | Metadata FPS (see note below) |
 | `--goal_lookahead` | `200` | Max frames ahead for pixel goals |
 | `--no-goal-lookahead-adaptive` | off | Disable adaptive search; require exact offset |
@@ -219,7 +217,7 @@ python scripts/dataset_converters/decode_depth_image.py \
   scripts/dataset_converters/lerobot_data_1/round2_bkhn/videos/chunk-000/observation.images.depth.125cm_30deg/episode_000000_0.png
 ```
 
-Pixel goals use the real `camera_matrix` at each frame (matches the exported RGB).
+Pixel goals are projected with the same OpenCV optical `T_world_cam` stored in `pose.{setting}`.
 
 ---
 
@@ -271,7 +269,7 @@ Training resizes images again inside the vision processor; parquet goals remain 
 
 1. **`info.json` fps** is set to 30; rosbag sync is often ~15 Hz. Consider fixing metadata or downsampling frames in a future pass.
 2. **End of episode / sharp turns**: fixed lookahead 200 may project off-screen → many `[-1,-1]` goals near boundaries.
-3. **Re-run converter** after changing `internvla_labels.py` or `poses.json`; parquet is not updated automatically. This includes the ROS→Habitat body rotation applied to `pose.*` columns — existing parquet must be regenerated with `--overwrite`.
+3. **Re-run converter** after changing `internvla_labels.py` or `poses.json`; parquet is not updated automatically. `pose.*` columns are OpenCV optical `T_world_cam` — regenerate existing parquet with `--overwrite`.
 4. **`poses.json` must include** `world_x/y/z` and `camera_matrix` (re-run keyframe `finalize()` after precompute).
 
 ---

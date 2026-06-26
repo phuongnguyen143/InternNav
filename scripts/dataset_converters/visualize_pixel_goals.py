@@ -42,11 +42,15 @@ from utils.floor_pose import (
 from internvla_labels import (  # noqa: E402
     DEFAULT_LOOKAHEAD_FRAMES,
     INVALID_GOAL,
+    build_optical_camera_extrinsic,
     compute_discrete_actions,
     compute_goals_for_setting,
     extract_floor_xyyaw,
+    get_T_world_base_from_pose,
     project_world_point_with_camera,
 )
+
+GOAL_SETTING = (125, 30)
 
 DEFAULT_INTRINSIC = np.array(
     [
@@ -169,7 +173,13 @@ def draw_floor_path_on_image(
     for f in range(local_i, end):
         tgt = pose_floor_world_xyz(poses[f], floor_plane)
         goal, ok = project_world_point_with_camera(
-            cam_i, tgt, camera_intrinsic, w, h, apply_body2optical=apply_body2optical
+            cam_i,
+            tgt,
+            camera_intrinsic,
+            w,
+            h,
+            apply_body2optical=apply_body2optical,
+            camera_frame=poses[local_i].get("camera_frame"),
         )
         if ok:
             pts.append((int(goal[0]), int(goal[1]), f))
@@ -477,15 +487,27 @@ def main() -> None:
     poses = collect_poses_for_episode(n_frames, start_frame, poses_by_idx)
     xyyaw = extract_floor_xyyaw(poses, floor_plane, None)
     actions = compute_discrete_actions(xyyaw)
+    goal_h, goal_p = GOAL_SETTING
+    world_cam_optical = [
+        build_optical_camera_extrinsic(
+            pose,
+            get_T_world_base_from_pose(pose, floor_plane, None),
+            goal_h,
+            goal_p,
+            apply_body2optical=apply_body2optical,
+            measured_setting=GOAL_SETTING,
+        )
+        for pose in poses
+    ]
     goals, rel_ids = compute_goals_for_setting(
         poses,
+        world_cam_optical,
         floor_plane,
         K,
         IMG_W,
         IMG_H,
         primary=True,
         lookahead_frames=args.lookahead,
-        apply_body2optical=apply_body2optical,
     )
     parquet = load_parquet_goals(lerobot_root, args.episode_index)
 

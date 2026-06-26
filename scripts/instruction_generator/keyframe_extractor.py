@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CompressedImage
 
 from utils.config import get_config
+from utils.extrinsics import apply_body2optical_transform
 from utils.floor_pose import (
     derive_floor_calibration_from_trajectory,
     floor_2d_pose_to_action_matrix,
@@ -205,16 +206,18 @@ class KeyframeExtractor(Node):
             self.get_logger().info(f"Merging floor world xyz from {floor_traj_path} ({len(floor_entries)} entries)")
 
         merged = 0
+        b2o_val = cfg.get("odom_apply_body2optical")
+        apply_body2optical = True if b2o_val is None else bool(b2o_val)
         for pose in self.poses:
             ts = pose["timestamp"]
             if camera_matcher is not None:
                 cam = camera_matcher.find_closest(ts)
                 if cam is not None:
-                    pose["camera_x"] = float(cam.x)
-                    pose["camera_y"] = float(cam.y)
-                    pose["camera_z"] = float(cam.z)
-                    pose["camera_yaw"] = float(cam.yaw)
-                    pose["camera_matrix"] = cam.matrix.astype(float).tolist()
+                    T_optical = apply_body2optical_transform(
+                        cam.matrix, apply=apply_body2optical
+                    )
+                    pose["camera_matrix"] = T_optical.astype(float).tolist()
+                    pose["camera_frame"] = "optical"
                     merged += 1
 
             if self.floor_plane is not None:
@@ -249,7 +252,8 @@ class KeyframeExtractor(Node):
                 pose["action_matrix"] = action.tolist()
 
         self.get_logger().info(
-            f"Merged camera poses for {merged}/{len(self.poses)} frames; "
+            f"Merged camera poses for {merged}/{len(self.poses)} frames "
+            f"(camera_frame=optical, body2optical={'yes' if apply_body2optical else 'no'}); "
             f"action_matrix={'yes' if self.floor_plane else 'no'}"
         )
 

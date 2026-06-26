@@ -98,7 +98,7 @@ Camera odometry (`T_world_cam`) and embodiment trajectory on the floor are **dif
 
 | Data | Source | Used for |
 |------|--------|----------|
-| Camera pose | `odometry_*.txt` | `poses.json` → `camera_matrix` → LeRobot `observation.camera_extrinsic` |
+| Camera pose | `odometry_*.txt` | `poses.json` → `camera_matrix` → LeRobot `pose.{h}cm_{p}deg` (OpenCV optical) |
 | Floor embodiment | `floor_trajectory.txt` (precomputed) | `poses.json` x,y,yaw → keyframes; `action_matrix` → LeRobot `action` |
 
 Floor estimation is **offline** (slow on large PCDs). Do not run it inside ROS nodes during bag play.
@@ -181,6 +181,17 @@ Live tmux flow:
 
 - Pane 1: `trajectory_publishers.py floor` (loads txt only, no PCD at startup)
 - Pane 2: `keyframe_extractor.py` merges camera odom and floor trajectory at `finalize()` into `poses.json`
+- `camera_matrix` is stored as **OpenCV optical** `T_world_cam` with `"camera_frame": "optical"` (BKHN: body→optical at finalize; office: SLAM optical odom as-is)
+
+**Migrate legacy poses.json** (body-frame `camera_matrix`):
+
+```bash
+python instruction_generator/normalize_poses_json.py \
+  --scene bkhn_round1 \
+  --poses-json DATA/process_keyframe/bkhn_round1 \
+  --camera-odom DATA/raw_rosbag/bkhn_round1/odometry_bkhn_round1_point2plane.txt \
+  --in-place
+```
 - Depth from `/camera/camera/aligned_depth_to_color/image_raw/compressedDepth` is decoded to meters and saved as `tmp/depth_frames/frame_XXXXXX.png` (uint16 mm). Episode export copies these into `episodes/*/depth_frames/`. A temporary `depth_full.mp4` preview may be written for debugging only.
 
 Press `Ctrl+B` then `S` to stop and save.
@@ -191,7 +202,7 @@ Place `floor_trajectory.txt` and `floor_calibration.json` in `output_dir` before
 |-------|--------|
 | `x, y, yaw, z` | Matched `floor_trajectory.txt` entry |
 | `world_x, world_y, world_z` | On-floor 3D point from trajectory |
-| `camera_matrix` | Matched camera odom txt |
+| `camera_matrix` | Matched camera odom → **OpenCV optical** `T_world_cam` (`camera_frame: optical`) |
 | `action_matrix` | Base on floor plane from `(x,y,yaw)` |
 
 #### LeRobot conversion (pose vs action vs pixel goals)
@@ -208,7 +219,7 @@ python ../dataset_converters/rosbag2lerobot.py \
 ```
 
 - `action` ← discrete steps from floor `(x,y,yaw)`
-- `pose.*` ← synthetic camera extrinsics per height/pitch setting
+- `pose.*` ← OpenCV optical `T_world_cam` per height/pitch (measured odom at goal setting, else synthetic from `action_matrix`)
 - `goal.125cm_30deg` ← project `world_x/y/z` at frame `i + lookahead` into image `i` (640×480)
 - `relative_goal_frame_id.125cm_30deg` ← fixed lookahead (e.g. 200) or `-1`
 
@@ -230,7 +241,9 @@ Re-running keyframe extraction clears stale `kf_*.jpg` and episode videos in eac
 
 ### Stage 2+3 — Instruction Generation (LLaVA)
 
-Generates one navigation instruction per subclip group by interleaving image frames inside the prompt.
+Generates one navigation instruction per chunk by extracting a **dense video clip** from `rgb.mp4` spanning the first-to-last keyframe in each window, then feeding that clip to LLaVA-OneVision video mode (uniform subsample of `--num-frames` frames).
+
+Requires `rgb.mp4` in each episode folder (written by keyframe extraction).
 
 **Single episode:**
 ```bash
@@ -244,9 +257,17 @@ python generate_instruction.py /path/to/episodes/episode_0000
 python generate_instruction.py
 ```
 
-Output per episode (only keyframes in that episode folder, sorted by global frame index):
-- `instructions.json` — full metadata per chunk (frame range, filenames, model output)
-- `instructions.txt` — one instruction per chunk window, e.g. `[chunk_0000 frames 0-3] ...`
+**Example:** 11 keyframes with `--window-size 6 --chunk-overlap 2` → 3 overlapping chunks (step = 4):
+- Chunk 0: keyframes 0–5, video global frames of kf0 → kf5
+- Chunk 1: keyframes 4–9 (overlaps kf 4–5 with chunk 0)
+- Chunk 2: keyframes 8–10 (overlaps kf 8–9 with chunk 1)
+
+Set `--chunk-overlap 0` for non-overlapping chunks (legacy behavior).
+
+Output per episode:
+- `instructions.json` — metadata per chunk (keyframe range, global frame range, clip path, model output)
+- `instructions.txt` — one instruction per chunk window
+- `_chunk_clips/chunk_XXXX.mp4` — extracted dense clips (regenerated each run)
 
 **Re-run after changing extraction settings:** run keyframe extraction first, then `generate_instruction.py`. Existing mixed keyframes from old runs are not fixed by instruction generation alone.
 
@@ -255,8 +276,10 @@ Output per episode (only keyframes in that episode folder, sorted by global fram
 | Parameter | Default | Description |
 |---|---|---|
 | `DEFAULT_MODEL_PATH` | local LLaVA path | Local path to LLaVA-OneVision model |
-| `DEFAULT_WINDOW_SIZE` | `4` | Keyframe images per chunk |
-| `DEFAULT_MAX_NEW_TOKENS` | `96` | Max tokens in generated instruction |
+| `DEFAULT_WINDOW_SIZE` | `6` | Keyframes per chunk (defines clip span) |
+| `DEFAULT_CHUNK_OVERLAP` | `2` | Shared keyframes between consecutive chunks |
+| `DEFAULT_NUM_VIDEO_FRAMES` | `32` | Frames sampled from each clip for LLaVA |
+| `DEFAULT_MAX_NEW_TOKENS` | `512` | Max tokens in generated instruction |
 
 ---
 
@@ -306,8 +329,8 @@ Each episode produces:
 
 **`instructions.txt`** — one instruction per chunk from LLaVA (`generate_instruction.py`):
 ```
-[chunk_0000 frames 0-3] Walk straight ahead, passing the bulletin board on your left...
-[chunk_0001 frames 4-7] Turn left at the glass door and continue down the corridor...
+[chunk_0000 keyframes 0-5 global 0-115] Turn left and walk forward past the desk...
+[chunk_0001 keyframes 6-10 global 228-380] Continue straight down the corridor...
 ```
 
 **`summary.txt`** — optional single long-horizon instruction from Qwen2-72B (`summarize_instructions.py`):
@@ -321,7 +344,7 @@ the corridor past the exit sign, and stop at the reception desk in the elevator 
 ## Known Limitations
 
 - LLaVA shows bias toward predicting right-turn actions even when not clearly visible in frames
-- Instruction quality depends on keyframe density — too few frames per subclip reduces visual context
+- Instruction quality depends on keyframe density and `--num-frames` — sparse keyframes with low `num_frames` reduces visual context
 - Qwen2-72B requires ~40GB VRAM; both models cannot be loaded simultaneously on dual RTX 4090 (48GB total) — the pipeline unloads LLaVA before loading Qwen
 
 ---

@@ -3,9 +3,6 @@ scene: office_round1
 # DROID-W odometry_camera.txt is already OpenCV optical (no body→optical).
 odom_apply_body2optical: false
 
-# Pitch+offset ground contact under optical camera (not nav-base floor_trajectory xyz).
-goal_use_ground_contact: true
-
 # office_round1 bag uses rs1 RealSense topics (not /camera/camera/...)
 ros:
   rgb_topic: /rs1/rs1/color/image_raw/compressed

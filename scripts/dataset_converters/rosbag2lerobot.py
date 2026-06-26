@@ -40,7 +40,6 @@ from internvla_labels import (  # noqa: E402
     CAMERA_SETTINGS,
     DEFAULT_LOOKAHEAD_FRAMES,
     build_frame_labels,
-    resolve_goal_use_ground_contact,
     setting_key,
 )
 
@@ -701,9 +700,6 @@ def convert_episode(
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
     goal_lookahead_adaptive: bool = True,
     apply_body2optical: bool = True,
-    camera_pitch_deg: float = 30.0,
-    ground_offset_y: float = 1.5,
-    use_ground_contact: bool = True,
 ) -> bool:
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
@@ -768,9 +764,6 @@ def convert_episode(
             goal_lookahead_frames=goal_lookahead_frames,
             goal_lookahead_adaptive=goal_lookahead_adaptive,
             apply_body2optical=apply_body2optical,
-            camera_pitch_deg=camera_pitch_deg,
-            ground_offset_y=ground_offset_y,
-            use_ground_contact=use_ground_contact,
         )
 
         print(f"  Adding {n_frames} frames …", end=" ", flush=True)
@@ -826,9 +819,6 @@ def main(
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
     goal_lookahead_adaptive: bool = True,
     apply_body2optical: bool = True,
-    camera_pitch_deg: float = 30.0,
-    ground_offset_y: float = 1.5,
-    use_ground_contact: bool = True,
 ) -> None:
     episodes_dir = keyframe_root / "episodes"
     if not episodes_dir.exists():
@@ -858,8 +848,7 @@ def main(
     print(f"Goal lookahead    : {goal_lookahead_frames} frames")
     print(f"Goal adaptive     : {'yes' if goal_lookahead_adaptive else 'no (fixed offset only)'}")
     print(f"Body→optical      : {'yes' if apply_body2optical else 'no (SLAM optical odom)'}")
-    print(f"Goal ground point : {'SLAM pitch+offset' if use_ground_contact else 'floor trajectory world xyz'}")
-    print(f"Goal ground pitch : {camera_pitch_deg}° offset_y={ground_offset_y}m")
+    print(f"Goal 3D target    : floor_trajectory world_x/y/z (lookahead projection)")
     print(f"Output            : {scene_root}")
 
     poses_by_frame_idx = load_poses_json(keyframe_root)
@@ -902,9 +891,6 @@ def main(
                 goal_lookahead_frames=goal_lookahead_frames,
                 goal_lookahead_adaptive=goal_lookahead_adaptive,
                 apply_body2optical=apply_body2optical,
-                camera_pitch_deg=camera_pitch_deg,
-                ground_offset_y=ground_offset_y,
-                use_ground_contact=use_ground_contact,
             ):
                 success += 1
         except Exception as e:
@@ -984,9 +970,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     apply_body2optical = True
-    camera_pitch_deg = 30.0
-    ground_offset_y = 1.5
-    use_ground_contact: Optional[bool] = None
     camera_intrinsic = load_camera_intrinsic(args.camera_intrinsic)
 
     scene_cfg = None
@@ -994,12 +977,6 @@ if __name__ == "__main__":
         scene_cfg = load_config(args.scene)
         b2o_val = scene_cfg.get("odom_apply_body2optical")
         apply_body2optical = True if b2o_val is None else bool(b2o_val)
-        slam_path = scene_cfg.get("slam_path", default={})
-        camera_pitch_deg = float(slam_path.get("camera_pitch_deg", camera_pitch_deg))
-        ground_offset_y = float(slam_path.get("ground_offset_y", ground_offset_y))
-        gc_val = scene_cfg.get("goal_use_ground_contact")
-        if gc_val is not None:
-            use_ground_contact = bool(gc_val)
         paths = scene_cfg.get("paths", default={})
         droid_cfg = paths.get("droid_cfg")
         if args.camera_intrinsic is None and droid_cfg and Path(droid_cfg).is_file():
@@ -1009,10 +986,6 @@ if __name__ == "__main__":
         apply_body2optical = False
     elif args.body2optical:
         apply_body2optical = True
-
-    use_ground_contact = resolve_goal_use_ground_contact(
-        apply_body2optical, use_ground_contact
-    )
 
     floor_cal = Path(args.floor_calibration) if args.floor_calibration else None
 
@@ -1030,7 +1003,4 @@ if __name__ == "__main__":
         goal_lookahead_frames=args.goal_lookahead,
         goal_lookahead_adaptive=not args.no_goal_lookahead_adaptive,
         apply_body2optical=apply_body2optical,
-        camera_pitch_deg=camera_pitch_deg,
-        ground_offset_y=ground_offset_y,
-        use_ground_contact=use_ground_contact,
     )

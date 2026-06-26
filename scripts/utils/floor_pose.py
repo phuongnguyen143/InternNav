@@ -286,6 +286,47 @@ def camera_matrix_to_floor_pose(
     return x, y, yaw, legacy_z, action, world_xyz
 
 
+def yaw_from_forward_on_floor_plane(forward: np.ndarray, floor_plane: tuple) -> float:
+    """Heading in floor 2D from a world forward vector projected onto the plane."""
+    _, x_ax, y_ax, n = build_floor_frame(floor_plane)
+    forward_proj = np.asarray(forward, dtype=np.float64).reshape(3) - np.dot(forward, n) * n
+    norm = np.linalg.norm(forward_proj)
+    if norm < 1e-9:
+        forward_proj = x_ax
+    else:
+        forward_proj /= norm
+    return float(math.atan2(np.dot(forward_proj, y_ax), np.dot(forward_proj, x_ax)))
+
+
+def camera_c2w_to_floor_pose(
+    T_world_cam: np.ndarray,
+    floor_plane: tuple,
+    *,
+    camera_pitch_deg: float = 30.0,
+    ground_offset_y: float = 1.5,
+) -> Tuple[float, float, float, float, np.ndarray]:
+    """SLAM export: leveled-camera floor contact → floor (x, y, yaw) + world xyz."""
+    from utils.slam_ground import floor_world_from_camera_c2w, leveled_camera_rotation
+
+    T = np.asarray(T_world_cam, dtype=np.float64).reshape(4, 4)
+    world_proj = project_points_to_plane(
+        floor_world_from_camera_c2w(T, camera_pitch_deg, ground_offset_y).reshape(1, 3),
+        floor_plane,
+    )[0]
+    R_level = leveled_camera_rotation(T[:3, :3], camera_pitch_deg)
+    yaw = yaw_from_forward_on_floor_plane(R_level[:, 2], floor_plane)
+
+    origin, x_ax, y_ax, _ = build_floor_frame(floor_plane)
+    delta = world_proj - origin
+    return (
+        float(np.dot(delta, x_ax)),
+        float(np.dot(delta, y_ax)),
+        yaw,
+        float(world_proj[2]),
+        world_proj.copy(),
+    )
+
+
 def floor_2d_pose_to_action_matrix(
     x: float,
     y: float,

@@ -50,7 +50,7 @@ Scene YAML under `scripts/utils/configs/scenes/` sets `odom_apply_body2optical` 
 | Scene type | Example | Odometry source | Floor estimation | `odom_apply_body2optical` |
 |------------|---------|-------------------|------------------|---------------------------|
 | **LiDAR / BKHN** | `bkhn_round1` | `odometry_*_point2plane.txt` (ROS body frame) | PCD patch fit (`precompute_floor_trajectory.py`) | `true` |
-| **Visual SLAM** | `office_round1` | DROID-W `odometry_camera.txt` (OpenCV optical c2w) | Odom PCA plane (`project_slam_path.py --export-floor-trajectory`) | `false` |
+| **Visual SLAM** | `office_round1` | DROID-W `odometry_camera.txt` (OpenCV optical c2w) | Leveled-camera floor contact (`project_slam_path.py --export-floor-trajectory`) | `false` |
 
 **Camera pose** (from `camera_odom` txt) and **floor embodiment** (from `floor_trajectory.txt`) are intentionally separate:
 
@@ -187,8 +187,8 @@ python precompute_floor_trajectory.py --scene bkhn_round1 --smooth none
 
 Two modes:
 
-1. **Export** (`--export-floor-trajectory [DIR]`): PCA floor plane from navigation-base origins; writes `floor_trajectory.txt` + `floor_calibration.json`. No PCD required.
-2. **Project** (default when RGB inputs exist): Draw future ground path on RGB frames using pitched-camera ground contact (matches GaussTrace / `image_projector.py`).
+1. **Export** (`--export-floor-trajectory [DIR]`): leveled-camera floor contact (undo mount pitch, offset on optical +Y); writes `floor_trajectory.txt` with raw offset `world_x/y/z` + `floor_calibration.json` (plane fitted from trajectory for downstream only). No PCD required.
+2. **Project** (default when RGB inputs exist): Draw future path on RGB from exported `world_x/y/z` (same points as pixel goals downstream).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -203,13 +203,13 @@ Two modes:
 | `--body2optical` | scene default | Apply ROS body→OpenCV optical on load |
 | `--smooth` | `moving_average` | Floor trajectory smoothing on export |
 | `--floor-smooth-window` | `5` | Smoothing window (export) |
-| `--camera-pitch-deg` | `30` | Pitch for ground-path projection |
-| `--ground-offset-y` | `1.5` | Offset along pitched camera Y (m) |
+| `--camera-pitch-deg` | `30` | Mount pitch to undo before floor contact (deg) |
+| `--ground-offset-y` | `1.5` | Offset along optical +Y after leveling (m) |
 | `--lookahead-m` / `--lookahead-s` | `10` / `10` | Path draw lookahead |
 | `--stride` | `1` | Frame subsampling for projection |
 | `--max-frames` | all | Limit projected frames (`-1` = all) |
 
-**Note:** RGB projection uses pitched optical ground points. Exported `world_x/y/z` lie on a flat horizontal plane and are for embodiment / goals — not for reprojecting the debug overlay.
+**Note:** SLAM export and pixel goals both use `floor_trajectory.txt` `world_x/y/z` (BKHN-style downstream). Re-export after changing `--camera-pitch-deg` or `--ground-offset-y`.
 
 ---
 
@@ -258,7 +258,6 @@ Example scene files: `scripts/utils/configs/scenes/bkhn_round1.yaml`, `office_ro
 ```yaml
 scene: office_round1
 odom_apply_body2optical: false   # DROID optical c2w
-goal_use_ground_contact: true    # pixel goals via pitched ground contact
 
 paths:
   bag: ${data_root}/raw_rosbag/office_round1
@@ -298,3 +297,44 @@ Refer to each subdirectory's README for build and run instructions.
 - [ ] For office: ran `project_slam_path.py --export-floor-trajectory` after DROID-W
 
 After keyframes: convert with [`../dataset_converters/README.md`](../dataset_converters/README.md).
+
+---
+
+## Rerun visualization
+
+Visualize the **estimated floor plane**, **scene point cloud**, and **trajectories** with the [Rerun SDK](https://www.rerun.io/docs):
+
+```bash
+conda activate internnav
+cd vln/InternNav/scripts
+export PYTHONPATH="$(pwd):$PYTHONPATH"
+
+# After precompute_floor_trajectory.py (BKHN / PCD scenes)
+python process_odom/visualize_rerun.py --scene bkhn_round1
+
+# Explicit paths
+python process_odom/visualize_rerun.py \
+  --floor-calibration DATA/raw_rosbag/bkhn_round1/floor_calibration.json \
+  --pcd DATA/raw_rosbag/bkhn_round1/bkhn_round1_point2plane.pcd \
+  --floor-trajectory DATA/raw_rosbag/bkhn_round1/floor_trajectory.txt \
+  --camera-odom DATA/raw_rosbag/bkhn_round1/odometry_bkhn_round1_point2plane.txt
+
+# Save .rrd (open later: rerun /path/to/recording.rrd)
+python process_odom/visualize_rerun.py --scene bkhn_round1 --save /tmp/bkhn_floor.rrd
+```
+
+**Layers in the viewer:**
+- `world/map` — downsampled point cloud (green ≈ near estimated plane)
+- `world/floor_plane` — semi-transparent fitted plane quad
+- `world/floor_path` — embodiment trajectory on the plane
+- `world/camera_path` — camera odometry polyline
+- `world/camera_axes` — RGB optical axes at subsampled poses (X red, Y green, Z yellow/forward)
+- `world/camera_frustums` — wireframe camera frustums (OpenCV RDF, +Z forward)
+
+Scrub a single moving camera with frustum: `--mode timeline --stride 5`
+
+Tune pose density: `--camera-stride 30` (static) or `--camera-axis-len 0.5 --camera-frustum-depth 0.8`
+
+Tune density with `--pcd-voxel 0.2` and `--pcd-max-points 250000`.
+
+Local Rerun examples: `vln/rerun/examples/python/` (minimal, rgbd, lidar, ros_node).

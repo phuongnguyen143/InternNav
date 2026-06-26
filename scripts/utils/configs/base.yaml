@@ -23,7 +23,7 @@ ros:
   odom_matched_topic: /odom_txt/matched
   frame_id: map
   child_frame_id: base_link
-  max_time_diff: 0.05
+  max_time_diff: 0.5
   sync_slop_sec: 0.05
   offline_match_max_dt: 0.5
   bag_play_rate: 5.0
@@ -47,8 +47,8 @@ camera:
   native_rgb_height: 480
 
 slam_path:
-  camera_pitch_deg: 30.0
-  ground_offset_y: 1.5
+  camera_pitch_deg: -30.0
+  ground_offset_y: 1
   lookahead_m: 10.0
   lookahead_s: 10.0
   smooth_window: 5

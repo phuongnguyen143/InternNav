@@ -2,24 +2,30 @@ import argparse
 import gc
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
+import cv2
 import torch
-from PIL import Image
 from transformers import (
     BitsAndBytesConfig,
     LlavaOnevisionForConditionalGeneration,
     LlavaOnevisionProcessor,
 )
 
+from frame_utils import write_rgb_mp4_segment
 from prompts import TRAJECTORY_PROMPT_AFTER, TRAJECTORY_PROMPT_BEFORE
 
-DEFAULT_MAX_NEW_TOKENS = 96
-DEFAULT_WINDOW_SIZE = 6
+DEFAULT_MAX_NEW_TOKENS = 512
+DEFAULT_WINDOW_SIZE = 7
+DEFAULT_CHUNK_OVERLAP = 1
+DEFAULT_NUM_VIDEO_FRAMES = 64
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MODEL_PATH = "/home/lenguyen1/hoangpqn/models/llava-onevision-qwen2-7b-ov-hf"
-DEFAULT_ROOT_DIR = Path("/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes")
+DEFAULT_ROOT_DIR = Path(
+    "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/instruction_generator/keyframe_output/episodes"
+)
 DEFAULT_DEVICE = "cuda:1"
 
 _KEYFRAME_FRAME_IDX_RE = re.compile(r"_(\d{6})\.(?:jpg|png)$", re.IGNORECASE)
@@ -32,8 +38,8 @@ def parse_keyframe_frame_idx(path: Path) -> int | None:
     return int(match.group(1))
 
 
-def collect_keyframe_paths(episode_dir: Path) -> list[Path]:
-    """Return keyframe images sorted by global frame index, deduplicated."""
+def collect_keyframe_paths(episode_dir: Path) -> list[tuple[int, Path]]:
+    """Return (global_frame_idx, path) pairs sorted by frame index, deduplicated."""
     paths = list(episode_dir.glob("kf_*.jpg")) + list(episode_dir.glob("kf_*.png"))
     by_frame_idx: dict[int, Path] = {}
     skipped = 0
@@ -56,12 +62,93 @@ def collect_keyframe_paths(episode_dir: Path) -> list[Path]:
                 f"({len(paths)} files -> {len(by_frame_idx)} unique frames)"
             )
 
-    return [by_frame_idx[i] for i in sorted(by_frame_idx)]
+    return [(i, by_frame_idx[i]) for i in sorted(by_frame_idx)]
+
+
+def split_keyframes_into_chunks(
+    keyframes: list[tuple[int, Path]],
+    window_size: int,
+    overlap: int,
+) -> list[tuple[int, list[tuple[int, Path]]]]:
+    """Split keyframes into overlapping windows.
+
+    Returns list of (start_index, chunk_keyframes). Step size is window_size - overlap.
+    """
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= window_size:
+        raise ValueError("overlap must be < window_size")
+
+    if len(keyframes) <= window_size:
+        return [(0, keyframes)]
+
+    step = window_size - overlap
+    chunks: list[tuple[int, list[tuple[int, Path]]]] = []
+    start = 0
+    while start < len(keyframes):
+        chunk = keyframes[start : start + window_size]
+        chunks.append((start, chunk))
+        if start + len(chunk) >= len(keyframes):
+            break
+        start += step
+    return chunks
+
+
+def extract_chunk_video(
+    episode_dir: Path,
+    episode_start_global: int,
+    chunk_keyframes: list[tuple[int, Path]],
+    dst_clip: Path,
+) -> dict | None:
+    """Extract dense rgb.mp4 segment from first to last keyframe in chunk."""
+    rgb_path = episode_dir / "rgb.mp4"
+    if not rgb_path.exists():
+        print(f"  Error: missing {rgb_path}")
+        return None
+
+    chunk_start_global = chunk_keyframes[0][0]
+    chunk_end_global = chunk_keyframes[-1][0]
+    local_start = chunk_start_global - episode_start_global
+    local_end = chunk_end_global - episode_start_global
+
+    cap = cv2.VideoCapture(str(rgb_path))
+    if not cap.isOpened():
+        print(f"  Error: cannot open {rgb_path}")
+        return None
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    dst_clip.parent.mkdir(parents=True, exist_ok=True)
+    frame_count = write_rgb_mp4_segment(
+        rgb_path,
+        dst_clip,
+        local_start,
+        local_end,
+        fps,
+        (width, height),
+    )
+    if frame_count == 0:
+        print(f"  Warning: no frames written for clip {dst_clip.name}")
+        return None
+
+    return {
+        "global_frame_range": f"{chunk_start_global}-{chunk_end_global}",
+        "local_frame_range": f"{local_start}-{local_end}",
+        "frame_count": frame_count,
+    }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate navigation instructions from keyframe images using LLaVA-OneVision.",
+        description=(
+            "Generate navigation instructions from dense video chunks "
+            "using LLaVA-OneVision."
+        ),
     )
     parser.add_argument(
         "input",
@@ -87,7 +174,25 @@ def parse_args():
         "--window-size",
         type=int,
         default=DEFAULT_WINDOW_SIZE,
-        help=f"Number of keyframe images per chunk (default: {DEFAULT_WINDOW_SIZE})",
+        help=f"Number of keyframes per chunk (default: {DEFAULT_WINDOW_SIZE})",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=DEFAULT_CHUNK_OVERLAP,
+        help=(
+            "Shared keyframes between consecutive chunks "
+            f"(default: {DEFAULT_CHUNK_OVERLAP}; must be < window-size)"
+        ),
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=DEFAULT_NUM_VIDEO_FRAMES,
+        help=(
+            "Frames sampled from each chunk video for LLaVA "
+            f"(default: {DEFAULT_NUM_VIDEO_FRAMES})"
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -106,15 +211,6 @@ def parse_args():
         default=DEFAULT_DEVICE,
         help=f"CUDA device for inference (default: {DEFAULT_DEVICE})",
     )
-    parser.add_argument(
-        "--flip-horizontal",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Mirror each image left↔right before inference (default: on). "
-            "Use --no-flip-horizontal to feed original images."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -129,7 +225,9 @@ class LlavaOnevisionLocal:
         self.max_new_tokens = max_new_tokens
         self.repetition_penalty = repetition_penalty
 
-        self.processor = LlavaOnevisionProcessor.from_pretrained(model_path, local_files_only=True, use_fast=True)
+        self.processor = LlavaOnevisionProcessor.from_pretrained(
+            model_path, local_files_only=True, use_fast=True
+        )
         self.processor.tokenizer.padding_side = "left"
         self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_path,
@@ -145,20 +243,29 @@ class LlavaOnevisionLocal:
         self.model.eval()
 
     @torch.inference_mode()
-    def generate(self, images) -> str:
+    def generate(self, video_path: Path, num_frames: int) -> str:
         conversation = [
             {
                 "role": "user",
-                "content": (
-                    [{"type": "text", "text": TRAJECTORY_PROMPT_BEFORE}]
-                    + [{"type": "image"} for _ in images]
-                    + [{"type": "text", "text": TRAJECTORY_PROMPT_AFTER}]
-                ),
+                "content": [
+                    {"type": "text", "text": TRAJECTORY_PROMPT_BEFORE},
+                    {"type": "video", "path": str(video_path)},
+                    {"type": "text", "text": TRAJECTORY_PROMPT_AFTER},
+                ],
             }
         ]
-        text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
-        inputs = self.processor(images=images, text=text_prompt, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = self.processor.apply_chat_template(
+            conversation,
+            num_frames=num_frames,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {
+            k: v.to(self.model.device) if hasattr(v, "to") else v
+            for k, v in inputs.items()
+        }
 
         output_ids = self.model.generate(
             **inputs,
@@ -172,73 +279,90 @@ class LlavaOnevisionLocal:
         )
 
         input_len = inputs["input_ids"].shape[1]
-        response = self.processor.batch_decode(output_ids[:, input_len:], skip_special_tokens=True)[0].strip()
+        response = self.processor.batch_decode(
+            output_ids[:, input_len:], skip_special_tokens=True
+        )[0].strip()
 
         return response
-
-
-def load_images(image_paths, mirror_left_right: bool = True):
-    """Load keyframe images; optionally mirror horizontally (left side ↔ right side)."""
-    images = []
-    for p in image_paths:
-        try:
-            img = Image.open(p).convert("RGB")
-            if mirror_left_right:
-                img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            img.thumbnail((384, 384))
-            images.append(img)
-        except Exception as e:
-            print(f"Failed loading {p}: {e}")
-    return images
 
 
 def run_episode(
     episode_dir: Path,
     llava: LlavaOnevisionLocal,
     window_size: int,
-    flip_horizontal: bool = True,
+    chunk_overlap: int,
+    num_frames: int,
 ):
     print(f"\n{'=' * 80}")
     print(f"EPISODE: {episode_dir.name}")
-    if flip_horizontal:
-        print("  Image preprocessing: mirror left↔right")
+
+    chunk_clips_dir = episode_dir / "_chunk_clips"
+    if chunk_clips_dir.exists():
+        shutil.rmtree(chunk_clips_dir)
 
     for stale in (episode_dir / "instructions.json", episode_dir / "instructions.txt"):
         if stale.exists():
             stale.unlink()
 
-    frame_paths = collect_keyframe_paths(episode_dir)
+    if not (episode_dir / "rgb.mp4").exists():
+        print("No rgb.mp4 found, skipping.")
+        return
 
-    if len(frame_paths) == 0:
+    keyframes = collect_keyframe_paths(episode_dir)
+
+    if len(keyframes) == 0:
         print("No keyframe images found, skipping.")
         return
 
-    print(f"Found {len(frame_paths)} keyframe images, window_size={window_size}")
+    episode_start_global = keyframes[0][0]
+    print(
+        f"Found {len(keyframes)} keyframes, window_size={window_size}, "
+        f"chunk_overlap={chunk_overlap}, num_frames={num_frames}"
+    )
 
-    chunks = [frame_paths[i : i + window_size] for i in range(0, len(frame_paths), window_size)]
+    chunks = split_keyframes_into_chunks(keyframes, window_size, chunk_overlap)
     print(f"Total chunks: {len(chunks)}")
 
     results = []
 
-    for chunk_idx, chunk_paths in enumerate(chunks):
-        start = chunk_idx * window_size
-        end = start + len(chunk_paths) - 1
-        print(f"\n[{chunk_idx + 1}/{len(chunks)}] frames {start}–{end} ({len(chunk_paths)} images)")
+    for chunk_idx, (kf_start, chunk_keyframes) in enumerate(chunks):
+        kf_end = kf_start + len(chunk_keyframes) - 1
+        clip_path = chunk_clips_dir / f"chunk_{chunk_idx:04d}.mp4"
+        print(
+            f"\n[{chunk_idx + 1}/{len(chunks)}] keyframes {kf_start}–{kf_end} "
+            f"({len(chunk_keyframes)} keyframes)"
+        )
 
-        images = load_images(chunk_paths, mirror_left_right=flip_horizontal)
-        if len(images) == 0:
-            print("  No valid images, skipping chunk.")
+        clip_meta = extract_chunk_video(
+            episode_dir,
+            episode_start_global,
+            chunk_keyframes,
+            clip_path,
+        )
+        if clip_meta is None:
+            print("  Skipping chunk (clip extraction failed).")
             continue
 
+        print(
+            f"  Clip: global frames {clip_meta['global_frame_range']} "
+            f"({clip_meta['frame_count']} dense frames) -> {clip_path.name}"
+        )
+
         try:
-            instruction = llava.generate(images=images)
+            instruction = llava.generate(video_path=clip_path, num_frames=num_frames)
             print(f"  → {instruction}")
 
             results.append(
                 {
                     "chunk_idx": chunk_idx,
-                    "frame_range": f"{start}-{end}",
-                    "frames": [p.name for p in chunk_paths],
+                    "keyframe_range": f"{kf_start}-{kf_end}",
+                    "chunk_overlap": chunk_overlap,
+                    "global_frame_range": clip_meta["global_frame_range"],
+                    "local_frame_range": clip_meta["local_frame_range"],
+                    "dense_frame_count": clip_meta["frame_count"],
+                    "keyframes": [p.name for _, p in chunk_keyframes],
+                    "video_clip": f"_chunk_clips/{clip_path.name}",
+                    "num_frames": num_frames,
                     "instruction": instruction,
                 }
             )
@@ -260,7 +384,10 @@ def run_episode(
     save_txt = episode_dir / "instructions.txt"
     with open(save_txt, "w") as f:
         for item in results:
-            f.write(f"[chunk_{item['chunk_idx']:04d} frames {item['frame_range']}] {item['instruction']}\n")
+            f.write(
+                f"[chunk_{item['chunk_idx']:04d} keyframes {item['keyframe_range']} "
+                f"global {item['global_frame_range']}] {item['instruction']}\n"
+            )
 
     print(f"\nSaved {len(results)} chunk instructions:")
     print(f"  {save_json}")
@@ -284,29 +411,61 @@ def run_episodes(
     input_path: Path | None,
     llava: LlavaOnevisionLocal,
     window_size: int,
+    chunk_overlap: int,
+    num_frames: int,
     root_dir: Path,
-    flip_horizontal: bool = True,
 ):
     if input_path is None:
-        episode_dirs = sorted([x for x in root_dir.iterdir() if x.is_dir() and x.name.startswith("episode_")])
+        episode_dirs = sorted(
+            [
+                x
+                for x in root_dir.iterdir()
+                if x.is_dir() and x.name.startswith("episode_")
+            ]
+        )
         print(f"Found {len(episode_dirs)} episodes in {root_dir}")
     else:
-        episode_dirs = sorted([x for x in input_path.iterdir() if x.is_dir() and x.name.startswith("episode_")])
+        episode_dirs = sorted(
+            [
+                x
+                for x in input_path.iterdir()
+                if x.is_dir() and x.name.startswith("episode_")
+            ]
+        )
         if episode_dirs:
             print(f"Found {len(episode_dirs)} episodes in {input_path}")
         else:
-            run_episode(input_path, llava, window_size=window_size, flip_horizontal=flip_horizontal)
+            run_episode(
+                input_path,
+                llava,
+                window_size=window_size,
+                chunk_overlap=chunk_overlap,
+                num_frames=num_frames,
+            )
             return
 
     for ep in episode_dirs:
         try:
-            run_episode(ep, llava, window_size=window_size, flip_horizontal=flip_horizontal)
+            run_episode(
+                ep,
+                llava,
+                window_size=window_size,
+                chunk_overlap=chunk_overlap,
+                num_frames=num_frames,
+            )
         except Exception as e:
             print(f"Episode failed: {ep.name} — {e}")
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.chunk_overlap >= args.window_size:
+        print(
+            f"Error: --chunk-overlap ({args.chunk_overlap}) must be < "
+            f"--window-size ({args.window_size})"
+        )
+        sys.exit(1)
 
     llava = LlavaOnevisionLocal(
         model_path=args.model_path,
@@ -320,6 +479,7 @@ if __name__ == "__main__":
         input_path,
         llava,
         window_size=args.window_size,
+        chunk_overlap=args.chunk_overlap,
+        num_frames=args.num_frames,
         root_dir=args.root_dir,
-        flip_horizontal=args.flip_horizontal,
     )

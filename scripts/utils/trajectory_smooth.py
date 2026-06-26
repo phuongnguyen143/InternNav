@@ -149,6 +149,82 @@ def smooth_floor_trajectory(
     raise ValueError(f"Unknown smooth method {method!r}; expected one of {SMOOTH_METHODS}")
 
 
+def _rebuild_slam_floor_entries(
+    entries: List[FloorEntry],
+    world_xyz: np.ndarray,
+    yaw: np.ndarray,
+    origin_xy: np.ndarray,
+) -> List[FloorEntry]:
+    return [
+        FloorEntry(
+            timestamp=e.timestamp,
+            x=float(world_xyz[i, 0] - origin_xy[0]),
+            y=float(world_xyz[i, 1] - origin_xy[1]),
+            yaw=float(yaw[i]),
+            z=float(world_xyz[i, 2]),
+            world_x=float(world_xyz[i, 0]),
+            world_y=float(world_xyz[i, 1]),
+            world_z=float(world_xyz[i, 2]),
+        )
+        for i, e in enumerate(entries)
+    ]
+
+
+def smooth_slam_floor_trajectory(
+    entries: List[FloorEntry],
+    method: str,
+    *,
+    window: int = 5,
+    bspline_s: float = 1.0,
+) -> List[FloorEntry]:
+    """Smooth SLAM floor trajectory world_x/y/z and yaw (offset-based export)."""
+    if method == "none" or len(entries) < 2:
+        return list(entries)
+
+    origin_xy = np.array([entries[0].world_x, entries[0].world_y], dtype=np.float64)
+    world = np.stack(
+        [[e.world_x, e.world_y, e.world_z] for e in entries],
+        axis=0,
+    )
+    yaw = np.array([e.yaw for e in entries], dtype=np.float64)
+    n = len(entries)
+
+    if method == "moving_average":
+        w = _normalize_window(window, n)
+        if w <= 1:
+            return list(entries)
+        world_s = np.column_stack(
+            [
+                _moving_average_1d(world[:, 0], w),
+                _moving_average_1d(world[:, 1], w),
+                _moving_average_1d(world[:, 2], w),
+            ]
+        )
+        yaw_s = _yaw_wrap(_moving_average_1d(_yaw_unwrap(yaw), w))
+        return _rebuild_slam_floor_entries(entries, world_s, yaw_s, origin_xy)
+
+    if method == "bspline":
+        if n < 4:
+            return smooth_slam_floor_trajectory(
+                entries, "moving_average", window=window
+            )
+        u = np.linspace(0.0, 1.0, n)
+        k = min(3, n - 1)
+        tck, _ = splprep(
+            [world[:, 0], world[:, 1], world[:, 2]],
+            u=u,
+            s=bspline_s,
+            k=k,
+        )
+        wx_s, wy_s, wz_s = splev(u, tck)
+        world_s = np.column_stack([wx_s, wy_s, wz_s])
+        yaw_tck = splrep(u, _yaw_unwrap(yaw), s=bspline_s, k=k)
+        yaw_s = _yaw_wrap(splev(u, yaw_tck))
+        return _rebuild_slam_floor_entries(entries, world_s, yaw_s, origin_xy)
+
+    raise ValueError(f"Unknown smooth method {method!r}; expected one of {SMOOTH_METHODS}")
+
+
 def _smooth_label(method: str, *, window: int = 5, bspline_s: float = 1.0) -> str:
     if method == "moving_average":
         return f"moving_average (window={window})"

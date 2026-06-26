@@ -1,0 +1,10 @@
+scene: bkhn_round2
+
+# LiDAR point2plane odom is ROS body frame; camera projection needs body→optical.
+odom_apply_body2optical: true
+
+paths:
+  bag: ${data_root}/raw_rosbag/bkhn_round2
+  camera_odom: ${data_root}/raw_rosbag/bkhn_round2/odometry_bkhn_round2_point2plane.txt
+  floor_trajectory: ${data_root}/raw_rosbag/bkhn_round2/floor_trajectory.txt
+  output_dir: ${data_root}/process_keyframe/bkhn_round2
