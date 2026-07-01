@@ -14,6 +14,7 @@ This fiel is used by scripts/realworld/http_internvla_server.py, internvla_n1_ro
 """
 
 import copy
+import gc
 import itertools
 import os
 import re
@@ -34,6 +35,7 @@ from transformers import AutoProcessor
 
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
 from internnav.model.utils.device import model_load_dtype, resolve_torch_device
+from internnav.model.utils.s2_attention_viz import extract_s2_attentions
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
 
 DEFAULT_IMAGE_TOKEN = "<image>"
@@ -55,16 +57,19 @@ class InternVLAN1AsyncAgent:
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"args.model_path{args.model_path}")
         load_dtype = model_load_dtype(self.device)
+        attn_implementation = getattr(args, "attn_implementation", "sdpa")
+        self.extract_attention = getattr(args, "extract_attention", False)
+        self.attn_layers = getattr(args, "attn_layers", None)
         self.model = InternVLAN1ForCausalLM.from_pretrained(
             args.model_path,
             torch_dtype=load_dtype,
-            attn_implementation="sdpa",
+            attn_implementation=attn_implementation,
             device_map={"": self.device},
         )
         self.model.eval()
         self.model.to(self.device)
 
-        self.processor = AutoProcessor.from_pretrained(args.model_path)
+        self.processor = AutoProcessor.from_pretrained(args.model_path_original)
         self.processor.tokenizer.padding_side = 'left'
 
         self.resize_w = args.resize_w
@@ -113,6 +118,8 @@ class InternVLAN1AsyncAgent:
         self.output_pixel = None
         self.pixel_goal_rgb = None  # RGB at the frame where S2 picked the pixel goal
         self.pixel_goal_depth = None
+        self.last_attention_bundle = None
+        self.last_s2_inputs = None
 
     def reset(self):
         """Clear episode state; call when starting a new navigation task."""
@@ -129,6 +136,8 @@ class InternVLAN1AsyncAgent:
         self.output_pixel = None
         self.pixel_goal_rgb = None
         self.pixel_goal_depth = None
+        self.last_attention_bundle = None
+        self.last_s2_inputs = None
 
         self.save_dir = "test_data/" + datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(self.save_dir, exist_ok=True)
@@ -176,6 +185,7 @@ class InternVLAN1AsyncAgent:
             )
             self.last_s2_idx = self.episode_idx
             dual_sys_output.output_pixel = self.output_pixel
+            dual_sys_output.attention_bundle = self.last_attention_bundle
             # Snapshot sensors at planning time; S1 compares goal frame vs current frame.
             self.pixel_goal_rgb = copy.deepcopy(rgb)
             self.pixel_goal_depth = copy.deepcopy(depth)
@@ -219,6 +229,7 @@ class InternVLAN1AsyncAgent:
 
         look_down=True appends a downward-view frame as a follow-up turn (after action 5).
         """
+        self.last_attention_bundle = None
         # 1. Preprocess the incoming frame 
         image = Image.fromarray(rgb).convert('RGB')
         if not look_down:
@@ -315,8 +326,33 @@ class InternVLAN1AsyncAgent:
         with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
             f.write(self.llm_output)
         self.last_output_ids = copy.deepcopy(output_ids[0])
-        self.past_key_values = copy.deepcopy(outputs.past_key_values)
+        self.last_s2_inputs = inputs
         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
+
+        self.last_attention_bundle = None
+        if self.extract_attention and not look_down:
+            del outputs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.last_attention_bundle = extract_s2_attentions(
+                self.model,
+                inputs,
+                output_ids,
+                self.processor.tokenizer,
+                self.llm_output,
+                instruction=instruction,
+                layers=self.attn_layers,
+            )
+        else:
+            if not self.extract_attention:
+                self.past_key_values = copy.deepcopy(outputs.past_key_values)
+            elif look_down:
+                print("Skipping attention extraction on look-down frame")
+            del outputs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         #  5. Parse VLM output into one of two branches 
         if bool(re.search(r'\d', self.llm_output)):

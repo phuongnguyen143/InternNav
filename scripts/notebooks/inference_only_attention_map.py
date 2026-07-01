@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
 """
-InternVLA-N1 inference script (from inference_only_demo.ipynb and inference_only_demo_v2.ipynb).
+InternVLA-N1 inference with System 2 (QwenVL) attention map visualization.
 
-Run inference on a local scene folder containing RGB images and an instruction
-file. Each run writes to a timestamped subfolder under SAVE_DIR and stitches
-annotated frames into an mp4 video.
-
-Prerequisites (not handled by this script):
-  - Install the environment of InternNav
-  - InternVLA-N1 checkpoint downloaded locally
-  - DepthAnything checkpoint in checkpoints/
-  - Scene folder prepared with instruction.txt and debug_raw_*.jpg images
-    + example: debug_raw_0001.jpg | debug_raw_0002_look_down.jpg
-
-Notes:
-  - Without --depth-dir, a constant dummy depth map is used (see DUMMY_DEPTH_METERS).
-  - With --depth-dir, depth files use the same basename as each RGB frame (e.g. debug_raw_0001.jpg).
-  - If not use `attn_implementation="flash_attention_2"`, set `attn_implementation="sdpa"`.
-  - If you meet the error about the `No module named LongCLIP (or diffusion policy)`, you should run the `git submodule update --init` in the root directory of InternNav.
-  - If you meet the error about the `No module named LongCLIP (or diffusion policy)`, you should run the `git submodule update --init` in the root directory of InternNav. 
-Usage:
-  python inference_only.py
-  python inference_only.py --project-root /path/to/InternNav --scene-dir /path/to/scene --depth-dir /path/to/depth --model-path /path/to/checkpoint
-
-
-  python inference_only.py  --scene-dir /home/khang/Documents/VR/InternNav/assets/bkhn_data1/rgb --depth-dir /home/khang/Documents/VR/InternNav/assets/bkhn_data1/depth
+  python inference_only_attention_map.py --attention
+  python inference_only_attention_map.py --attention --attn-layers 6,15,24
+  python inference_only_attention_map.py --scene-dir /path/to/scene --depth-dir /path/to/depth
 """
 
 from __future__ import annotations
@@ -53,26 +33,26 @@ import yaml
 # CONFIGURATION 
 # =============================================================================
 
-# InternNav repo root (directory that contains the `internnav` package).
-# The notebook uses `../../` relative to scripts/notebooks/.
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Path to the InternVLA-N1 checkpoint directory.
 MODEL_PATH = PROJECT_ROOT / "checkpoints" / "InternVLA-N1-DualVLN"
 
-# Scene folder: must contain instruction.txt and RGB frames (debug_raw_*.jpg).
-SCENE_DIR = PROJECT_ROOT / "assets" / "realworld_sample_data2"
+MODEL_PATH_ORIGINAL = PROJECT_ROOT / "checkpoints" / "InternVLA-N1-DualVLN"
 
-# Base output directory. Each run creates a required timestamped subfolder:
-# output_test/{scene_name}_{YYYYMMDD_HHMMSS}/
+#MODEL_PATH = PROJECT_ROOT / "checkpoints" / "dit" / "290626-only-s1" / "InternVLA-N1-DualVLN-office-rtx5090-v1"
+
+
+SCENE_DIR = PROJECT_ROOT / "assets" / "vr-office" / "rgb"
+
+DEPTH_DIR = PROJECT_ROOT / "assets" / "vr-office" / "depth"
+
 SAVE_DIR = Path(__file__).resolve().parent / f"output_test"
 
-# Compute device.
 DEVICE = "cuda:0"
 
-# Model / preprocessing settings.
-RESIZE_W = 384
-RESIZE_H = 384
+RESIZE_W = 224
+RESIZE_H = 224
 NUM_HISTORY = 8
 PLAN_STEP_GAP = 4
 
@@ -89,28 +69,24 @@ DEFAULT_CAMERA_INTRINSIC = np.array(
 DEFAULT_CAMERA_IMAGE_WIDTH = 640
 DEFAULT_CAMERA_IMAGE_HEIGHT = 480
 
-# Instruction file name in the scene dir
-INSTRUCTION_FILENAME = "instruction.txt"
+
+INSTRUCTION_FILENAME = "instruction_simplified.txt"
 RGB_GLOB_PATTERN = "debug_raw_*.jpg"
 
-# When real depth is unavailable, set with constant
-# Unit is meter
-# The sample dataset has no depth; trajectories will be shorter than ~2 m.
 DUMMY_DEPTH_METERS = 10.0
 
-# Default identity camera pose (4x4) when odometry is not recorded.
 DEFAULT_CAMERA_POSE = np.eye(4)
 
-# Set False to skip saving annotated PNGs (stdout logging only).
 SAVE_VISUALIZATIONS = True
 
-# Stitch saved annotated frames into an mp4 after inference.
 SAVE_VIDEO = True
 VIDEO_FILENAME = "trajectory_video.mp4"
 VIDEO_FPS = 2.0
 
-# Warm up the model with a dummy forward pass before processing the scene.
 WARMUP_MODEL = True
+
+EXTRACT_ATTENTION = False
+ATTN_LAYERS = None  # e.g. 0,8,16,27
 
 
 # ==========================================================
@@ -180,19 +156,27 @@ class Args:
         self,
         device: str,
         model_path: str | Path,
+        model_path_original: str | Path,
         resize_w: int,
         resize_h: int,
         num_history: int,
         camera_intrinsic: np.ndarray,
         plan_step_gap: int,
+        extract_attention: bool = False,
+        attn_layers: list[int] | None = None,
+        attn_implementation: str = "sdpa",
     ):
         self.device = device
         self.model_path = str(model_path)
+        self.model_path_original = str(model_path_original)
         self.resize_w = resize_w
         self.resize_h = resize_h
         self.num_history = num_history
         self.camera_intrinsic = camera_intrinsic
         self.plan_step_gap = plan_step_gap
+        self.extract_attention = extract_attention
+        self.attn_layers = attn_layers
+        self.attn_implementation = attn_implementation
 
 
 def setup_python_path(project_root: Path) -> None:
@@ -226,7 +210,8 @@ def load_rgb_paths(scene_dir: Path, glob_pattern: str) -> list[str]:
 
 
 def make_run_save_dir(base_dir: Path, scene_dir: Path, timestamp: datetime | None = None) -> Path:
-    """Create a unique run directory: {base}/{scene_name}_{YYYYMMDD_HHMMSS}."""
+    """
+    {{base}/{scene_name}_{YYYYMMDD_HHMMSS}."""
     timestamp = timestamp or datetime.now()
     stamp = timestamp.strftime("%Y%m%d_%H%M%S")
     run_dir = base_dir / f"{scene_dir.name}_{stamp}"
@@ -243,7 +228,6 @@ def parse_image_id(rgb_path: str) -> str:
 
 
 def depth_path_for_rgb(rgb_path: str | Path, depth_dir: Path) -> Path | None:
-    """Resolve depth file in depth_dir with the same basename as the RGB file."""
     rgb_name = Path(rgb_path).name
     depth_dir = depth_dir.resolve()
     candidates = [
@@ -495,6 +479,10 @@ def build_agent(args: Args):
     print(f"  image size: {args.resize_w}x{args.resize_h}")
     print(f"  history:    {args.num_history}")
     print(f"  plan gap:   {args.plan_step_gap}")
+    print(f"  attention:  {args.extract_attention}")
+    if args.extract_attention:
+        print(f"  attn impl:  {args.attn_implementation}")
+        print(f"  attn layers:{args.attn_layers or 'default (shallow/mid/deep)'}")
 
     agent = InternVLAN1AsyncAgent(args)
 
@@ -530,7 +518,13 @@ def run_inference(
     save_video: bool,
     video_fps: float,
     video_filename: str,
+    extract_attention: bool = False,
 ) -> None:
+    from internnav.model.utils.s2_attention_viz import (
+        SceneInstructionAttentionTracker,
+        save_attention_visualizations,
+    )
+
     agent.reset()
     print("=" * 80)
     print(f"Processing scene: {scene_dir.name}")
@@ -541,8 +535,12 @@ def run_inference(
 
     if save_visualizations:
         save_dir.mkdir(parents=True, exist_ok=True)
+    attn_dir = save_dir / "attention_maps"
+    if extract_attention:
+        attn_dir.mkdir(parents=True, exist_ok=True)
 
     annotated_frames: list[np.ndarray] = []
+    scene_instruction_tracker = SceneInstructionAttentionTracker() if extract_attention else None
 
     for frame_index, rgb_path in enumerate(rgb_paths):
         look_down = "look_down" in rgb_path
@@ -598,6 +596,21 @@ def run_inference(
             llm_output = "traj"
             pixel_goal = output_pixel
 
+        if extract_attention and dual_sys_output.attention_bundle is not None:
+            bundle = dual_sys_output.attention_bundle
+            frame_tag = f"frame_{frame_index:05d}"
+            if scene_instruction_tracker is not None:
+                scene_instruction_tracker.add(frame_index, bundle)
+            saved_paths = save_attention_visualizations(
+                bundle,
+                agent.input_images,
+                str(attn_dir),
+                frame_tag,
+            )
+            print(f"Saved attention maps for {frame_tag}:")
+            for name, path in saved_paths.items():
+                print(f"  {name}: {path}")
+
         if save_visualizations:
             annotated = annotate_image(
                 image_id,
@@ -611,6 +624,12 @@ def run_inference(
             annotated_frames.append(annotated)
 
     print(f"\nScene {scene_dir.name} completed!")
+    if extract_attention and scene_instruction_tracker is not None:
+        scene_paths = scene_instruction_tracker.save(str(attn_dir))
+        if scene_paths:
+            print("Saved scene-level instruction attention plots:")
+            for name, path in scene_paths.items():
+                print(f"  {name}: {path}")
     if save_visualizations:
         print(f"Saved {len(annotated_frames)} annotated frames to: {save_dir}")
         if save_video:
@@ -714,21 +733,39 @@ def parse_args() -> argparse.Namespace:
             "If omitted, auto-detect (uint16 mm -> /1000, uint8 -> 0-10m, etc.)."
         ),
     )
+    parser.add_argument(
+        "--attention",
+        action="store_true",
+        help="Extract and save S2 text/vision attention maps (uses eager attention)",
+    )
+    parser.add_argument(
+        "--attn-layers",
+        default=None,
+        help="Comma-separated transformer layer indices for attention plots (e.g. 0,8,16,27)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    global WARMUP_MODEL
+    global WARMUP_MODEL, EXTRACT_ATTENTION
 
     cli = parse_args()
     WARMUP_MODEL = WARMUP_MODEL and not cli.no_warmup
+    EXTRACT_ATTENTION = cli.attention
 
     setup_python_path(cli.project_root)
+
+    from internnav.model.utils.s2_attention_viz import parse_layer_list
+
+    attn_layers = parse_layer_list(cli.attn_layers or ATTN_LAYERS)
+    attn_implementation = "eager" if EXTRACT_ATTENTION else "sdpa"
+    device = DEVICE
 
     camera_intrinsic = resolve_camera_intrinsic(cli.camera_intrinsic)
 
     scene_dir = cli.scene_dir.resolve()
     model_path = cli.model_path.resolve()
+    model_path_original = MODEL_PATH_ORIGINAL.resolve()
     save_base_dir = cli.save_dir.resolve()
 
     if not model_path.exists():
@@ -745,8 +782,9 @@ def main() -> None:
     instruction = load_instruction(scene_dir, INSTRUCTION_FILENAME)
     rgb_paths = load_rgb_paths(scene_dir, RGB_GLOB_PATTERN)
 
-    depth_dir = cli.depth_dir.resolve() if cli.depth_dir is not None else None
+    depth_dir = cli.depth_dir.resolve() if cli.depth_dir is not None else DEPTH_DIR
     if depth_dir is not None:
+        print(f"Depth directory: {depth_dir}")
         validate_depth_dir(rgb_paths, depth_dir)
 
     save_dir = make_run_save_dir(save_base_dir, scene_dir)
@@ -773,13 +811,17 @@ def main() -> None:
     print()
 
     args = Args(
-        device=cli.device,
+        device=device,
         model_path=model_path,
+        model_path_original=model_path_original,
         resize_w=RESIZE_W,
         resize_h=RESIZE_H,
         num_history=NUM_HISTORY,
         camera_intrinsic=camera_intrinsic,
         plan_step_gap=PLAN_STEP_GAP,
+        extract_attention=EXTRACT_ATTENTION,
+        attn_layers=attn_layers,
+        attn_implementation=attn_implementation,
     )
 
     agent = build_agent(args)
@@ -798,7 +840,9 @@ def main() -> None:
         save_video=SAVE_VIDEO and not cli.no_video and save_visualizations,
         video_fps=cli.video_fps,
         video_filename=cli.video_name,
+        extract_attention=EXTRACT_ATTENTION,
     )
+
 
 if __name__ == "__main__":
     main()

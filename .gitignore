@@ -152,6 +152,7 @@ checkpoints
 internnav/model/basemodel/LongCLIP/
 .gradio/
 result/
+assets/
 
 # Local datasets / real-world samples
 assets/bkhn_data1/
