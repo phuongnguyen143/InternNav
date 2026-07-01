@@ -74,7 +74,14 @@ R2R_125CM_0_30 = {
 }
 
 BKHN_125CM_0_30 = {
-    "data_path": "vr-office",
+    "data_path": "bkhn_ver3.0",
+    "height": 125,
+    "pitch_1": 0,
+    "pitch_2": 30,
+}
+
+OFFICE_125CM_0_30 = {
+    "data_path": "data/vr-office",
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
@@ -179,6 +186,7 @@ data_dict = {
     "videochatgpt": VIDEOCHATGPT,
     "r2r_125cm_0_30": R2R_125CM_0_30,
     "bkhn_125cm_0_30": BKHN_125CM_0_30,
+    "office_125cm_0_30": OFFICE_125CM_0_30,
     "bkhn_125cm_0_45": BKHN_125CM_0_45,
     "bkhn_60cm_15_15": BKHN_60CM_15_15,
     "bkhn_60cm_30_30": BKHN_60CM_30_30,
@@ -224,6 +232,8 @@ _CUSTOM_DATA_PATH_OVERRIDES = {
     "traj_data/rxr": os.environ.get("INTERNAV_CUSTOM_RXR_DATA_PATH", ""),
     "traj_data/scalevln": os.environ.get("INTERNAV_CUSTOM_SCALEVLN_DATA_PATH", ""),
     "bkhn_ver2.0": os.environ.get("INTERNAV_CUSTOM_BKHN_DATA_PATH", ""),
+    "vr-office": os.environ.get("INTERNAV_CUSTOM_BKHN_DATA_PATH", ""),
+
 }
 
 

@@ -277,6 +277,7 @@ class VlnMoveBySpeedController(BaseController):
         super().__init__(config=config, robot=robot, scene=scene)
 
         self._policy = RLPolicy(path=config.policy_weights_path).get_inference_policy(device='cpu')
+        #self._policy = None
         self.joint_subset = None
         self.joint_names = config.joint_names
         self.gym_adapter = gymutil.gym_adapter(self.joint_names_gym, self.joint_names_sim)
@@ -302,6 +303,31 @@ class VlnMoveBySpeedController(BaseController):
         rotation_speed: float = 0,
         lateral_speed: float = 0,
     ) -> ArticulationAction:
+        
+        if self._policy is None:
+            joint_positions = np.array(
+                [
+                    0.0, 0.0, 0.0,
+                    0.0, 0.0,
+                    0.0, 0.0,
+                    -0.4, -0.4,
+                    0.0, 0.0,
+                    0.8, 0.8,
+                    0.0, 0.0,
+                    -0.4, -0.4,
+                    0.0, 0.0,
+                ],
+                dtype=np.float32,
+            )
+
+            if self.joint_subset is None:
+                return ArticulationAction(joint_positions=joint_positions)
+
+            return self.joint_subset.make_articulation_action(
+                joint_positions=joint_positions,
+                joint_velocities=None,
+            )
+
         if self._apply_times_left > 0:
             self._apply_times_left -= 1
             if self.joint_subset is None:

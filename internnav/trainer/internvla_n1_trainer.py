@@ -313,7 +313,9 @@ def train(attn_implementation="sdpa"):
         ).image_processor
         data_args.model_type = "qwen2.5vl"
     else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        if is_rank0():
+            print(f"Loading full dual-system checkpoint from {model_args.model_name_or_path}")
+        model = InternVLAN1ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
@@ -323,7 +325,8 @@ def train(attn_implementation="sdpa"):
         data_args.image_processor = Qwen2VLImageProcessor.from_pretrained(
             model_args.model_name_or_path,
         )
-        data_args.model_type = "qwen2vl"
+        data_args.model_type = "intern-n1-custom"
+        loaded_full_dual_checkpoint = True
 
     # --- Memory / attention optimizations ---
     # data_flatten swaps in a flattened attention kernel; disable KV cache during training.
@@ -382,6 +385,13 @@ def train(attn_implementation="sdpa"):
     if is_rank0():
         print(f"train_dataset size: {len(train_dataset)}")
         print(f"TensorBoard:     {train_tensorboard_log_dir(training_args)}")
+        print("\n=== LR scheduler ===")
+        print(f"learning_rate:     {training_args.learning_rate}")
+        print(f"lr_scheduler_type: {training_args.lr_scheduler_type}")
+        print(f"lr_scheduler_kwargs: {training_args.lr_scheduler_kwargs}")
+        print(f"warmup_ratio:      {training_args.warmup_ratio}")
+        print(f"warmup_steps:      {training_args.warmup_steps}")
+        print("=== End LR scheduler ===\n")
         print_status_block("after_dataset_load")
     if len(train_dataset) == 0:
         raise RuntimeError(
@@ -410,22 +420,28 @@ def train(attn_implementation="sdpa"):
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
         print_status_block("before_train_loop")
 
+    print("len dataset: ", len(train_dataset))
+
     if frozen_smoke:
         print("We running frozen smoke test")
         run_frozen_smoke_test(trainer)
     elif list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print("We are training from checkpoint")
         logging.info("checkpoint found, resume training")
-        trainer.train(resume_from_checkpoint=True)
-        trainer.save_state()
-        data_args.image_processor.save_pretrained(training_args.output_dir)
-        model.config.use_cache = True
-        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        # trainer.train(resume_from_checkpoint=True)
+        # trainer.save_state()
+        # data_args.image_processor.save_pretrained(training_args.output_dir)
+        # model.config.use_cache = True
+        # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
     else:
         trainer.train()
         trainer.save_state()
         data_args.image_processor.save_pretrained(training_args.output_dir)
         model.config.use_cache = True
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    
+
+
 
 
 if __name__ == "__main__":

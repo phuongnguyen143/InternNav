@@ -59,13 +59,13 @@ total_gpus=$((NPROC_PER_NODE * NNODES))
 TARGET_EFFECTIVE_BATCH="${TARGET_EFFECTIVE_BATCH:-64}"
 
 vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%0}"
-DEFAULT_DATA_ROOT="/mnt/data/sftp/data/tungns30/intern_n1/vln_ce"
+DEFAULT_DATA_ROOT="data/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
 export INTERNAV_SCALEVLN_DATA_PATH="${INTERNAV_SCALEVLN_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/scalevln}"
 
-vln_dataset_custom="${VLN_DATASETS_CUSTOM:-bkhn_125cm_0_30}"
-DEFAULT_CUSTOM_DATA_ROOT="/mnt/data/sftp/data/khangnh11"
+vln_dataset_custom="${VLN_DATASETS_CUSTOM:-office_125cm_0_30}"
+DEFAULT_CUSTOM_DATA_ROOT="data"
 export INTERNAV_CUSTOM_BKHN_DATA_PATH="${INTERNAV_CUSTOM_BKHN_DATA_PATH:-${DEFAULT_CUSTOM_DATA_ROOT}/vr-office}"
 
 if [[ "${LOW_MEM:-False}" == "True" ]]; then
@@ -92,14 +92,14 @@ elif [[ "${HIGH_MEM:-False}" == "True" ]]; then
     _default_omp_threads=8
 else
     _default_deepspeed="scripts/train/qwenvl_train/zero2.json"
-    _default_batch_size=4
+    _default_batch_size=2
     _default_resize=384
-    _default_model_max_length=4096
-    _default_max_pixels=200704
-    _default_num_history=4
+    _default_model_max_length=8192
+    _default_max_pixels=313600
+    _default_num_history=8
     _default_data_aug=True
     _default_torch_empty_cache=25
-    _default_dataloader_workers=4
+    _default_dataloader_workers=2
     _default_omp_threads=4
 fi
 
@@ -107,7 +107,9 @@ _default_grad_accum=$(( (TARGET_EFFECTIVE_BATCH + total_gpus * _default_batch_si
 
 deepspeed="${DEEPSPEED_CONFIG:-${DEEPSPEED:-${_default_deepspeed}}}"
 
-system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-w-NavDP}"
+
+# /home/phuongnh/khang/InternNav/checkpoints/InternVLA-N1-DualVLN-office-rtx5090-v1
+system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-DualVLN-office-rtx5090-v1}"
 if [[ -d "${system2_ckpt}" ]]; then
     system2_ckpt="$(cd "${system2_ckpt}" && pwd)"
 elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
@@ -115,9 +117,9 @@ elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
 fi
 
 # system1 options: navdp_async, nextdit_async, nextdit
-system1="${SYSTEM1:-navdp_async}"
+system1="${SYSTEM1:-nextdit_async}"
 
-lr="${LR:-1e-4}"
+lr="${LR:-2e-5}"
 batch_size="${BATCH_SIZE:-${_default_batch_size}}"
 grad_accum_steps="${GRAD_ACCUM_STEPS:-${_default_grad_accum}}"
 max_pixels="${MAX_PIXELS:-${_default_max_pixels}}"
@@ -150,7 +152,7 @@ print_gpu_preflight() {
     echo ""
 }
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-office-rtx5090-v1}"
+run_name="${RUN_NAME:-InternVLA-N1-DualVLN-office-rtx5090-v2}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 
 extra_args=()
@@ -160,8 +162,8 @@ if [ -n "${MAX_STEPS:-}" ]; then
     save_steps=1000000
     report_to="none"
 else
-    num_epochs="${NUM_TRAIN_EPOCHS:-3.0}"
-    save_steps=5
+    num_epochs="${NUM_TRAIN_EPOCHS:-2}"
+    save_steps=100
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
@@ -228,8 +230,8 @@ fi
     --vln_dataset_use "${vln_datasets}" \
     --vln_dataset_custom "${vln_dataset_custom}" \
     --data_flatten False \
-    --tune_mm_vision True \
-    --tune_mm_mlp True \
+    --tune_mm_vision False \
+    --tune_mm_mlp False \
     --tune_mm_llm False \
     --bf16 \
     --num_history "${num_history}" \
@@ -254,10 +256,10 @@ fi
     --save_total_limit 5 \
     --learning_rate "${lr}" \
     --weight_decay 0 \
-    --warmup_ratio 0.003 \
+    --warmup_ratio 0.03 \
     --max_grad_norm 1 \
     --lr_scheduler_type "cosine_with_min_lr" \
-    --lr_scheduler_kwargs '{"min_lr": 1e-05}' \
+    --lr_scheduler_kwargs '{"min_lr": 1e-06}' \
     --logging_steps 1 \
     --logging_first_step True \
     --include_num_input_tokens_seen True \

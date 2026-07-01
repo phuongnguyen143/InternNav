@@ -77,6 +77,6 @@ eval_cfg = EvalCfg(
     eval_settings={
         'save_to_json': True,
         'vis_output': True,
-        'use_agent_server': False,  # If use_agent_server=True, please start the agent server first.
+        'use_agent_server': True,  # If use_agent_server=True, please start the agent server first.
     },
 )
