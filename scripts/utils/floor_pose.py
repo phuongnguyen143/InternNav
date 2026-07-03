@@ -306,15 +306,15 @@ def camera_c2w_to_floor_pose(
     ground_offset_y: float = 1.5,
 ) -> Tuple[float, float, float, float, np.ndarray]:
     """SLAM export: leveled-camera floor contact → floor (x, y, yaw) + world xyz."""
-    from utils.slam_ground import floor_world_from_camera_c2w, leveled_camera_rotation
+    from utils.slam_ground import floor_world_from_camera_c2w, rotation_x_pitch_deg
 
     T = np.asarray(T_world_cam, dtype=np.float64).reshape(4, 4)
     world_proj = project_points_to_plane(
         floor_world_from_camera_c2w(T, camera_pitch_deg, ground_offset_y).reshape(1, 3),
         floor_plane,
     )[0]
-    R_level = leveled_camera_rotation(T[:3, :3], camera_pitch_deg)
-    yaw = yaw_from_forward_on_floor_plane(R_level[:, 2], floor_plane)
+    forward = (T[:3, :3] @ rotation_x_pitch_deg(-camera_pitch_deg))[:, 2]
+    yaw = yaw_from_forward_on_floor_plane(forward, floor_plane)
 
     origin, x_ax, y_ax, _ = build_floor_frame(floor_plane)
     delta = world_proj - origin

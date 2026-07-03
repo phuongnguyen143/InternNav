@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -157,6 +157,7 @@ class S2Output:
     output_latent: Optional[torch.Tensor] = None
     rgb_memory: Optional[np.ndarray] = None  # 用于记录pixel goal那一帧的rgb
     depth_memory: Optional[np.ndarray] = None  # 用于记录pixel goal那一帧的depth
+    attention_bundle: Optional[Any] = None  # S2AttentionBundle when attention viz is enabled
 
     def validate(self):
         """确保output_action、output_pixel和output_latent中只有一个为非None"""

@@ -53,7 +53,9 @@ class NextDiTCrossAttn(PreTrainedModel):
         config: NextDiTCrossAttnConfig,
     ) -> None:
         super().__init__(config)
-        assert config.learn_sigma is False, "learn_sigma is not supported in nextdit-crossattn"
+        assert config.learn_sigma is False, (
+            "learn_sigma is not supported in nextdit-crossattn"
+        )
         self._gradient_checkpointing = config._gradient_checkpointing
 
         self.model = LuminaNextDiT2DModel(
@@ -88,7 +90,9 @@ class NextDiTCrossAttn(PreTrainedModel):
             hidden_states=x,
             timestep=timestep,
             encoder_hidden_states=z_latents,
-            encoder_mask=torch.ones((z_latents.shape[0], z_latents.shape[1]), device=z_latents.device),
+            encoder_mask=torch.ones(
+                (z_latents.shape[0], z_latents.shape[1]), device=z_latents.device
+            ),
             image_rotary_emb=None,
             cross_attention_kwargs=dict(),
         ).sample

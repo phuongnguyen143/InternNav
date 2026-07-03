@@ -8,3 +8,10 @@ paths:
   camera_odom: ${data_root}/raw_rosbag/bkhn_round2/odometry_bkhn_round2_point2plane.txt
   floor_trajectory: ${data_root}/raw_rosbag/bkhn_round2/floor_trajectory.txt
   output_dir: ${data_root}/process_keyframe/bkhn_round2
+keyframe:
+  sharp_turn_thresh_deg: 25.0
+  curvature_thresh_deg: 25.0
+  max_dist_between_keyframes: 3
+  min_dist_between_keyframes: 1
+  keyframes_per_episode: 12
+  record_fps: 15

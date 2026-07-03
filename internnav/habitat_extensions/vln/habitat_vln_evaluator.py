@@ -445,7 +445,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
 
                         with torch.no_grad():
-                            traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                            traj_latents = self.model.generate_latents(
+                                output_ids,
+                                pixel_values,
+                                image_grid_thw,
+                                pixel_goal=pixel_goal,
+                                image_hw=(self.model_args.resize_h, self.model_args.resize_w),
+                            )
 
                         # prepocess align with navdp
                         image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255

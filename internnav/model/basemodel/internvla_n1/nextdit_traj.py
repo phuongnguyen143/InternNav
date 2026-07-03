@@ -111,12 +111,22 @@ class LuminaNextDiTBlock(nn.Module):
             norm_eps=norm_eps,
             norm_elementwise_affine=norm_elementwise_affine,
         )
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+        self.ffn_norm1 = RMSNorm(
+            dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine
+        )
 
-        self.norm2 = RMSNorm(dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+        self.norm2 = RMSNorm(
+            dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine
+        )
+        self.ffn_norm2 = RMSNorm(
+            dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine
+        )
 
-        self.norm1_context = RMSNorm(cross_attention_dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine)
+        self.norm1_context = RMSNorm(
+            cross_attention_dim,
+            eps=norm_eps,
+            elementwise_affine=norm_elementwise_affine,
+        )
 
     def forward(
         self,
@@ -143,7 +153,9 @@ class LuminaNextDiTBlock(nn.Module):
         residual = hidden_states
 
         # Self-attention
-        norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(hidden_states, temb)
+        norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(
+            hidden_states, temb
+        )
         self_attn_output = self.attn1(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_hidden_states,
@@ -169,11 +181,17 @@ class LuminaNextDiTBlock(nn.Module):
         # linear proj
         hidden_states = self.attn2.to_out[0](mixed_attn_output)
 
-        hidden_states = residual + gate_msa.unsqueeze(1).tanh() * self.norm2(hidden_states)
+        hidden_states = residual + gate_msa.unsqueeze(1).tanh() * self.norm2(
+            hidden_states
+        )
 
-        mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
+        mlp_output = self.feed_forward(
+            self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1))
+        )
 
-        hidden_states = hidden_states + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(mlp_output)
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1).tanh() * self.ffn_norm2(
+            mlp_output
+        )
 
         return hidden_states
 
@@ -256,9 +274,14 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         self.scaling_factor = scaling_factor
         self.gradient_checkpointing = False
 
-        self.caption_projection = PixArtAlphaTextProjection(in_features=cross_attention_dim, hidden_size=hidden_size)
+        self.caption_projection = PixArtAlphaTextProjection(
+            in_features=cross_attention_dim, hidden_size=hidden_size
+        )
         self.patch_embedder = LuminaPatchEmbed(
-            patch_size=patch_size, in_channels=in_channels, embed_dim=hidden_size, bias=True
+            patch_size=patch_size,
+            in_channels=in_channels,
+            embed_dim=hidden_size,
+            bias=True,
         )
 
         self.time_caption_embed = LuminaCombinedTimestepCaptionEmbedding(
@@ -290,7 +313,9 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         )
         # self.final_layer = LuminaFinalLayer(hidden_size, patch_size, self.out_channels)
 
-        assert (hidden_size // num_attention_heads) % 4 == 0, "2d rope needs head dim to be divisible by 4"
+        assert (hidden_size // num_attention_heads) % 4 == 0, (
+            "2d rope needs head dim to be divisible by 4"
+        )
 
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
@@ -317,7 +342,10 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         """
 
         mask = torch.ones(
-            hidden_states.shape[0], hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=torch.int32,
+            device=hidden_states.device,
         )
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         temb = self.time_caption_embed(timestep, encoder_hidden_states, encoder_mask)
@@ -336,7 +364,9 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
 
                     return custom_forward
 
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                ckpt_kwargs: Dict[str, Any] = (
+                    {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                )
                 hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
                     hidden_states,

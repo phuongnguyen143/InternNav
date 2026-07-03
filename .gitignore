@@ -161,4 +161,4 @@ scripts/dataset_converters/bkhn_ver1.0
 scripts/dataset_converters/bkhn_ver2.0
 scripts/notebooks/*.whl
 scripts/dataset_converters/decode_depth_image.py
-scripts/process_odom/mapping/
+scripts/process_odom/mapping/test_data/

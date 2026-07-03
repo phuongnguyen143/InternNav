@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusion_policy.model.diffusion.positional_embedding import SinusoidalPosEmb
 
-from internnav.model.encoder.navdp_backbone import *  # noqa: F403
+from internnav.model.encoder.navdp_backbone import SinusoidalPosEmb
+from internnav.model.encoder.navdp_backbone import *  # noqa: F403, F401
 
 local_rank = None
 

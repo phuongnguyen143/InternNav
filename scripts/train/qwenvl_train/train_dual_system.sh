@@ -32,7 +32,7 @@ vln_datasets=r2r_125cm_0_30%30,r2r_60cm_15_15%30,rxr_125cm_0_30%30,rxr_60cm_15_1
 run_name=InternVLA-N1-DualVLN
 output_dir=checkpoints/${run_name}
 # system 1 options: nextdit_async, navdp_async, nextdit
-system1=nextdit_async
+system1=
 
 system2_ckpt=checkpoints/InternVLA-N1-System2
 

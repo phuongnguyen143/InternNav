@@ -235,12 +235,62 @@ def get_video_frame_count(video_path: Path) -> int:
     return n
 
 
+def subsampled_frame_count(n_frames: int, frame_stride: int) -> int:
+    if n_frames <= 0:
+        return 0
+    stride = max(int(frame_stride), 1)
+    return (n_frames + stride - 1) // stride
+
+
+def compute_dataset_fps(fps: int, frame_stride: int) -> int:
+    """LeRobot metadata fps: spacing between saved frames (source_fps / stride)."""
+    stride = max(int(frame_stride), 1)
+    if stride == 1:
+        return fps
+    if fps % stride != 0:
+        logger.warning(
+            f"fps={fps} is not divisible by frame_stride={stride}; "
+            f"rounding dataset fps to {max(1, round(fps / stride))} in info.json."
+        )
+        return max(1, round(fps / stride))
+    return fps // stride
+
+
+def frame_timestamp(frame_index: int, fps: int, frame_stride: int) -> float:
+    stride = max(int(frame_stride), 1)
+    return float(frame_index * stride) / fps
+
+
+def check_timestamps_sync_strided(
+    timestamps: np.ndarray,
+    episode_indices: np.ndarray,
+    episode_data_index: dict[str, np.ndarray],
+    fps: int,
+    frame_stride: int,
+    tolerance_s: float,
+) -> None:
+    expected_delta = (max(int(frame_stride), 1) / fps) if frame_stride > 1 else (1.0 / fps)
+    diffs = np.diff(timestamps)
+    within_tolerance = np.abs(diffs - expected_delta) <= tolerance_s
+
+    mask = np.ones(len(diffs), dtype=bool)
+    ignored_diffs = episode_data_index["to"][:-1] - 1
+    mask[ignored_diffs] = False
+    if not np.all(within_tolerance[mask]):
+        raise ValueError(
+            f"Timestamp spacing mismatch with fps={fps}, frame_stride={frame_stride} "
+            f"(expected delta {expected_delta:.6f}s)."
+        )
+
+
 def extract_frames_from_video(
     video_path: Path,
     out_dir: Path,
     ep_index: int,
     ext: str,
     resize_wh: Optional[Tuple[int, int]] = None,
+    frame_stride: int = 1,
+    n_frames: Optional[int] = None,
 ) -> int:
     """Extract video frames to episode_{ep:06d}_{frame}.{ext}."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -248,18 +298,24 @@ def extract_frames_from_video(
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    count = 0
+    stride = max(int(frame_stride), 1)
+    read_idx = 0
+    out_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if resize_wh:
-            frame = cv2.resize(frame, resize_wh)
-        fname = f"episode_{ep_index:06d}_{count}.{ext}"
-        cv2.imwrite(str(out_dir / fname), frame)
-        count += 1
+        if n_frames is not None and read_idx >= n_frames:
+            break
+        if read_idx % stride == 0:
+            if resize_wh:
+                frame = cv2.resize(frame, resize_wh)
+            fname = f"episode_{ep_index:06d}_{out_count}.{ext}"
+            cv2.imwrite(str(out_dir / fname), frame)
+            out_count += 1
+        read_idx += 1
     cap.release()
-    return count
+    return out_count
 
 
 def extract_depth_frames_from_dir(
@@ -269,11 +325,14 @@ def extract_depth_frames_from_dir(
     start_frame: int,
     n_frames: int,
     resize_wh: Optional[Tuple[int, int]] = None,
+    frame_stride: int = 1,
 ) -> int:
     """Extract uint16 mm depth PNGs to episode_{ep:06d}_{frame}.png."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    for count in range(n_frames):
-        src = depth_frames_dir / f"frame_{start_frame + count:06d}.png"
+    stride = max(int(frame_stride), 1)
+    out_count = 0
+    for src_offset in range(0, n_frames, stride):
+        src = depth_frames_dir / f"frame_{start_frame + src_offset:06d}.png"
         if not src.exists():
             raise RuntimeError(f"Missing depth frame: {src}")
         depth_mm = cv2.imread(str(src), cv2.IMREAD_ANYDEPTH)
@@ -286,10 +345,11 @@ def extract_depth_frames_from_dir(
             )
         if resize_wh:
             depth_mm = resize_depth_nearest(depth_mm, resize_wh)
-        fname = f"episode_{ep_index:06d}_{count}.png"
+        fname = f"episode_{ep_index:06d}_{out_count}.png"
         if not cv2.imwrite(str(out_dir / fname), depth_mm):
             raise RuntimeError(f"Failed to write depth frame: {out_dir / fname}")
-    return n_frames
+        out_count += 1
+    return out_count
 
 
 def extract_legacy_depth_frames_from_video(
@@ -297,6 +357,8 @@ def extract_legacy_depth_frames_from_video(
     out_dir: Path,
     ep_index: int,
     resize_wh: Optional[Tuple[int, int]] = None,
+    frame_stride: int = 1,
+    n_frames: Optional[int] = None,
 ) -> int:
     """Convert legacy 8-bit depth.mp4 preview frames to uint16 mm LeRobot PNGs."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,22 +366,28 @@ def extract_legacy_depth_frames_from_video(
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open legacy depth video: {depth_video}")
 
-    count = 0
+    stride = max(int(frame_stride), 1)
+    read_idx = 0
+    out_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if len(frame.shape) == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        depth_mm = legacy_depth_vis_to_uint16_mm(frame)
-        if resize_wh:
-            depth_mm = resize_depth_nearest(depth_mm, resize_wh)
-        fname = f"episode_{ep_index:06d}_{count}.png"
-        if not cv2.imwrite(str(out_dir / fname), depth_mm):
-            raise RuntimeError(f"Failed to write legacy depth frame: {out_dir / fname}")
-        count += 1
+        if n_frames is not None and read_idx >= n_frames:
+            break
+        if read_idx % stride == 0:
+            if len(frame.shape) == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            depth_mm = legacy_depth_vis_to_uint16_mm(frame)
+            if resize_wh:
+                depth_mm = resize_depth_nearest(depth_mm, resize_wh)
+            fname = f"episode_{ep_index:06d}_{out_count}.png"
+            if not cv2.imwrite(str(out_dir / fname), depth_mm):
+                raise RuntimeError(f"Failed to write legacy depth frame: {out_dir / fname}")
+            out_count += 1
+        read_idx += 1
     cap.release()
-    return count
+    return out_count
 
 
 def duplicate_frame_dir(src_dir: Path, dst_dir: Path) -> None:
@@ -342,6 +410,7 @@ def export_episode_images(
     start_frame: int = 0,
     n_frames: Optional[int] = None,
     legacy_depth_video: Optional[Path] = None,
+    frame_stride: int = 1,
 ) -> Dict[str, Path]:
     """
     Extract per-frame images and duplicate into all required setting folders.
@@ -352,7 +421,13 @@ def export_episode_images(
 
     rgb_0_tmp = tmp_base / "rgb_125cm_0deg"
     n_rgb = extract_frames_from_video(
-        rgb_video, rgb_0_tmp, ep_index, "jpg", resize_wh=resize_wh
+        rgb_video,
+        rgb_0_tmp,
+        ep_index,
+        "jpg",
+        resize_wh=resize_wh,
+        frame_stride=frame_stride,
+        n_frames=n_frames,
     )
     if n_rgb == 0:
         raise RuntimeError(f"No RGB frames extracted from {rgb_video}")
@@ -378,6 +453,7 @@ def export_episode_images(
             start_frame=start_frame,
             n_frames=depth_count,
             resize_wh=resize_wh,
+            frame_stride=frame_stride,
         )
         if n_depth != n_rgb:
             logger.warning(
@@ -400,6 +476,8 @@ def export_episode_images(
             depth_30_tmp,
             ep_index,
             resize_wh=resize_wh,
+            frame_stride=frame_stride,
+            n_frames=n_frames,
         )
         if n_depth != n_rgb:
             logger.warning(
@@ -489,11 +567,16 @@ class NavDataset(LeRobotDataset):
         robot_type: str | None = None,
         tolerance_s: float = 1e-4,
         video_backend: str | None = None,
+        frame_stride: int = 1,
     ) -> "NavDataset":
+        stride = max(int(frame_stride), 1)
+        dataset_fps = compute_dataset_fps(fps, stride)
         obj = cls.__new__(cls)
+        obj.frame_stride = stride
+        obj.source_fps = fps
         obj.meta = NavDatasetMetadata.create(
             repo_id=repo_id,
-            fps=fps,
+            fps=dataset_fps,
             robot_type=robot_type,
             features=features,
             root=root,
@@ -591,13 +674,23 @@ class NavDataset(LeRobotDataset):
 
         ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
-        check_timestamps_sync(
-            episode_buffer["timestamp"],
-            episode_buffer["episode_index"],
-            ep_data_index_np,
-            self.fps,
-            self.tolerance_s,
-        )
+        if self.frame_stride > 1 and self.source_fps % self.frame_stride != 0:
+            check_timestamps_sync_strided(
+                episode_buffer["timestamp"],
+                episode_buffer["episode_index"],
+                ep_data_index_np,
+                self.source_fps,
+                self.frame_stride,
+                self.tolerance_s,
+            )
+        else:
+            check_timestamps_sync(
+                episode_buffer["timestamp"],
+                episode_buffer["episode_index"],
+                ep_data_index_np,
+                self.fps,
+                self.tolerance_s,
+            )
         self.episode_buffer = self.create_episode_buffer()
 
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
@@ -618,6 +711,8 @@ def write_internvla_info_json(
     total_episodes: int,
     total_frames: int,
     total_tasks: int,
+    source_fps: Optional[int] = None,
+    frame_stride: int = 1,
 ) -> None:
     """Finalize meta/info.json to match GdvgFV5R1Z5 schema."""
     features: Dict = {
@@ -663,18 +758,80 @@ def write_internvla_info_json(
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "features": features,
     }
+    stride = max(int(frame_stride), 1)
+    if stride > 1:
+        info["source_fps"] = source_fps if source_fps is not None else fps * stride
+        info["frame_stride"] = stride
     write_info(info, root)
+
+
+def validate_converted_dataset(scene_root: Path, rgb_setting: Tuple[int, int] = (125, 0)) -> List[str]:
+    """Check parquet rows, episode lengths, and image counts stay aligned."""
+    issues: List[str] = []
+    episodes_path = scene_root / "meta" / "episodes.jsonl"
+    if not episodes_path.is_file():
+        return [f"Missing {episodes_path}"]
+
+    import pyarrow.parquet as pq
+
+    height_cm, pitch_deg = rgb_setting
+    rgb_key = image_rgb_key(height_cm, pitch_deg)
+    depth_key = image_depth_key(height_cm, 30)
+
+    for line in episodes_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        ep = json.loads(line)
+        ep_id = ep["episode_index"]
+        ep_len = ep["length"]
+        chunk = ep_id // 1000
+        pq_path = scene_root / "data" / f"chunk-{chunk:03d}" / f"episode_{ep_id:06d}.parquet"
+        if not pq_path.is_file():
+            issues.append(f"episode {ep_id}: missing parquet")
+            continue
+        df = pq.read_table(pq_path).to_pandas()
+        if len(df) != ep_len:
+            issues.append(
+                f"episode {ep_id}: parquet rows ({len(df)}) != episodes.jsonl length ({ep_len})"
+            )
+
+        rgb_dir = scene_root / "videos" / f"chunk-{chunk:03d}" / rgb_key
+        rgb_files = sorted(rgb_dir.glob(f"episode_{ep_id:06d}_*")) if rgb_dir.is_dir() else []
+        depth_dir = scene_root / "videos" / f"chunk-{chunk:03d}" / depth_key
+        depth_files = sorted(depth_dir.glob(f"episode_{ep_id:06d}_*")) if depth_dir.is_dir() else []
+
+        for label, files in (("rgb", rgb_files), ("depth", depth_files)):
+            if len(files) != ep_len:
+                issues.append(
+                    f"episode {ep_id}: {label} images ({len(files)}) != length ({ep_len})"
+                )
+            ids = sorted(int(f.stem.split("_")[-1]) for f in files)
+            if ids != list(range(len(ids))):
+                issues.append(f"episode {ep_id}: {label} frame indices not contiguous from 0")
+
+        if len(df) > 1:
+            info = json.loads((scene_root / "meta" / "info.json").read_text())
+            diffs = np.diff(df["timestamp"].to_numpy())
+            expected = 1.0 / info["fps"]
+            if not np.allclose(diffs, expected, atol=1e-3):
+                issues.append(
+                    f"episode {ep_id}: timestamp delta {diffs.mean():.4f} != 1/fps ({expected:.4f})"
+                )
+
+    return issues
 
 
 def collect_poses_for_episode(
     n_frames: int,
     start_frame: int,
     poses_by_frame_idx: Dict[int, Dict],
+    frame_stride: int = 1,
 ) -> List[Dict]:
     poses: List[Dict] = []
     last_pose: Optional[Dict] = None
-    for i in range(n_frames):
-        global_idx = start_frame + i
+    stride = max(int(frame_stride), 1)
+    for src_offset in range(0, n_frames, stride):
+        global_idx = start_frame + src_offset
         pose = poses_by_frame_idx.get(global_idx)
         if pose is None:
             if last_pose is None:
@@ -700,6 +857,7 @@ def convert_episode(
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
     goal_lookahead_adaptive: bool = True,
     apply_body2optical: bool = True,
+    frame_stride: int = 1,
 ) -> bool:
     lerobot_dataset.episode_buffer = lerobot_dataset.create_episode_buffer()
 
@@ -737,6 +895,18 @@ def convert_episode(
             print("  [SKIP] No frames.")
             return False
 
+        stride = max(int(frame_stride), 1)
+        n_output = subsampled_frame_count(n_frames, stride)
+        if stride > 1:
+            print(
+                f"  Frame stride {stride}: {n_frames} source → {n_output} saved frames"
+            )
+        if n_output == 0:
+            print("  [SKIP] No frames after subsampling.")
+            return False
+
+        effective_lookahead = max(1, goal_lookahead_frames // stride)
+
         print("  Extracting frames …", end=" ", flush=True)
         chunk = lerobot_dataset.meta.get_episode_chunk(ep_index)
         image_files = export_episode_images(
@@ -749,10 +919,13 @@ def convert_episode(
             start_frame=start_frame,
             n_frames=n_frames,
             legacy_depth_video=src_depth_mp4 if not src_depth_frames.exists() else None,
+            frame_stride=stride,
         )
         print("done")
 
-        poses = collect_poses_for_episode(n_frames, start_frame, poses_by_frame_idx)
+        poses = collect_poses_for_episode(
+            n_frames, start_frame, poses_by_frame_idx, frame_stride=stride
+        )
         frame_records = build_frame_labels(
             poses,
             floor_plane,
@@ -761,18 +934,18 @@ def convert_episode(
             TGT_W,
             TGT_H,
             goal_setting=(height_cm, pitch_lookdown),
-            goal_lookahead_frames=goal_lookahead_frames,
+            goal_lookahead_frames=effective_lookahead,
             goal_lookahead_adaptive=goal_lookahead_adaptive,
             apply_body2optical=apply_body2optical,
         )
 
-        print(f"  Adding {n_frames} frames …", end=" ", flush=True)
+        print(f"  Adding {n_output} frames …", end=" ", flush=True)
         for i, rec in enumerate(frame_records):
             frame = {k: v for k, v in rec.items()}
             lerobot_dataset.add_frame(
                 frame=frame,
                 task=instruction,
-                timestamp=float(i) / fps,
+                timestamp=frame_timestamp(i, fps, stride),
             )
         print("done")
 
@@ -781,9 +954,12 @@ def convert_episode(
         shutil.rmtree(lerobot_dataset.root / "_tmp" / f"episode_{ep_index:06d}", ignore_errors=True)
 
         ep_idx = lerobot_dataset.meta.total_episodes - 1
+        dataset_fps = compute_dataset_fps(fps, stride)
         print(
             f"  ✓ {episode_dir.name} → episode {ep_idx:06d} "
-            f"({n_frames} frames @ {fps} fps, global frames {start_frame}-{start_frame + n_frames - 1})"
+            f"({n_output} frames @ {dataset_fps} fps dataset, "
+            f"source {fps} fps stride {stride}, "
+            f"source frames {start_frame}-{start_frame + n_frames - 1})"
         )
         return True
 
@@ -819,6 +995,7 @@ def main(
     goal_lookahead_frames: int = DEFAULT_LOOKAHEAD_FRAMES,
     goal_lookahead_adaptive: bool = True,
     apply_body2optical: bool = True,
+    frame_stride: int = 1,
 ) -> None:
     episodes_dir = keyframe_root / "episodes"
     if not episodes_dir.exists():
@@ -842,7 +1019,10 @@ def main(
 
     print(f"Found {len(episode_dirs)} episodes")
     print(f"Scene ID          : {scene_id}")
-    print(f"FPS               : {fps}")
+    print(f"FPS (dataset)     : {compute_dataset_fps(fps, frame_stride)}")
+    if max(int(frame_stride), 1) > 1:
+        print(f"Source FPS        : {fps}")
+    print(f"Frame stride      : {max(int(frame_stride), 1)}")
     print(f"Resolution        : {TGT_W}×{TGT_H}")
     print(f"Camera setting    : {height_cm}cm horizon {pitch_horizon}° / lookdown {pitch_lookdown}°")
     print(f"Goal lookahead    : {goal_lookahead_frames} frames")
@@ -872,6 +1052,7 @@ def main(
         robot_type="unknown",
         fps=fps,
         features=features,
+        frame_stride=frame_stride,
     )
 
     success = 0
@@ -891,6 +1072,7 @@ def main(
                 goal_lookahead_frames=goal_lookahead_frames,
                 goal_lookahead_adaptive=goal_lookahead_adaptive,
                 apply_body2optical=apply_body2optical,
+                frame_stride=frame_stride,
             ):
                 success += 1
         except Exception as e:
@@ -900,13 +1082,26 @@ def main(
             traceback.print_exc()
 
     meta = lerobot_dataset.meta
+    dataset_fps = compute_dataset_fps(fps, frame_stride)
     write_internvla_info_json(
         scene_root,
-        fps=fps,
+        fps=dataset_fps,
         total_episodes=meta.total_episodes,
         total_frames=meta.total_frames,
         total_tasks=meta.info.get("total_tasks", meta.total_episodes),
+        source_fps=fps,
+        frame_stride=frame_stride,
     )
+
+    validation_issues = validate_converted_dataset(scene_root)
+    if validation_issues:
+        print(f"\n[WARN] Dataset validation found {len(validation_issues)} issue(s):")
+        for issue in validation_issues[:20]:
+            print(f"  - {issue}")
+        if len(validation_issues) > 20:
+            print(f"  ... and {len(validation_issues) - 20} more")
+    else:
+        print("\nDataset validation: parquet, images, and timestamps are consistent.")
 
     sep = "=" * 60
     print(f"\n{sep}")
@@ -923,6 +1118,12 @@ if __name__ == "__main__":
     parser.add_argument("--lerobot_out", type=str, default=str(LEROBOT_OUT))
     parser.add_argument("--scene_id", type=str, default=SCENE_ID)
     parser.add_argument("--fps", type=int, default=DATASET_FPS)
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=1,
+        help="Keep every Nth source frame (1=all). Reduces images saved per episode.",
+    )
     parser.add_argument(
         "--camera_intrinsic",
         type=str,
@@ -968,6 +1169,8 @@ if __name__ == "__main__":
         help="Skip body→optical transform (SLAM/DROID optical odom)",
     )
     args = parser.parse_args()
+    if args.frame_stride < 1:
+        parser.error("--frame_stride must be >= 1")
 
     apply_body2optical = True
     camera_intrinsic = load_camera_intrinsic(args.camera_intrinsic)
@@ -1003,4 +1206,5 @@ if __name__ == "__main__":
         goal_lookahead_frames=args.goal_lookahead,
         goal_lookahead_adaptive=not args.no_goal_lookahead_adaptive,
         apply_body2optical=apply_body2optical,
+        frame_stride=args.frame_stride,
     )

@@ -1,0 +1,15 @@
+camera_matrix:
+  cols: 3
+  data:
+  - 386.5
+  - 0.0
+  - 328.9
+  - 0.0
+  - 386.5
+  - 244.0
+  - 0.0
+  - 0.0
+  - 1.0
+  rows: 3
+image_height: 480
+image_width: 640

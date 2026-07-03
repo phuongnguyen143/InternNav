@@ -28,6 +28,12 @@ Example:
       --rgb-topic /rs1/rs1/color/image_raw/compressed \\
       --depth-topic /rs1/rs1/depth/image_rect_raw/compressedDepth
 
+  # ZED waist camera (raw sensor_msgs/Image depth):
+  python extract_bag_frames.py /path/to/internnav_bag \\
+      --rgb-topic /camera/waist_front_zed_stream/left/color/rect/image/compressed \\
+      --depth-topic /camera/waist_front_zed_stream/depth/depth_registered \\
+      --no-trim
+
   # Full bag (no 20s head/tail trim):
   python extract_bag_frames.py /path/to/bag --no-trim
 """
@@ -43,6 +49,7 @@ from typing import Dict, List, Tuple
 from utils.config import get_config
 from utils.trajectory_io import export_odom_from_tum_and_frames
 from frame_utils import (
+    StampedDepth,
     depth_m_to_preview_bgr,
     open_mp4_writer,
     ros_stamp_to_sec,
@@ -50,6 +57,12 @@ from frame_utils import (
     save_rgb_frame,
     sync_rgb_depth_messages,
 )
+
+
+def _bag_item_timestamp(item: StampedDepth | Tuple[float, ...]) -> float:
+    if isinstance(item, StampedDepth):
+        return item.timestamp
+    return float(item[0])
 
 
 def detect_storage_id(bag_path: Path, storage_id: str) -> str:
@@ -114,13 +127,31 @@ def read_bag_topic_messages(
             continue
         msg = deserialize_message(data, type_map[topic])
         ts = ros_stamp_to_sec(msg.header.stamp)
-        if topic.endswith("compressedDepth") or "compressedDepth" in (msg.format or ""):
-            buckets[topic].append((ts, bytes(msg.data), msg.format or ""))
+        msg_type = topic_types[topic]
+        if msg_type.endswith("/Image"):
+            buckets[topic].append(
+                StampedDepth(
+                    timestamp=ts,
+                    data=bytes(msg.data),
+                    encoding=str(msg.encoding),
+                    height=int(msg.height),
+                    width=int(msg.width),
+                    step=int(msg.step),
+                )
+            )
+        elif msg_type.endswith("/CompressedImage"):
+            fmt = str(getattr(msg, "format", "") or "")
+            if topic.endswith("compressedDepth") or "compressedDepth" in fmt:
+                buckets[topic].append(
+                    StampedDepth(timestamp=ts, data=bytes(msg.data), format_hint=fmt)
+                )
+            else:
+                buckets[topic].append((ts, bytes(msg.data)))
         else:
             buckets[topic].append((ts, bytes(msg.data)))
 
     for name in topics:
-        buckets[name].sort(key=lambda item: item[0])
+        buckets[name].sort(key=_bag_item_timestamp)
     return buckets
 
 

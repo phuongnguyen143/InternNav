@@ -2,6 +2,7 @@ import argparse
 import gzip
 import json
 import os
+import time
 
 import cv2
 import imageio
@@ -90,8 +91,43 @@ def parse_args():
             "If neither is set, a random episode is chosen."
         ),
     )
+    parser.add_argument(
+        "--stop-delay-seconds",
+        type=float,
+        default=5.0,
+        help=(
+            "After the first STOP (action 0), keep calling agent.step() for this many "
+            "seconds without sending habitat STOP. Set to 0 to end immediately."
+        ),
+    )
 
     return parser.parse_args()
+
+
+def _investigate_after_stop(args, agent, agent_obs, video_frames, step_idx):
+    """Keep agent inference running after STOP without ending the Habitat episode."""
+    delay = args.stop_delay_seconds
+    if delay <= 0:
+        return
+
+    instruction = agent_obs.get("instruction", "")
+    print(
+        f"[step {step_idx + 1}] STOP received — continuing agent inference for "
+        f"{delay:.1f}s (habitat STOP deferred)..."
+    )
+    deadline = time.time() + delay
+    infer_count = 0
+    while time.time() < deadline:
+        out = agent.step([agent_obs])[0]
+        action = out["action"][0]
+        infer_count += 1
+        print(f"[post-stop infer #{infer_count}] agent_action={action}")
+
+        if args.save_video:
+            rgb = np.asarray(agent_obs["rgb"], dtype=np.uint8)
+            video_frames.append(_overlay_prompt_text(rgb, instruction))
+
+    print(f"[post-stop infer] finished ({infer_count} extra agent.step calls)")
 
 
 def build_agent_client(args):
@@ -124,6 +160,8 @@ def build_agent_client(args):
             "device": "cuda:0",
             "predict_step_nums": 32,
             "continuous_traj": True,
+            "vis_debug": False,
+            "vis_debug_path": "./logs/vis_debug",
         },
     )
     return AgentClient(agent_cfg)
@@ -422,6 +460,9 @@ def run_sim_only_loop(args, agent):
             out = agent.step([obs])[0]
             action = out["action"][0]
             if action == 0:
+                _investigate_after_stop(
+                    args, agent, obs, video_frames, step_idx
+                )
                 print(f"[step {step_idx + 1}] agent_action=0 (STOP)")
                 break
             if action == -1:
@@ -560,6 +601,11 @@ def main():
                     print("Episode finished.")
                     break
                 continue
+
+            if action == 0:
+                _investigate_after_stop(
+                    args, agent, agent_obs, video_frames, step_idx
+                )
 
             habitat_action = map_agent_action_to_habitat(action)
             observations = env.step(habitat_action)

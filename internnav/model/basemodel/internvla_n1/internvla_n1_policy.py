@@ -188,7 +188,13 @@ class InternVLAN1Net(PreTrainedModel):
 
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
+                traj_latents = self.model.generate_latents(
+                    output_ids,
+                    inputs.pixel_values,
+                    image_grid_thw,
+                    pixel_goal=pixel_goal,
+                    image_hw=(self.resize_h, self.resize_w),
+                )
             output.output_latent = traj_latents
 
         else:  # Output action

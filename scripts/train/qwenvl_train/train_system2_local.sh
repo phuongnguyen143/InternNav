@@ -12,8 +12,8 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 DEEPSPEED_CONFIG="scripts/train/qwenvl_train/zero2.json"
-MODEL_PATH="/home/lenguyen1/hoangpqn/InternNav/scripts/notebooks/checkpoints/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"
-VLN_DATASETS="bkhn_125cm_0_30"
+MODEL_PATH="/home/lenguyen1/hoangpqn/vln/InternNav/checkpoints/base_model/qwen2.5"
+VLN_DATASETS="office_125cm_0_30"
 
 LR="2e-5"
 VISION_TOWER_LR="5e-6"
@@ -221,9 +221,9 @@ TRAIN_ARGS=(
     --model_name_or_path "${MODEL_PATH}"
     --vln_dataset_use "${VLN_DATASETS}"
     --data_flatten False
-    --tune_mm_vision True
+    --tune_mm_vision False
     --tune_mm_mlp True
-    --tune_mm_llm True
+    --tune_mm_llm False
     --bf16
     --num_history 8
     --data_augmentation True

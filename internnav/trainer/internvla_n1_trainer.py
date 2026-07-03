@@ -14,6 +14,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import json
 import logging
 import os
 import pathlib
@@ -71,8 +72,51 @@ def smart_tokenizer_and_embedding_resize(
 
     if num_new_tokens > 0:
         input_embeddings = model.get_input_embeddings().weight.data
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
+            dim=0, keepdim=True
+        )
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
+
+
+def get_checkpoint_config(model_path: str) -> dict:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def is_internvla_n1_checkpoint(model_path: str, ckpt_config: dict) -> bool:
+    if ckpt_config.get("model_type") == "internvla_n1":
+        return True
+    if "InternVLAN1ForCausalLM" in ckpt_config.get("architectures", []):
+        return True
+
+    path_lower = model_path.lower()
+    return "internvla-n1" in path_lower or "dualvln" in path_lower
+
+
+def is_dual_system_checkpoint(ckpt_config: dict) -> bool:
+    """True when the checkpoint already contains trained System-1 weights."""
+    if ckpt_config.get("model_type") == "internvla_n1":
+        return True
+    if ckpt_config.get("system1"):
+        return True
+    return "InternVLAN1ForCausalLM" in ckpt_config.get("architectures", [])
+
+
+def resolve_system1_from_checkpoint(
+    model_args: ModelArguments, ckpt_config: dict, dual_ckpt: bool
+) -> ModelArguments:
+    ckpt_system1 = ckpt_config.get("system1")
+    if dual_ckpt and ckpt_system1 and model_args.system1 != ckpt_system1:
+        logging.warning(
+            "Overriding --system1=%s with checkpoint system1=%s to match loaded weights.",
+            model_args.system1,
+            ckpt_system1,
+        )
+        model_args.system1 = ckpt_system1
+    return model_args
 
 
 def set_model(model_args, model):
@@ -101,31 +145,35 @@ def set_model(model_args, model):
         for n, p in model.lm_head.named_parameters():
             p.requires_grad = False
 
-    if 'nextdit' in model_args.system1:
+    if "nextdit" in model_args.system1:
         modules = [
-            'action_encoder',
-            'action_decoder',
-            'traj_dit',
-            'cond_projector',
-            'memory_encoder',
-            'rgb_resampler',
-            'rgb_model',
+            "action_encoder",
+            "action_decoder",
+            "traj_dit",
+            "cond_projector",
+            "memory_encoder",
+            "rgb_resampler",
+            "rgb_model",
         ]
         for n, p in model.model.named_parameters():
             if any(k in n for k in modules):
                 p.requires_grad = True
         model.model.latent_queries.requires_grad = True
-    elif 'navdp' in model_args.system1:
+        model.model.pixel_goal_grounding_weight.requires_grad = True
+    elif "navdp" in model_args.system1:
         for n, p in model.model.navdp.named_parameters():
             if "rgb_model" not in n:
                 p.requires_grad = True
         model.model.latent_queries.requires_grad = True
+        model.model.pixel_goal_grounding_weight.requires_grad = True
 
 
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments)
+    )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
@@ -146,7 +194,10 @@ def train(attn_implementation="flash_attention_2"):
     else:
         data_args.transform_train = v2.Resize((data_args.resize_h, data_args.resize_w))
 
-    if 'internvla-n1-system2' in model_args.model_name_or_path.lower():
+    ckpt_config = get_checkpoint_config(model_args.model_name_or_path)
+    dual_system_ckpt = is_dual_system_checkpoint(ckpt_config)
+
+    if is_internvla_n1_checkpoint(model_args.model_name_or_path, ckpt_config):
         model = InternVLAN1ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -157,6 +208,9 @@ def train(attn_implementation="flash_attention_2"):
             model_args.model_name_or_path,
         ).image_processor
         data_args.model_type = "internvla-n1"
+        model_args = resolve_system1_from_checkpoint(
+            model_args, ckpt_config, dual_system_ckpt
+        )
     elif "qwen2.5" in model_args.model_name_or_path.lower():
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
@@ -203,7 +257,24 @@ def train(attn_implementation="flash_attention_2"):
     )
 
     if data_args.model_type == "internvla-n1":
-        model.get_model().initialize_vision_modules(model_args=model_args)
+        if dual_system_ckpt:
+            model.get_model().config.system1 = model_args.system1
+            model.get_model().config.n_query = model_args.n_query
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "Dual-system checkpoint detected: keeping pretrained System-1 "
+                    "weights from %s (system1=%s).",
+                    model_args.model_name_or_path,
+                    model_args.system1,
+                )
+        else:
+            model.get_model().initialize_vision_modules(model_args=model_args)
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "System-2-only checkpoint: initialized System-1 from scratch "
+                    "(system1=%s).",
+                    model_args.system1,
+                )
     set_model(model_args, model)
 
     if torch.distributed.get_rank() == 0:
@@ -211,10 +282,16 @@ def train(attn_implementation="flash_attention_2"):
         model.model.print_trainable_parameters()
 
     if data_args.data_packing:
-        data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)  # noqa: F821
+        data_module = make_supervised_data_module_packed(
+            tokenizer=tokenizer, data_args=data_args
+        )  # noqa: F821
     else:
-        data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(model=model, processing_class=tokenizer, args=training_args, **data_module)
+        data_module = make_supervised_data_module(
+            tokenizer=tokenizer, data_args=data_args
+        )
+    trainer = Trainer(
+        model=model, processing_class=tokenizer, args=training_args, **data_module
+    )
     from tabulate import tabulate
 
     if trainer.is_world_process_zero():

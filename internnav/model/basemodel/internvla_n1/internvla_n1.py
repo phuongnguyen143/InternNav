@@ -55,6 +55,90 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
     def get_model(self):
         return self.model
 
+    def _get_spatial_merge_size(self):
+        vision_cfg = getattr(self.config, "vision_config", None)
+        if vision_cfg is not None:
+            return int(getattr(vision_cfg, "spatial_merge_size", 2))
+        return 2
+
+    def _pixel_goal_grounding_scale(self):
+        return torch.sigmoid(self.get_model().pixel_goal_grounding_weight)
+
+    def _patch_offset_for_image(self, image_grid_thw, image_idx):
+        merge_sq = self._get_spatial_merge_size() ** 2
+        offset = 0
+        for i in range(image_idx):
+            t, h, w = [int(x) for x in image_grid_thw[i].tolist()]
+            offset += (t * h * w) // merge_sq
+        return offset
+
+    def _pixel_to_patch_index(self, pixel_goal, image_hw, grid_thw):
+        row, col = float(pixel_goal[0]), float(pixel_goal[1])
+        h_img, w_img = float(image_hw[0]), float(image_hw[1])
+        merge = self._get_spatial_merge_size()
+        _, h, w = [int(x) for x in grid_thw.tolist()]
+        patch_h, patch_w = h // merge, w // merge
+        if h_img <= 0 or w_img <= 0 or patch_h <= 0 or patch_w <= 0:
+            return 0
+        py = min(max(int(row / h_img * patch_h), 0), patch_h - 1)
+        px = min(max(int(col / w_img * patch_w), 0), patch_w - 1)
+        return py * patch_w + px
+
+    def _extract_pixel_goal_patch_embed(
+        self, image_embeds, image_grid_thw, pixel_goal, image_hw, image_idx=-1
+    ):
+        if image_idx < 0:
+            image_idx = image_grid_thw.shape[0] + image_idx
+        image_idx = max(0, min(int(image_idx), image_grid_thw.shape[0] - 1))
+        patch_offset = self._patch_offset_for_image(image_grid_thw, image_idx)
+        patch_idx = patch_offset + self._pixel_to_patch_index(
+            pixel_goal, image_hw, image_grid_thw[image_idx]
+        )
+        return image_embeds[patch_idx]
+
+    def _fuse_pixel_goal_into_latents(
+        self,
+        hidden_states,
+        image_embeds,
+        image_grid_thw,
+        pixel_goals,
+        pixel_goal_image_hws,
+        num_images_per_sample=None,
+        pixel_goal_image_idxs=None,
+    ):
+        if pixel_goals is None or image_embeds is None:
+            return hidden_states
+
+        scale = self._pixel_goal_grounding_scale().to(hidden_states.dtype)
+        batch_size = hidden_states.shape[0]
+        if num_images_per_sample is None:
+            num_images_per_sample = [image_grid_thw.shape[0]] * batch_size
+
+        fused = hidden_states.clone()
+        for b in range(batch_size):
+            n_images = int(num_images_per_sample[b])
+            if n_images <= 0:
+                continue
+            if pixel_goal_image_idxs is not None:
+                local_idx = int(pixel_goal_image_idxs[b].item())
+                if local_idx < 0:
+                    local_idx = n_images + local_idx
+            else:
+                local_idx = n_images - 1
+            local_idx = max(0, min(local_idx, n_images - 1))
+
+            global_img_start = int(sum(int(num_images_per_sample[i]) for i in range(b)))
+            sample_grid = image_grid_thw[global_img_start : global_img_start + n_images]
+            goal_feat = self._extract_pixel_goal_patch_embed(
+                image_embeds,
+                sample_grid,
+                pixel_goals[b],
+                pixel_goal_image_hws[b],
+                image_idx=local_idx,
+            )
+            fused[b] = fused[b] + scale * goal_feat.unsqueeze(0)
+        return fused
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -79,6 +163,10 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_depths: Optional[torch.Tensor] = None,
         video_frame_num: Optional[torch.Tensor] = None,
         traj_poses: Optional[torch.Tensor] = None,
+        pixel_goals: Optional[torch.Tensor] = None,
+        pixel_goal_image_hws: Optional[torch.Tensor] = None,
+        num_images_per_sample: Optional[torch.Tensor] = None,
+        pixel_goal_image_idxs: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -125,11 +213,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        cached_image_embeds = None
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                cached_image_embeds = image_embeds
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
@@ -226,6 +316,16 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
+            if pixel_goals is not None and cached_image_embeds is not None:
+                traj_hidden_states = self._fuse_pixel_goal_into_latents(
+                    traj_hidden_states,
+                    cached_image_embeds,
+                    image_grid_thw,
+                    pixel_goals,
+                    pixel_goal_image_hws,
+                    num_images_per_sample=num_images_per_sample,
+                    pixel_goal_image_idxs=pixel_goal_image_idxs,
+                )
             traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, traj_poses.size(1), 1, 1).flatten(0, 1)
             loss_mask = torch.arange(traj_images.size(1), device=self.device).expand(
                 traj_images.size(0), traj_images.size(1)
@@ -285,7 +385,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 masked_loss = loss * mask
                 loss = masked_loss.sum() / mask.sum() / (loss.shape[1] * loss.shape[2])
             elif 'navdp' in self.get_system1_type():
-                if 'async' in self.get_system1_type():
+                if 'async' in self.get_system1_type():  
                     cur_images = traj_images.flatten(0, 1)
                     cur_depths = traj_depths.flatten(0, 1)
                     pix_goal_images = traj_images[:, 0:1].repeat(1, traj_images.size(1), 1, 1, 1).flatten(0, 1)
@@ -317,17 +417,27 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             attentions=outputs.attentions,
         )
 
-    def generate_latents(self, input_ids, pixel_values, image_grid_thw):
-        input_ids.to(self.get_model().device)
+    def generate_latents(
+        self,
+        input_ids,
+        pixel_values,
+        image_grid_thw,
+        pixel_goal=None,
+        image_hw=None,
+        pixel_goal_image_idx=-1,
+    ):
+        input_ids = input_ids.to(self.get_model().device)
         with torch.no_grad():
             text_embeds = self.get_model().embed_tokens(input_ids)
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
-        input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
+        input_ids = torch.cat(
+            [input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY], device=input_ids.device)], dim=1
+        )
 
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
 
         text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
 
@@ -338,11 +448,19 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             outputs = self.model(
                 inputs_embeds=text_embeds,
                 position_ids=position_ids,
-                # attention_mask=attention_mask,
                 output_hidden_states=True,
                 return_dict=True,
             )
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
+
+        if pixel_goal is not None and image_hw is not None:
+            goal_tensor = torch.tensor(pixel_goal, device=hidden_states.device, dtype=torch.float32)
+            hw_tensor = torch.tensor(image_hw, device=hidden_states.device, dtype=torch.float32)
+            goal_feat = self._extract_pixel_goal_patch_embed(
+                image_embeds, image_grid_thw, goal_tensor, hw_tensor, image_idx=pixel_goal_image_idx
+            )
+            scale = self._pixel_goal_grounding_scale().to(hidden_states.dtype)
+            hidden_states = hidden_states + scale * goal_feat.view(1, 1, -1)
 
         return hidden_states
 

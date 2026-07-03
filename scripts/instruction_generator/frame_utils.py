@@ -11,7 +11,11 @@ import cv2
 import numpy as np
 
 from utils.config import get_config
-from utils.depth_codec import decode_compressed_depth, save_depth_png_mm
+from utils.depth_codec import (
+    decode_compressed_depth,
+    decode_raw_depth_image,
+    save_depth_png_mm,
+)
 
 
 def ros_stamp_to_sec(stamp) -> float:
@@ -30,6 +34,34 @@ def decode_rgb_compressed(data: bytes) -> Optional[np.ndarray]:
 def decode_depth_compressed(data: bytes, format_hint: str = "") -> Optional[np.ndarray]:
     """Decode compressedDepth payload to float32 meters."""
     return decode_compressed_depth(data, format_hint=format_hint)
+
+
+@dataclass
+class StampedDepth:
+    timestamp: float
+    data: bytes
+    format_hint: str = ""
+    encoding: str = ""
+    height: int = 0
+    width: int = 0
+    step: int = 0
+
+    @property
+    def is_raw_image(self) -> bool:
+        return bool(self.encoding)
+
+
+def decode_stamped_depth(msg: StampedDepth) -> Optional[np.ndarray]:
+    """Decode a stamped depth message (compressedDepth or raw sensor_msgs/Image)."""
+    if msg.is_raw_image:
+        return decode_raw_depth_image(
+            msg.data,
+            msg.encoding,
+            msg.height,
+            msg.width,
+            msg.step,
+        )
+    return decode_depth_compressed(msg.data, msg.format_hint)
 
 
 def align_depth_to_rgb(depth_m: np.ndarray, rgb: np.ndarray) -> np.ndarray:
@@ -137,18 +169,11 @@ class StreamFrame:
     depth_m: np.ndarray
 
 
-@dataclass
-class _StampedMsg:
-    timestamp: float
-    data: bytes
-    format_hint: str = ""
-
-
 def _find_closest(
-    items: Sequence[_StampedMsg],
+    items: Sequence[StampedDepth],
     target_ts: float,
     max_dt: float,
-) -> Optional[_StampedMsg]:
+) -> Optional[StampedDepth]:
     if not items:
         return None
     idx = int(np.searchsorted([m.timestamp for m in items], target_ts))
@@ -165,16 +190,13 @@ def _find_closest(
 
 def sync_rgb_depth_messages(
     rgb_messages: Iterable[Tuple[float, bytes]],
-    depth_messages: Iterable[Tuple[float, bytes, str]],
+    depth_messages: Iterable[StampedDepth],
     sync_slop_sec: float | None = None,
 ) -> Iterator[StreamFrame]:
     """Yield synchronized RGB/depth frames using the RGB stream as reference."""
     if sync_slop_sec is None:
         sync_slop_sec = float(get_config().ros.get("sync_slop_sec", 0.05))
-    depth_list: List[_StampedMsg] = [
-        _StampedMsg(timestamp=ts, data=data, format_hint=fmt) for ts, data, fmt in depth_messages
-    ]
-    depth_list.sort(key=lambda m: m.timestamp)
+    depth_list = sorted(depth_messages, key=lambda m: m.timestamp)
 
     frame_idx = 0
     for rgb_ts, rgb_data in rgb_messages:
@@ -186,7 +208,7 @@ def sync_rgb_depth_messages(
         if depth_msg is None:
             continue
 
-        depth = decode_depth_compressed(depth_msg.data, depth_msg.format_hint)
+        depth = decode_stamped_depth(depth_msg)
         if depth is None:
             continue
 

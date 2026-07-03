@@ -337,4 +337,34 @@ Tune pose density: `--camera-stride 30` (static) or `--camera-axis-len 0.5 --cam
 
 Tune density with `--pcd-voxel 0.2` and `--pcd-max-points 250000`.
 
+### LeRobot final dataset (RGB + pose + pixel goal)
+
+Visualize exported parquet + per-frame RGB JPGs (e.g. `DATA/final/office_round1_ver2.0`):
+
+```bash
+python process_odom/visualize_rerun.py \
+  --lerobot-root /home/lenguyen1/hoangpqn/vln/DATA/final/office_round1_ver2.0 \
+  --setting 125cm_30deg \
+  --episode 0 \
+  --mode timeline \
+  --stride 5
+```
+
+**Layers:**
+- `world/episode_XXXXXX/camera_path` — 3D camera centres from `pose.{setting}`
+- `world/episode_XXXXXX/floor_path` — ground-contact trajectory (SLAM trick from poses)
+- `world/episode_XXXXXX/camera` — moving camera rig (timeline) with Pinhole + RGB
+- `.../camera/rgb/goal` — pixel goal (red dot + Points2D)
+
+Use the same `--setting` for `pose.*`, `goal.*`, and `observation.images.rgb.{setting}` folders. If goals are all `[-1,-1]`, the script prints which settings have valid goals.
+
+```bash
+# All episodes, save recording
+python process_odom/visualize_rerun.py \
+  --lerobot-root /path/to/final/office_round1_ver2.0 \
+  --setting 125cm_30deg \
+  --stride 10 \
+  --save /tmp/office_lerobot.rrd
+```
+
 Local Rerun examples: `vln/rerun/examples/python/` (minimal, rgbd, lidar, ros_node).

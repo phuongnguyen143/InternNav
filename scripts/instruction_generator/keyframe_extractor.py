@@ -123,7 +123,10 @@ class KeyframeExtractor(Node):
             self.odom_topic,
             qos_profile=qos,
         )
-        self.get_logger().info(f"Keyframe extractor ready (odom sync via {self.odom_topic})")
+        self.get_logger().info(
+            f"Keyframe extractor ready: rgb={self.rgb_topic} depth={self.depth_topic} "
+            f"odom={self.odom_topic} sync_slop={float(ros.get('sync_slop_sec', 0.05))}s"
+        )
 
         self.sync = ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub, self.odom_sub],

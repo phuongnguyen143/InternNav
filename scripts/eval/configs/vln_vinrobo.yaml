@@ -1,4 +1,5 @@
 # @package _global_
+# Custom VLN-CE style dataset under data/vln-vinrobo/
 
 defaults:
   - /habitat: habitat_config_base
@@ -72,6 +73,6 @@ habitat:
 
   dataset:
     type: R2RVLN-v1
-    split: val_unseen
-    scenes_dir: /home/lenguyen1/hoangpqn/InternNav/data/scene_data/mp3d_ce/mp3d
-    data_path: /home/lenguyen1/hoangpqn/InternNav/data/vln-ce/raw_data/r2r/{split}/{split}.json.gz
+    split: train
+    scenes_dir: data/scene_data/mp3d
+    data_path: data/vln-vinrobo/{split}/{split}.json.gz

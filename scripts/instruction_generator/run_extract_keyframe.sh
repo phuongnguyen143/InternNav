@@ -2,16 +2,18 @@
 # Config-driven keyframe extraction launcher.
 #
 # STEP 0 (once per scene, PCD-free SLAM path):
-#   python ../process_odom/project_slam_path.py --scene office_round1 --export-floor-trajectory ...
-#   # writes floor_trajectory.txt + floor_calibration.json
-#   # or if you only have floor_trajectory.txt:
-#   python ../process_odom/derive_floor_calibration.py --scene office_round1
+#   python ../process_odom/project_slam_path.py --scene <scene> --export-floor-trajectory ...
+#   # or: python ../process_odom/derive_floor_calibration.py --scene <scene>
 #
-# STEP 0 (PCD path):
-#   python ../process_odom/precompute_floor_trajectory.py --scene office_round1
+# STEP 0 (PCD path, e.g. bkhn):
+#   python ../process_odom/precompute_floor_trajectory.py --scene bkhn_round1
 #
 # STEP 1:
+#   ./run_extract_keyframe.sh bkhn_round1
 #   ./run_extract_keyframe.sh office_round1
+#
+# ROS topics come from merged base.yaml + scenes/<scene>.yaml (bkhn uses base
+# defaults; office overrides rgb_topic/depth_topic in its scene file).
 #
 # SHUTDOWN: Press Ctrl+B then S
 
@@ -33,7 +35,8 @@ if [[ -z "$SCENE" || "$SCENE" == "--scene" ]]; then
         echo "       $0 --scene <scene>"
         echo "       VLN_SCENE=<scene> $0"
         echo ""
-        echo "Example: $0 office_round1"
+        echo "Example: $0 bkhn_round1"
+        echo "         $0 office_round1"
         exit 1
     fi
 fi
@@ -50,6 +53,10 @@ for key in ("bag", "camera_odom", "floor_trajectory", "output_dir"):
   print(paths.get(key, ""))
 ros = cfg.get("ros", default={})
 print(ros.get("bag_play_rate", 5.0))
+print(ros.get("rgb_topic", ""))
+print(ros.get("depth_topic", ""))
+print(ros.get("odom_matched_topic", "/odom_txt/matched"))
+print(ros.get("max_time_diff", 0.05))
 PY
 }
 
@@ -59,6 +66,15 @@ CAMERA_ODOM="${_CFG_LINES[1]}"
 FLOOR_TRAJ="${_CFG_LINES[2]}"
 KEYFRAME_OUT="${_CFG_LINES[3]}"
 BAG_RATE="${_CFG_LINES[4]}"
+RGB_TOPIC="${_CFG_LINES[5]}"
+DEPTH_TOPIC="${_CFG_LINES[6]}"
+ODOM_TOPIC="${_CFG_LINES[7]}"
+MAX_TIME_DIFF="${_CFG_LINES[8]}"
+
+if [[ -z "$RGB_TOPIC" || -z "$DEPTH_TOPIC" ]]; then
+    echo "ERROR: ros.rgb_topic or ros.depth_topic not set (check base.yaml or scene override)"
+    exit 1
+fi
 
 if [[ -z "$BAG_PATH" || -z "$CAMERA_ODOM" || -z "$FLOOR_TRAJ" || -z "$KEYFRAME_OUT" ]]; then
     echo "ERROR: scene config missing required paths (bag, camera_odom, floor_trajectory, output_dir)"
@@ -116,6 +132,8 @@ echo "  bag:          $BAG_PATH"
 echo "  camera odom:  $CAMERA_ODOM"
 echo "  floor traj:   $FLOOR_TRAJ"
 echo "  output_dir:   $KEYFRAME_OUT"
+echo "  rgb topic:    $RGB_TOPIC"
+echo "  depth topic:  $DEPTH_TOPIC"
 echo ""
 
 tmux kill-session -t $SESSION 2>/dev/null || true
@@ -123,18 +141,23 @@ sleep 0.5
 
 tmux new-session  -d -s $SESSION -x 220 -y 50
 tmux set-option -t $SESSION default-shell "$TMUX_SHELL"
+tmux set-environment -t $SESSION VLN_SCENE "$SCENE"
 tmux split-window -v -t $SESSION:0.0
 tmux split-window -v -t $SESSION:0.1
 tmux select-layout -t $SESSION even-vertical
 
+# Pass merged-config ROS params explicitly so tmux panes never fall back to wrong topics.
+FLOOR_ROS_ARGS="-p floor_trajectory_file:=$FLOOR_TRAJ -p rgb_topic:=$RGB_TOPIC -p max_time_diff:=$MAX_TIME_DIFF"
+KF_ROS_ARGS="-p camera_odom_file:=$CAMERA_ODOM -p output_dir:=$KEYFRAME_OUT -p rgb_topic:=$RGB_TOPIC -p depth_topic:=$DEPTH_TOPIC -p odom_topic:=$ODOM_TOPIC"
+
 tmux send-keys -t $SESSION:0.0 \
-  "$PANE_CMD ros2 bag play $BAG_PATH --rate $BAG_RATE" Enter
+  "VLN_SCENE=$SCENE $PANE_CMD ros2 bag play $BAG_PATH --rate $BAG_RATE" Enter
 
 tmux send-keys -t $SESSION:0.1 \
-  "$PANE_CMD python3 trajectory_publishers.py floor --ros-args -p floor_trajectory_file:=$FLOOR_TRAJ" Enter
+  "VLN_SCENE=$SCENE $PANE_CMD python3 trajectory_publishers.py floor --ros-args $FLOOR_ROS_ARGS" Enter
 
 tmux send-keys -t $SESSION:0.2 \
-  "$PANE_CMD python3 keyframe_extractor.py --ros-args -p camera_odom_file:=$CAMERA_ODOM -p output_dir:=$KEYFRAME_OUT" Enter
+  "VLN_SCENE=$SCENE $PANE_CMD python3 keyframe_extractor.py --ros-args $KF_ROS_ARGS" Enter
 
 tmux bind-key -T prefix S run-shell " \
   tmux send-keys -t $SESSION:0.2 C-c ; \

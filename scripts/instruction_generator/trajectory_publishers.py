@@ -247,7 +247,10 @@ class FloorTrajectoryPublisher(Node):
 
         self.rgb_sub = self.create_subscription(CompressedImage, rgb_topic, self._rgb_callback, qos)
 
-        self.get_logger().info(f"FloorTrajectoryPublisher ready: {len(self.entries)} entries.")
+        self.get_logger().info(
+            f"FloorTrajectoryPublisher ready: {len(self.entries)} entries, "
+            f"rgb_topic={rgb_topic}, max_time_diff={max_dt}s"
+        )
 
     @staticmethod
     def _entry_to_xyyaw(entry: FloorEntry) -> Pose2D:

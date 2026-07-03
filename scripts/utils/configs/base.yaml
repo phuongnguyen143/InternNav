@@ -23,14 +23,14 @@ ros:
   odom_matched_topic: /odom_txt/matched
   frame_id: map
   child_frame_id: base_link
-  max_time_diff: 0.5
+  max_time_diff: 0.05
   sync_slop_sec: 0.05
   offline_match_max_dt: 0.5
   bag_play_rate: 5.0
 
 keyframe:
-  sharp_turn_thresh_deg: 10.0
-  curvature_thresh_deg: 10.0
+  sharp_turn_thresh_deg: 15.0
+  curvature_thresh_deg: 15.0
   curvature_window: 10
   max_dist_between_keyframes: 0.8
   min_dist_between_keyframes: 0.3

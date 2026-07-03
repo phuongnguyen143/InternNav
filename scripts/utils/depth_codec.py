@@ -26,6 +26,55 @@ def legacy_depth_vis_scale() -> float:
 PNG_MAGIC = b"\x89PNG"
 
 
+def decode_raw_depth_image(
+    data: bytes,
+    encoding: str,
+    height: int,
+    width: int,
+    step: int,
+) -> Optional[np.ndarray]:
+    """Decode sensor_msgs/Image depth payload to float32 meters."""
+    enc = (encoding or "").lower()
+    if height <= 0 or width <= 0:
+        return None
+
+    buf = np.frombuffer(data, dtype=np.uint8)
+    if not enc:
+        return None
+
+    if enc in ("32fc1", "32fc"):
+        elem_size = 4
+        row_bytes = step if step > 0 else width * elem_size
+        if buf.size < row_bytes * height:
+            return None
+        depth = np.zeros((height, width), dtype=np.float32)
+        for row in range(height):
+            start = row * row_bytes
+            row_data = buf[start : start + width * elem_size]
+            if row_data.size < width * elem_size:
+                return None
+            depth[row] = np.frombuffer(row_data, dtype=np.float32, count=width)
+        depth[~np.isfinite(depth)] = 0.0
+        depth[depth < 0.0] = 0.0
+        return depth
+
+    if enc in ("16uc1",):
+        elem_size = 2
+        row_bytes = step if step > 0 else width * elem_size
+        if buf.size < row_bytes * height:
+            return None
+        depth_mm = np.zeros((height, width), dtype=np.uint16)
+        for row in range(height):
+            start = row * row_bytes
+            row_data = buf[start : start + width * elem_size]
+            if row_data.size < width * elem_size:
+                return None
+            depth_mm[row] = np.frombuffer(row_data, dtype=np.uint16, count=width)
+        return uint16_mm_to_meters(depth_mm)
+
+    return None
+
+
 def decode_compressed_depth(data: bytes, format_hint: str = "") -> Optional[np.ndarray]:
     """Decode ROS compressedDepth payload to float32 meters.
 

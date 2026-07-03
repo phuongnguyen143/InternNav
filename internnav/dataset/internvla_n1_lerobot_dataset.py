@@ -121,8 +121,9 @@ SCALEVLN_60CM_30_30 = {
     "pitch_1": 30,
     "pitch_2": 30,
 }
+
 BKHN = {
-    "data_path": "/home/lenguyen1/hoangpqn/vln/InternNav/scripts/dataset_converters/bkhn_ver2.0",
+    "data_path": "/home/lenguyen1/hoangpqn/vln/DATA/final/bkhn",
     "height": 125,
     "pitch_1": 0,
     "pitch_2": 30,
@@ -1285,6 +1286,13 @@ class NavPixelGoalDataset(Dataset):
             data_dict["traj_images"] = traj_images[:goal_len][::interval]
             data_dict["traj_depths"] = torch.stack(traj_depths[:goal_len][::interval])
             data_dict["traj_poses"] = torch.stack(traj_poses_gt)
+            lookdown_w, lookdown_h = lookdown_image.size
+            data_dict["pixel_goal"] = torch.tensor(
+                [float(action[0]), float(action[1])], dtype=torch.float32
+            )
+            data_dict["pixel_goal_image_hw"] = torch.tensor(
+                [float(lookdown_h), float(lookdown_w)], dtype=torch.float32
+            )
         return data_dict
 
 
@@ -1411,6 +1419,11 @@ class DataCollatorForSupervisedDataset(object):
 
         batch["pixel_values"] = concat_images
         batch["image_grid_thw"] = grid_thw
+        if len(images) != 0:
+            batch["num_images_per_sample"] = torch.tensor(
+                [instance["image_grid_thw"].shape[0] for instance in instances],
+                dtype=torch.long,
+            )
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
@@ -1456,6 +1469,13 @@ class DataCollatorForSupervisedDataset(object):
             batch["traj_depths"] = torch.stack(traj_depth_batch)
             batch["traj_poses"] = torch.stack(traj_pose_batch)
             batch["video_frame_num"] = torch.tensor(video_frame_num)
+            if "pixel_goal" in instances[0]:
+                batch["pixel_goals"] = torch.stack(
+                    [instance["pixel_goal"] for instance in instances]
+                )
+                batch["pixel_goal_image_hws"] = torch.stack(
+                    [instance["pixel_goal_image_hw"] for instance in instances]
+                )
 
         return batch
 
