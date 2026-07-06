@@ -13,6 +13,12 @@ class ModelArguments:
 
     system1: Optional[str] = field(default='nextdit')
     n_query: int = field(default=4)
+    navdp_goal_mode: str = field(
+        default="fuse",
+        metadata={
+            "help": "NavDP goal conditioning: fuse (vlm+pixel), pixel_only, vlm_only."
+        },
+    )
 
 
 @dataclass

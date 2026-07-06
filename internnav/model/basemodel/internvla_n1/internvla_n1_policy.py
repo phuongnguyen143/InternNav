@@ -36,6 +36,10 @@ class InternVLAN1Net(PreTrainedModel):
             attn_implementation="flash_attention_2",
             device_map={"": self.model_config.device},
         )
+        if hasattr(self.model.model, "navdp"):
+            self.model.model.navdp.set_goal_mode(
+                getattr(self.model.config, "navdp_goal_mode", "fuse")
+            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.model_path, use_fast=True)
         self.processor = AutoProcessor.from_pretrained(self.model_config.model_path)
@@ -188,13 +192,7 @@ class InternVLAN1Net(PreTrainedModel):
 
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
             with torch.no_grad():
-                traj_latents = self.model.generate_latents(
-                    output_ids,
-                    inputs.pixel_values,
-                    image_grid_thw,
-                    pixel_goal=pixel_goal,
-                    image_hw=(self.resize_h, self.resize_w),
-                )
+                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw, output.output_pixel)
             output.output_latent = traj_latents
 
         else:  # Output action

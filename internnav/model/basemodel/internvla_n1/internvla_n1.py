@@ -1,3 +1,4 @@
+import re
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -26,7 +27,7 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.model_cfg = kwargs.get('model_cfg', None)
+        self.model_cfg = kwargs.get("model_cfg", None)
 
 
 class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
@@ -36,7 +37,9 @@ class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
         super(InternVLAN1Model, self).__init__(config)
 
 
-class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1MetaForCausalLM):
+class InternVLAN1ForCausalLM(
+    Qwen2_5_VLForConditionalGeneration, InternVLAN1MetaForCausalLM
+):
     config_class = InternVLAN1ModelConfig
 
     def __init__(self, config):
@@ -49,95 +52,40 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         # Initialize weights and apply final processing
         self.post_init()
 
-        for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
-            self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
+        for name, value in (
+            ("_resnet_mean", _RESNET_MEAN),
+            ("_resnet_std", _RESNET_STD),
+        ):
+            self.register_buffer(
+                name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False
+            )
 
     def get_model(self):
         return self.model
 
-    def _get_spatial_merge_size(self):
-        vision_cfg = getattr(self.config, "vision_config", None)
-        if vision_cfg is not None:
-            return int(getattr(vision_cfg, "spatial_merge_size", 2))
-        return 2
+    def _parse_s2_pixel_goals_from_input_ids(self, input_ids, t_s_pos):
+        """Parse pixel goals from S2 coordinate text already in the input sequence.
 
-    def _pixel_goal_grounding_scale(self):
-        return torch.sigmoid(self.get_model().pixel_goal_grounding_weight)
-
-    def _patch_offset_for_image(self, image_grid_thw, image_idx):
-        merge_sq = self._get_spatial_merge_size() ** 2
-        offset = 0
-        for i in range(image_idx):
-            t, h, w = [int(x) for x in image_grid_thw[i].tolist()]
-            offset += (t * h * w) // merge_sq
-        return offset
-
-    def _pixel_to_patch_index(self, pixel_goal, image_hw, grid_thw):
-        row, col = float(pixel_goal[0]), float(pixel_goal[1])
-        h_img, w_img = float(image_hw[0]), float(image_hw[1])
-        merge = self._get_spatial_merge_size()
-        _, h, w = [int(x) for x in grid_thw.tolist()]
-        patch_h, patch_w = h // merge, w // merge
-        if h_img <= 0 or w_img <= 0 or patch_h <= 0 or patch_w <= 0:
-            return 0
-        py = min(max(int(row / h_img * patch_h), 0), patch_h - 1)
-        px = min(max(int(col / w_img * patch_w), 0), patch_w - 1)
-        return py * patch_w + px
-
-    def _extract_pixel_goal_patch_embed(
-        self, image_embeds, image_grid_thw, pixel_goal, image_hw, image_idx=-1
-    ):
-        if image_idx < 0:
-            image_idx = image_grid_thw.shape[0] + image_idx
-        image_idx = max(0, min(int(image_idx), image_grid_thw.shape[0] - 1))
-        patch_offset = self._patch_offset_for_image(image_grid_thw, image_idx)
-        patch_idx = patch_offset + self._pixel_to_patch_index(
-            pixel_goal, image_hw, image_grid_thw[image_idx]
-        )
-        return image_embeds[patch_idx]
-
-    def _fuse_pixel_goal_into_latents(
-        self,
-        hidden_states,
-        image_embeds,
-        image_grid_thw,
-        pixel_goals,
-        pixel_goal_image_hws,
-        num_images_per_sample=None,
-        pixel_goal_image_idxs=None,
-    ):
-        if pixel_goals is None or image_embeds is None:
-            return hidden_states
-
-        scale = self._pixel_goal_grounding_scale().to(hidden_states.dtype)
-        batch_size = hidden_states.shape[0]
-        if num_images_per_sample is None:
-            num_images_per_sample = [image_grid_thw.shape[0]] * batch_size
-
-        fused = hidden_states.clone()
-        for b in range(batch_size):
-            n_images = int(num_images_per_sample[b])
-            if n_images <= 0:
-                continue
-            if pixel_goal_image_idxs is not None:
-                local_idx = int(pixel_goal_image_idxs[b].item())
-                if local_idx < 0:
-                    local_idx = n_images + local_idx
-            else:
-                local_idx = n_images - 1
-            local_idx = max(0, min(local_idx, n_images - 1))
-
-            global_img_start = int(sum(int(num_images_per_sample[i]) for i in range(b)))
-            sample_grid = image_grid_thw[global_img_start : global_img_start + n_images]
-            goal_feat = self._extract_pixel_goal_patch_embed(
-                image_embeds,
-                sample_grid,
-                pixel_goals[b],
-                pixel_goal_image_hws[b],
-                image_idx=local_idx,
+        Training data formats the assistant reply as ``"{row} {col}"`` (640x480).
+        We decode tokens before the traj-query block and take the last two integers.
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError(
+                "Pixel-goal NavDP training requires `model.tokenizer = tokenizer` "
+                "before calling forward (set once in internvla_n1_trainer.py)."
             )
-            fused[b] = fused[b] + scale * goal_feat.unsqueeze(0)
-        return fused
+
+        goals = []
+        for b in range(input_ids.shape[0]):
+            seq_ids = input_ids[b, : t_s_pos[b]]
+            text = tokenizer.decode(seq_ids, skip_special_tokens=True)
+            nums = [int(x) for x in re.findall(r"\d+", text)]
+            if len(nums) >= 2:
+                goals.append([nums[-2], nums[-1]])
+            else:
+                goals.append([-1.0, -1.0])
+        return torch.tensor(goals, dtype=torch.float32)
 
     def forward(
         self,
@@ -163,10 +111,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_depths: Optional[torch.Tensor] = None,
         video_frame_num: Optional[torch.Tensor] = None,
         traj_poses: Optional[torch.Tensor] = None,
-        pixel_goals: Optional[torch.Tensor] = None,
-        pixel_goal_image_hws: Optional[torch.Tensor] = None,
         num_images_per_sample: Optional[torch.Tensor] = None,
-        pixel_goal_image_idxs: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -207,19 +152,25 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
-        cached_image_embeds = None
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                cached_image_embeds = image_embeds
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
@@ -232,7 +183,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
                 image_mask = mask_expanded.to(inputs_embeds.device)
 
-                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_embeds = image_embeds.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
@@ -250,12 +203,16 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
                 video_mask = mask_expanded.to(inputs_embeds.device)
 
-                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds = video_embeds.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
             n_traj_tokens = (input_ids == TRAJ_TOKEN_INDEX).sum().item()
             traj_idx = input_ids == TRAJ_TOKEN_INDEX
-            latent_queries = self.get_model().latent_queries.repeat(input_ids.shape[0], 1, 1)
+            latent_queries = self.get_model().latent_queries.repeat(
+                input_ids.shape[0], 1, 1
+            )
             H = latent_queries.shape[-1]
             latent_queries = latent_queries.contiguous().view(-1, H)
             if n_traj_tokens != 0:
@@ -265,7 +222,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
-        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+        if position_ids is None and (
+            attention_mask is None or attention_mask.ndim == 2
+        ):
             # calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache_position is not None and cache_position[0] == 0)
@@ -284,7 +243,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
                 delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
+                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
+                    if cache_position is not None
+                    else 0
                 )
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
@@ -313,63 +274,91 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         if labels is not None:
             traj_hidden_states = []
             for b in range(hidden_states.shape[0]):
-                traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
+                traj_hidden_states.append(
+                    hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :]
+                )
 
             traj_hidden_states = torch.stack(traj_hidden_states, dim=0)
-            if pixel_goals is not None and cached_image_embeds is not None:
-                traj_hidden_states = self._fuse_pixel_goal_into_latents(
-                    traj_hidden_states,
-                    cached_image_embeds,
-                    image_grid_thw,
-                    pixel_goals,
-                    pixel_goal_image_hws,
-                    num_images_per_sample=num_images_per_sample,
-                    pixel_goal_image_idxs=pixel_goal_image_idxs,
-                )
-            traj_hidden_states = traj_hidden_states.unsqueeze(1).repeat(1, traj_poses.size(1), 1, 1).flatten(0, 1)
+            traj_hidden_states = (
+                traj_hidden_states.unsqueeze(1)
+                .repeat(1, traj_poses.size(1), 1, 1)
+                .flatten(0, 1)
+            )
             loss_mask = torch.arange(traj_images.size(1), device=self.device).expand(
                 traj_images.size(0), traj_images.size(1)
             ) < video_frame_num.unsqueeze(1)
 
-            if 'nextdit' in self.get_system1_type():
-                if 'async' in self.get_system1_type():
+            if "nextdit" in self.get_system1_type():
+                if "async" in self.get_system1_type():
                     cur_images = traj_images.flatten(0, 1)
-                    pix_goal_images = traj_images[:, 0:1].repeat(1, traj_images.size(1), 1, 1, 1).flatten(0, 1)
+                    pix_goal_images = (
+                        traj_images[:, 0:1]
+                        .repeat(1, traj_images.size(1), 1, 1, 1)
+                        .flatten(0, 1)
+                    )
                     bsz = cur_images.size(0)
-                    images_dp = torch.stack([pix_goal_images, cur_images], dim=1).permute(0, 1, 4, 2, 3)
+                    images_dp = torch.stack(
+                        [pix_goal_images, cur_images], dim=1
+                    ).permute(0, 1, 4, 2, 3)
                     images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
 
                     images_dp_feat = (
                         self.get_model()
-                        .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1))[0]
+                        .rgb_model.get_intermediate_layers(
+                            images_dp_norm.flatten(0, 1)
+                        )[0]
                         .unflatten(dim=0, sizes=(bsz, -1))
                     )
 
                     memory_feat = self.get_model().memory_encoder(
                         images_dp_feat.flatten(1, 2)
                     )  # [bs*select_size,512,384]
-                    memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
+                    memory_feat = torch.cat(
+                        [images_dp_feat.flatten(1, 2), memory_feat], dim=-1
+                    )
                     memory_tokens = self.get_model().rgb_resampler(memory_feat)
 
-                    traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
+                    traj_hidden_states = self.get_model().cond_projector(
+                        traj_hidden_states
+                    )
                     latents = torch.cat([memory_tokens, traj_hidden_states], dim=1)
                 else:
-                    traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
+                    traj_hidden_states = self.get_model().cond_projector(
+                        traj_hidden_states
+                    )
                     latents = traj_hidden_states
 
                 relative_poses = traj_poses.flatten(0, 1)
                 bsz = relative_poses.shape[0]
-                noise = torch.randn(relative_poses.shape, device=relative_poses.device, dtype=relative_poses.dtype)
+                noise = torch.randn(
+                    relative_poses.shape,
+                    device=relative_poses.device,
+                    dtype=relative_poses.dtype,
+                )
                 u = torch.rand(size=(bsz,), device="cpu")
-                indices = (u * self.get_model().noise_scheduler.config.num_train_timesteps).long()
-                timesteps = self.get_model().noise_scheduler.timesteps[indices].to(device=latents.device)
+                indices = (
+                    u * self.get_model().noise_scheduler.config.num_train_timesteps
+                ).long()
+                timesteps = (
+                    self.get_model()
+                    .noise_scheduler.timesteps[indices]
+                    .to(device=latents.device)
+                )
                 sigmas = self.get_sigmas(
-                    timesteps, latents.device, n_dim=relative_poses.shape[-1], dtype=relative_poses.dtype
+                    timesteps,
+                    latents.device,
+                    n_dim=relative_poses.shape[-1],
+                    dtype=relative_poses.dtype,
                 )
 
                 noisy_trajectory = (1 - sigmas) * relative_poses + sigmas * noise
                 action_features = self.get_model().action_encoder(noisy_trajectory)
-                pos_ids = torch.arange(relative_poses.shape[1]).reshape(1, -1).repeat(bsz, 1).to(relative_poses.device)
+                pos_ids = (
+                    torch.arange(relative_poses.shape[1])
+                    .reshape(1, -1)
+                    .repeat(bsz, 1)
+                    .to(relative_poses.device)
+                )
                 pos_embed = self.get_model().pos_encoding(pos_ids)
                 action_features += pos_embed
 
@@ -384,23 +373,48 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 mask = loss_mask.flatten(0, 1)[:, None, None]
                 masked_loss = loss * mask
                 loss = masked_loss.sum() / mask.sum() / (loss.shape[1] * loss.shape[2])
-            elif 'navdp' in self.get_system1_type():
-                if 'async' in self.get_system1_type():  
+            elif "navdp" in self.get_system1_type():
+                if "async" in self.get_system1_type():
                     cur_images = traj_images.flatten(0, 1)
                     cur_depths = traj_depths.flatten(0, 1)
-                    pix_goal_images = traj_images[:, 0:1].repeat(1, traj_images.size(1), 1, 1, 1).flatten(0, 1)
-                    pix_goal_depths = traj_depths[:, 0:1].repeat(1, traj_depths.size(1), 1, 1).flatten(0, 1)
-                    images_dp = torch.stack([pix_goal_images, cur_images], dim=1)  # (bs*select_size, 2, 224, 224, 3)
-                    depths_dp = torch.stack([pix_goal_depths, cur_depths], dim=1).unsqueeze(
-                        -1
-                    )  # (bs*select_size, 2, 224, 224, 1)
-                    pred_pg, noise = self.model.navdp.forward_vlm_traj(
-                        traj_hidden_states, images_dp, depths_dp, tensor_label_actions=traj_poses
+                    pix_goal_images = (
+                        traj_images[:, 0:1]
+                        .repeat(1, traj_images.size(1), 1, 1, 1)
+                        .flatten(0, 1)
+                    )
+                    pix_goal_depths = (
+                        traj_depths[:, 0:1]
+                        .repeat(1, traj_depths.size(1), 1, 1)
+                        .flatten(0, 1)
+                    )
+                    images_dp = torch.stack(
+                        [pix_goal_images, cur_images], dim=1
+                    )  # (bs*select_size, 2, 224, 224, 3)
+                    depths_dp = torch.stack(
+                        [pix_goal_depths, cur_depths], dim=1
+                    ).unsqueeze(-1)  # (bs*select_size, 2, 224, 224, 1)
+                    pixel_goal = (
+                        self._parse_s2_pixel_goals_from_input_ids(input_ids, t_s_pos)
+                        .unsqueeze(1)
+                        .repeat(1, traj_poses.size(1), 1)
+                        .flatten(0, 1)
+                        .to(traj_hidden_states.device)
+                    )
+                    pred_pg, noise = self.model.navdp.forward_vlm_traj_w_pixelgoal_pg(
+                        traj_hidden_states,
+                        images_dp,
+                        depths_dp,
+                        tensor_label_actions=traj_poses,
+                        pixel_goal=pixel_goal,
                     )
                     pg_action_loss = (pred_pg - noise).square()
                     mask = loss_mask.flatten(0, 1)[:, None, None]
                     masked_loss = pg_action_loss * mask
-                    loss = masked_loss.sum() / mask.sum() / (pg_action_loss.shape[1] * pg_action_loss.shape[2])
+                    loss = (
+                        masked_loss.sum()
+                        / mask.sum()
+                        / (pg_action_loss.shape[1] * pg_action_loss.shape[2])
+                    )
 
             else:
                 raise NotImplementedError
@@ -417,29 +431,29 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             attentions=outputs.attentions,
         )
 
-    def generate_latents(
-        self,
-        input_ids,
-        pixel_values,
-        image_grid_thw,
-        pixel_goal=None,
-        image_hw=None,
-        pixel_goal_image_idx=-1,
-    ):
-        input_ids = input_ids.to(self.get_model().device)
+    def generate_latents(self, input_ids, pixel_values, image_grid_thw):
+        input_ids.to(self.get_model().device)
         with torch.no_grad():
             text_embeds = self.get_model().embed_tokens(input_ids)
-        latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
+        latent_queries = self.get_model().latent_queries.repeat(
+            text_embeds.shape[0], 1, 1
+        )
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
         input_ids = torch.cat(
-            [input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY], device=input_ids.device)], dim=1
+            [
+                input_ids,
+                torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device),
+            ],
+            dim=1,
         )
 
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
 
-        text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
+        text_embeds[image_idx] = image_embeds.to(text_embeds.device)[
+            : image_idx.sum(), :
+        ]
 
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
 
@@ -448,19 +462,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             outputs = self.model(
                 inputs_embeds=text_embeds,
                 position_ids=position_ids,
+                # attention_mask=attention_mask,
                 output_hidden_states=True,
                 return_dict=True,
             )
         hidden_states = outputs.hidden_states[-1][:, -N_QUERY:, :]
-
-        if pixel_goal is not None and image_hw is not None:
-            goal_tensor = torch.tensor(pixel_goal, device=hidden_states.device, dtype=torch.float32)
-            hw_tensor = torch.tensor(image_hw, device=hidden_states.device, dtype=torch.float32)
-            goal_feat = self._extract_pixel_goal_patch_embed(
-                image_embeds, image_grid_thw, goal_tensor, hw_tensor, image_idx=pixel_goal_image_idx
-            )
-            scale = self._pixel_goal_grounding_scale().to(hidden_states.dtype)
-            hidden_states = hidden_states + scale * goal_feat.view(1, 1, -1)
 
         return hidden_states
 
@@ -469,36 +475,43 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_latents,
         images_dp,
         depths_dp=None,
+        pixel_goal=None,
         predict_step_nums=32,
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
     ):
-        if 'nextdit' in self.get_system1_type():
+        if "nextdit" in self.get_system1_type():
             scheduler = FlowMatchEulerDiscreteScheduler()
             device = traj_latents.device
             dtype = traj_latents.dtype
 
             traj_latents = self.get_model().cond_projector(traj_latents)
-            if 'async' in self.get_system1_type():
+            if "async" in self.get_system1_type():
                 with torch.no_grad():
                     images_dp = images_dp.permute(0, 1, 4, 2, 3)
                     images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
                     self.get_model().rgb_model.to(dtype)
                     images_dp_feat = (
                         self.get_model()
-                        .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1).to(dtype))[0]
+                        .rgb_model.get_intermediate_layers(
+                            images_dp_norm.flatten(0, 1).to(dtype)
+                        )[0]
                         .unflatten(dim=0, sizes=(1, -1))
                     )
                     memory_feat = self.get_model().memory_encoder(
                         images_dp_feat.flatten(1, 2)
                     )  # [bs*select_size,512,384]
-                    memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
+                    memory_feat = torch.cat(
+                        [images_dp_feat.flatten(1, 2), memory_feat], dim=-1
+                    )
                     memory_tokens = self.get_model().rgb_resampler(memory_feat)
                 hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
             else:
                 hidden_states = traj_latents
-            hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
+            hidden_states_null = torch.zeros_like(
+                hidden_states, device=device, dtype=dtype
+            )
             hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
             batch_size = traj_latents.shape[0]
             latent_size = predict_step_nums
@@ -514,7 +527,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
             scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
-            hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
+            hidden_states_input = hidden_states_input.repeat_interleave(
+                num_sample_trajs, dim=0
+            )
 
             for t in scheduler.timesteps:
                 latent_features = self.get_model().action_encoder(latents)
@@ -528,7 +543,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 latent_features += pos_embed  # [num_sample_trajs, t, 384]
                 latent_model_input = latent_features.repeat(2, 1, 1)
                 if hasattr(scheduler, "scale_model_input"):
-                    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+                    latent_model_input = scheduler.scale_model_input(
+                        latent_model_input, t
+                    )
 
                 # predict noise model_output
                 noise_pred = self.get_model().traj_dit(
@@ -543,17 +560,37 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
                 # perform guidance
                 noise_pred_uncond, noise_pred = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred - noise_pred_uncond
+                )
 
                 # compute previous: x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
             return latents
 
-        elif 'navdp' in self.get_system1_type():
-            if 'async' in self.get_system1_type():
-                all_trajs = self.model.navdp.predict_pointgoal_action_async(
-                    traj_latents.to(self.get_model().device), images_dp, depths_dp
+        elif "navdp" in self.get_system1_type():
+            traj_latents = traj_latents.to(self.get_model().device)
+            if "async" in self.get_system1_type():
+                if pixel_goal is not None:
+                    all_trajs = (
+                        self.model.navdp.predict_pointgoal_action_w_pixelgoal_async(
+                            traj_latents,
+                            images_dp,
+                            depths_dp,
+                            pixel_goal=pixel_goal,
+                        )
+                    )
+                else:
+                    all_trajs = self.model.navdp.predict_pointgoal_action_async(
+                        traj_latents,
+                        images_dp,
+                        depths_dp,
+                    )
+            elif pixel_goal is not None:
+                all_trajs = self.model.navdp.predict_pointgoal_action_w_pixelgoal(
+                    traj_latents,
+                    pixel_goal=pixel_goal,
                 )
             else:
-                all_trajs = self.model.navdp.predict_pointgoal_action(traj_latents.to(self.get_model().device))
+                all_trajs = self.model.navdp.predict_pointgoal_action(traj_latents)
             return all_trajs

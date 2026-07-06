@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Local torchrun launcher for InternVLA-N1 dual-system (VLN) training.
 
-RUN_NAME="InternVLA-N1-DualVLN-BKHN-finetune"
+RUN_NAME="InternVLA-N1-DualVLN-BKHN-finetune-navdp-pixel-goal-only"
 OUTPUT_DIR="checkpoints/${RUN_NAME}-local"
 GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"
 NUM_GPUS=""
@@ -15,13 +15,14 @@ DEEPSPEED_CONFIG="scripts/train/qwenvl_train/zero2.json"
 MODEL_PATH="/home/lenguyen1/hoangpqn/vln/InternNav/checkpoints/base_model/InternVLA-N1-w-NavDP"
 VLN_DATASETS="bkhn_125cm_0_30"
 
-SYSTEM1="nextdit_async"
+SYSTEM1="navdp_async"
+NAVDP_GOAL_MODE="pixel_only"
 
 LR="1e-4"
 BATCH_SIZE="2"
 GRAD_ACCUM_STEPS="1"
 EPOCHS="3.0"
-SAVE_STEPS="5000"
+SAVE_STEPS="2000"
 MAX_PIXELS="313600"
 MIN_PIXELS="3136"
 DATALOADER_NUM_WORKERS="8"
@@ -47,6 +48,7 @@ Options:
   --model-path PATH       System2 checkpoint path (used as base). Default: ${MODEL_PATH}
   --datasets LIST         Comma-separated VLN dataset list. Default: ${VLN_DATASETS}
   --system1 NAME          System1 module: nextdit_async, navdp_async, nextdit. Default: ${SYSTEM1}
+  --navdp-goal-mode MODE  NavDP goal: fuse, pixel_only, vlm_only. Default: ${NAVDP_GOAL_MODE}
   --batch-size N          Per-device train batch size. Default: ${BATCH_SIZE}
   --grad-accum-steps N    Gradient accumulation steps. Default: ${GRAD_ACCUM_STEPS}
   --lr VALUE              Learning rate. Default: ${LR}
@@ -120,6 +122,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --system1)
             SYSTEM1="$2"
+            shift 2
+            ;;
+        --navdp-goal-mode)
+            NAVDP_GOAL_MODE="$2"
             shift 2
             ;;
         --batch-size)
@@ -235,6 +241,7 @@ TRAIN_ARGS=(
     --predict_step_num 32
     --pixel_goal_only True
     --system1 "${SYSTEM1}"
+    --navdp_goal_mode "${NAVDP_GOAL_MODE}"
     --output_dir "${OUTPUT_DIR}"
     --num_train_epochs "${EPOCHS}"
     --per_device_train_batch_size "${BATCH_SIZE}"
@@ -275,6 +282,7 @@ echo "  rendezvous: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  torchrun logs: ${TORCHRUN_LOG_DIR}"
 echo "  system2 checkpoint: ${MODEL_PATH}"
 echo "  system1: ${SYSTEM1}"
+echo "  navdp_goal_mode: ${NAVDP_GOAL_MODE}"
 echo "  datasets: ${VLN_DATASETS}"
 echo "  report_to: ${REPORT_TO}"
 if [[ -n "${DEEPSPEED_CONFIG}" ]]; then

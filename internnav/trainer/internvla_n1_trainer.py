@@ -159,13 +159,11 @@ def set_model(model_args, model):
             if any(k in n for k in modules):
                 p.requires_grad = True
         model.model.latent_queries.requires_grad = True
-        model.model.pixel_goal_grounding_weight.requires_grad = True
     elif "navdp" in model_args.system1:
         for n, p in model.model.navdp.named_parameters():
             if "rgb_model" not in n:
                 p.requires_grad = True
         model.model.latent_queries.requires_grad = True
-        model.model.pixel_goal_grounding_weight.requires_grad = True
 
 
 def train(attn_implementation="flash_attention_2"):
@@ -276,6 +274,14 @@ def train(attn_implementation="flash_attention_2"):
                     model_args.system1,
                 )
     set_model(model_args, model)
+
+    if data_args.model_type == "internvla-n1":
+        model.tokenizer = tokenizer
+        if hasattr(model.model, "navdp"):
+            model.model.navdp.set_goal_mode(model_args.navdp_goal_mode)
+            model.config.navdp_goal_mode = model_args.navdp_goal_mode
+            if torch.distributed.get_rank() == 0:
+                logging.info("NavDP goal_mode=%s", model_args.navdp_goal_mode)
 
     if torch.distributed.get_rank() == 0:
         model.visual.print_trainable_parameters()
