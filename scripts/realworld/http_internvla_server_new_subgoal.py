@@ -12,8 +12,7 @@ from PIL import Image
 from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
 
 DEFAULT_SUBGOALS = [
-    "Go straight and stop near the green plant without touching the plant",
-    "Turn left and go straight along the yellow lines, stop at the second green plant",
+    "Go straight to the fire extinguisher. Turn right and go straight, stop at the green plant",
 ]
 
 app = Flask(__name__)
@@ -159,11 +158,21 @@ def eval_dual():
 # 3. Move straight and stop at the second green plant
 
 # /home/phuongnh/khang/InternNav/checkpoints/DualVLN-pixel-goal-v1
+# /home/phuongnh/khang/InternNav/checkpoints/dit/260626/only-s1/InternVLA-N1-DualVLN-office-rtx5090-v2
+# /home/phuongnh/khang/InternNav/checkpoints/dit/290626-only-s1/InternVLA-N1-DualVLN-office-rtx5090-v1
+# /home/phuongnh/khang/InternNav/checkpoints/navdp/240626-no-llm
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:1")
-    parser.add_argument("--model_path", type=str, default="checkpoints/DualVLN-pixel-goal-v1")
+    ### note: if using pixel goal as condition, set use_pixel_goal_for_s1 = true
+    parser.add_argument("--model_path", type=str, default="checkpoints/navdp/240626-no-llm")
+    parser.add_argument(
+        "--use_pixel_goal_for_s1",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    ###
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
@@ -191,11 +200,7 @@ if __name__ == '__main__':
         "--model_path_original",
         default="checkpoints/InternVLA-N1-DualVLN",
     )
-    parser.add_argument(
-        "--use_pixel_goal_for_s1",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
+    
     args = parser.parse_args()
 
     if args.no_subgoals:

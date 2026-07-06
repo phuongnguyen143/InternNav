@@ -87,7 +87,7 @@ def eval_dual():
 # 1. Go straight and stop at the green plant
 # 2. Turn left. Stop when you are facing left
 # 3. Move straight and stop at the second green plant
-
+# /home/phuongnh/khang/InternNav/checkpoints/DualVLN-pixel-goal-v3
 
 if __name__ == '__main__':
 

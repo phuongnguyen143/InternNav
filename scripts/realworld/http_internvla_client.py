@@ -390,31 +390,39 @@ class Go2Manager(Node):
         image_bytes = io.BytesIO()
         image.save(image_bytes, format='JPEG')
         image_bytes.seek(0)
-
-        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        raw_depth[np.isnan(raw_depth)] = 0
-        raw_depth[np.isinf(raw_depth)] = 0
-        self.depth_image = raw_depth / 1000.0
-        self.depth_image -= 0.0
-        self.depth_image[np.where(self.depth_image < 0)] = 0
+ 
+        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_encoding = depth_msg.encoding.upper()
+        if depth_encoding == '16UC1':
+            # Integer depth images contain millimeters.
+            self.depth_image = raw_depth.astype(np.float32) / 1000.0
+        elif depth_encoding == '32FC1':
+            # Floating-point depth images already contain meters.
+            self.depth_image = raw_depth.astype(np.float32)
+        else:
+            self.get_logger().error(f"Unsupported depth encoding: {depth_msg.encoding}")
+            return
+ 
+        self.depth_image[~np.isfinite(self.depth_image)] = 0.0
+        self.depth_image[self.depth_image < 0.0] = 0.0
         depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
         depth = PIL_Image.fromarray(depth)
         depth_bytes = io.BytesIO()
         depth.save(depth_bytes, format='PNG')
         depth_bytes.seek(0)
-
+ 
         rgb_depth_rw_lock.acquire_write()
         self.rgb_bytes = image_bytes
-
+ 
         self.rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
         self.last_rgb_time = self.rgb_time
-
+ 
         self.depth_bytes = depth_bytes
         self.depth_time = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec / 1.0e9
         self.last_depth_time = self.depth_time
-
+ 
         rgb_depth_rw_lock.release_write()
-
+ 
         self.new_vis_image_arrived = True
         self.new_image_arrived = True
 
