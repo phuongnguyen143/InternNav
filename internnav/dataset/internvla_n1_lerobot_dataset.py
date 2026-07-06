@@ -1371,6 +1371,8 @@ class NavPixelGoalDataset(Dataset):
         data_dict["sample_type"] = sample_type
         if pixel_coords_gt is not None:
             data_dict["pixel_coords_gt"] = pixel_coords_gt
+        else:
+            data_dict["pixel_coords_gt"] = torch.tensor([float("nan"), float("nan")], dtype=torch.float32)
 
         # System-1 trajectory supervision (dual-system training only).
         if self.pixel_goal_only:
@@ -1520,8 +1522,13 @@ class DataCollatorForSupervisedDataset(object):
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
 
-        if "sample_type" in instances[0]:
-            batch["sample_types"] = [instance["sample_type"] for instance in instances]
+        # Stack pixel coords whenever any sample has them (or S1 traj is present).
+        # Do not gate on sample_type: HF remove_unused_columns strips that key before collate.
+        has_pixel_coords = any("pixel_coords_gt" in instance for instance in instances)
+        if has_pixel_coords or "traj_images" in instances[0]:
+            batch["sample_types"] = [
+                instance.get("sample_type", "unknown") for instance in instances
+            ]
             coords = []
             for instance in instances:
                 if "pixel_coords_gt" in instance:

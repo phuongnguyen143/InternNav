@@ -80,7 +80,7 @@ class TokenCompressor(nn.Module):
     def forward(self, x, padding_mask=None):
         """
         x: (bs, N, 384) - Input sequence (variable length)
-        padding_mask: (bs, N) - Padding mask for input sequence (True for padding positions)
+        padding_mask: (bs, N). Padding mask for input sequence (True for padding positions)
         """
         bs, token_len, _ = x.shape
 

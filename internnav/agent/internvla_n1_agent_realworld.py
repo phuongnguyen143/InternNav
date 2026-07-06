@@ -5,8 +5,9 @@ Architecture:
 ------------
 - S2 (slow planner): VLM reads RGB (+ optional history) and the language instruction,
   then outputs either discrete actions (STOP / arrows) or pixel waypoint coordinates.
-- S1 (fast executor): When S2 outputs a pixel goal, S1 turns the latent into a
-  short trajectory using goal-frame + current-frame RGB-D.
+- S1 (fast executor): When S2 outputs a pixel goal, S1 produces a short trajectory using
+  goal-frame + current-frame RGB-D. Conditioning is either VLM latents (default) or
+  pixel (x,y) when model config use_pixel_goal_for_s1=True.
 
 Async pipeline: because S2 re-plans every `plan_step_gap` frames while S1 executes trajectories in between.
 
@@ -33,7 +34,7 @@ from collections import OrderedDict
 from PIL import Image
 from transformers import AutoProcessor
 
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM, InternVLAN1ModelConfig
 from internnav.model.utils.device import model_load_dtype, resolve_torch_device
 from internnav.model.utils.s2_attention_viz import extract_s2_attentions
 from internnav.model.utils.vln_utils import S2Output, split_and_clean, traj_to_actions
@@ -60,12 +61,19 @@ class InternVLAN1AsyncAgent:
         attn_implementation = getattr(args, "attn_implementation", "sdpa")
         self.extract_attention = getattr(args, "extract_attention", False)
         self.attn_layers = getattr(args, "attn_layers", None)
-        self.model = InternVLAN1ForCausalLM.from_pretrained(
-            args.model_path,
+
+        use_pixel_goal_override = getattr(args, 'use_pixel_goal_for_s1', None)
+        load_kwargs = dict(
             torch_dtype=load_dtype,
             attn_implementation=attn_implementation,
             device_map={"": self.device},
         )
+        if use_pixel_goal_override is not None:
+            model_config = InternVLAN1ModelConfig.from_pretrained(args.model_path)
+            model_config.use_pixel_goal_for_s1 = bool(use_pixel_goal_override)
+            load_kwargs['config'] = model_config
+
+        self.model = InternVLAN1ForCausalLM.from_pretrained(args.model_path, **load_kwargs)
         self.model.eval()
         self.model.to(self.device)
 
@@ -76,6 +84,11 @@ class InternVLAN1AsyncAgent:
         self.resize_h = args.resize_h
         self.num_history = args.num_history  # past frames sampled into the S2 prompt
         self.PLAN_STEP_GAP = args.plan_step_gap  # S2 re-plan interval (S1 runs in between)
+
+        if use_pixel_goal_override is not None:
+            self.model.get_model().config.use_pixel_goal_for_s1 = bool(use_pixel_goal_override)
+        self.use_pixel_goal_for_s1 = self.model.uses_pixel_goal_for_s1()
+        print(f"use_pixel_goal_for_s1={self.use_pixel_goal_for_s1}")
 
         # Base prompt template; <instruction> is replaced per episode in step_s2().
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task."
@@ -143,13 +156,18 @@ class InternVLAN1AsyncAgent:
         os.makedirs(self.save_dir, exist_ok=True)
 
     def parse_actions(self, output):
-        """Extract discrete action indices from VLM text (e.g. '↑' -> [1])."""
+        """'↑' -> [1]"""
         action_patterns = '|'.join(re.escape(action) for action in self.actions2idx)
         regex = re.compile(action_patterns)
         matches = regex.findall(output)
         actions = [self.actions2idx[match] for match in matches]
         actions = itertools.chain.from_iterable(actions)
         return list(actions)
+
+    def _has_pending_s1(self):
+        if self.use_pixel_goal_for_s1:
+            return self.output_pixel is not None
+        return self.output_latent is not None
 
     def step_no_infer(self, rgb, depth, pose):
         """Record a frame without model inference (between S2 re-plans)."""
@@ -172,12 +190,12 @@ class InternVLAN1AsyncAgent:
         Main control loop entry point.
 
         Runs S2 when enough steps have passed, on the first call, or when look_down=True.
-        Otherwise caches the frame and runs S1 if a pixel-goal latent is pending.
+        Otherwise caches the frame and runs S1 if a pixel goal (latent or x,y) is pending.
 
         pose/intrinsic are kept for API compatibility with sim/ROS wrappers; not used here.
         """
         dual_sys_output = S2Output()
-        no_output_flag = self.output_action is None and self.output_latent is None
+        no_output_flag = self.output_action is None and not self._has_pending_s1()
 
         if (self.episode_idx - self.last_s2_idx > self.PLAN_STEP_GAP) or look_down or no_output_flag:
             self.output_action, self.output_latent, self.output_pixel = self.step_s2(
@@ -196,7 +214,7 @@ class InternVLAN1AsyncAgent:
             # Discrete actions are one-shot: return them and clear so S2 runs next cycle.
             dual_sys_output.output_action = copy.deepcopy(self.output_action)
             self.output_action = None
-        elif self.output_latent is not None:
+        elif self._has_pending_s1():
             # S1 expects two RGB-D pairs: [pixel-goal frame, current frame], 224x224.
             processed_pixel_rgb = np.array(Image.fromarray(self.pixel_goal_rgb).resize((224, 224))) / 255
             processed_pixel_depth = np.array(Image.fromarray(self.pixel_goal_depth).resize((224, 224)))
@@ -213,7 +231,12 @@ class InternVLAN1AsyncAgent:
                 .unsqueeze(-1)
                 .to(self.device)
             )
-            trajectories = self.step_s1(self.output_latent, rgbs, depths)
+            trajectories = self.step_s1(
+                self.output_latent,
+                rgbs,
+                depths,
+                pixel_goal=self.output_pixel,
+            )
             # Continuous XY path (not discretized to turn/forward symbols).
             dual_sys_output.output_trajectory = traj_to_actions(trajectories, use_discrate_action=False)
 
@@ -224,7 +247,7 @@ class InternVLAN1AsyncAgent:
         S2 planner: build a multi-image chat prompt and run VLM generation.
 
         Returns (action_seq, traj_latents, pixel_goal):
-          - Digits in output -> pixel goal + latents for S1: (None, latents, [row, col])
+          - Digits in output -> pixel goal for S1; latents only if use_pixel_goal_for_s1=False
           - Arrow/STOP tokens -> discrete actions: (action_list, None, None)
 
         look_down=True appends a downward-view frame as a follow-up turn (after action 5).
@@ -362,13 +385,15 @@ class InternVLAN1AsyncAgent:
             # Model outputs (col, row); swap to [row, col] for image indexing.
             pixel_goal = [int(coord[1]), int(coord[0])]
 
-            # Re-run the model's hidden states to extract trajectory latents for S1.
-            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-            pixel_values = inputs.pixel_values
-            t0 = time.time()
-            with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-            # No discrete actions; S1 will produce a continuous trajectory from the latents.
+            traj_latents = None
+            if not self.use_pixel_goal_for_s1:
+                # Extra forward pass: traj-query hidden states for latent-conditioned S1.
+                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+                pixel_values = inputs.pixel_values
+                t0 = time.time()
+                with torch.no_grad():
+                    traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                print(f"generate_latents cost: {time.time() - t0:.3f}s")
             return None, traj_latents, pixel_goal
 
         else:
@@ -377,14 +402,17 @@ class InternVLAN1AsyncAgent:
             action_seq = self.parse_actions(self.llm_output)
             return action_seq, None, None
 
-    def step_s1(self, latent, rgb, depth):
+    def step_s1(self, latent, rgb, depth, pixel_goal=None):
         """
-        S1 inference:
-        - Latent -> S1 inference -> trajectory
-        - Trajectory -> action
-        S1 executor: diffusion-style trajectory head conditioned on S2 latents + RGB-D pair.
+        S1 inference: diffusion trajectory from S2 goal + RGB-D pair.
 
+        Uses VLM latents by default, or pixel (x, y) when use_pixel_goal_for_s1=True.
         Returns raw trajectory deltas; step() converts them to an XY path via traj_to_actions().
         """
-        all_trajs = self.model.generate_traj(latent, rgb, depth)
+        all_trajs = self.model.generate_traj(
+            traj_latents=latent,
+            images_dp=rgb,
+            depths_dp=depth,
+            pixel_goal=pixel_goal,
+        )
         return all_trajs

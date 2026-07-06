@@ -58,7 +58,7 @@ fi
 total_gpus=$((NPROC_PER_NODE * NNODES))
 TARGET_EFFECTIVE_BATCH="${TARGET_EFFECTIVE_BATCH:-64}"
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%0}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%30}"
 DEFAULT_DATA_ROOT="data/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
@@ -108,8 +108,8 @@ _default_grad_accum=$(( (TARGET_EFFECTIVE_BATCH + total_gpus * _default_batch_si
 deepspeed="${DEEPSPEED_CONFIG:-${DEEPSPEED:-${_default_deepspeed}}}"
 
 
-# /home/phuongnh/khang/InternNav/checkpoints/InternVLA-N1-DualVLN-office-rtx5090-v1
-system2_ckpt="${SYSTEM2_CKPT:-checkpoints/InternVLA-N1-DualVLN-office-rtx5090-v1}"
+# /home/phuongnh/khang/InternNav/checkpoints/dit/260626/only-s1/InternVLA-N1-DualVLN-office-rtx5090-v2
+system2_ckpt="${SYSTEM2_CKPT:-checkpoints/dit/260626/only-s1/InternVLA-N1-DualVLN-office-rtx5090-v2}"
 if [[ -d "${system2_ckpt}" ]]; then
     system2_ckpt="$(cd "${system2_ckpt}" && pwd)"
 elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
@@ -119,6 +119,11 @@ fi
 # system1 options: navdp_async, nextdit_async, nextdit
 system1="${SYSTEM1:-nextdit_async}"
 
+# use_pixel_goal_for_s1=False -> VLM latent (default), | True -> pixel (x,y)
+# Dual w S1 training needs traj gt on every sample:
+#   pixel_goal_only=True  (required for both latent and pixel S1 modes)
+use_pixel_goal_for_s1="${USE_PIXEL_GOAL_FOR_S1:-True}"
+pixel_goal_only="${PIXEL_GOAL_ONLY:-True}"
 lr="${LR:-2e-5}"
 batch_size="${BATCH_SIZE:-${_default_batch_size}}"
 grad_accum_steps="${GRAD_ACCUM_STEPS:-${_default_grad_accum}}"
@@ -152,18 +157,24 @@ print_gpu_preflight() {
     echo ""
 }
 
-run_name="${RUN_NAME:-InternVLA-N1-DualVLN-office-rtx5090-v2}"
+run_name="${RUN_NAME:-DualVLN-pixel-goal-v3}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
+mkdir -p "${output_dir}"
+run_log_file="${RUN_LOG_FILE:-${output_dir}/train.log}"
+exec > >(tee "${run_log_file}") 2>&1
 
 extra_args=()
+if [[ "${use_pixel_goal_for_s1}" == "True" ]]; then
+    extra_args+=(--use_pixel_goal_for_s1 True)
+fi
 if [ -n "${MAX_STEPS:-}" ]; then
     extra_args+=(--max_steps "${MAX_STEPS}")
     num_epochs="1.0"
     save_steps=1000000
     report_to="none"
 else
-    num_epochs="${NUM_TRAIN_EPOCHS:-2}"
-    save_steps=100
+    num_epochs="${NUM_TRAIN_EPOCHS:-3}"
+    save_steps=10
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
@@ -176,7 +187,8 @@ if [[ "${system2_ckpt}" == /* ]] && [[ ! -d "${system2_ckpt}" ]]; then
     echo "Download from https://huggingface.co/InternRobotics/InternVLA-N1-System2" >&2
     exit 1
 fi
-echo "System 1:        ${system1} (train NavDP, System 2 frozen)"
+echo "System 1:        ${system1}"
+echo "S1 goal cond:    use_pixel_goal_for_s1=${use_pixel_goal_for_s1}  pixel_goal_only=${pixel_goal_only}"
 echo "DeepSpeed:       ${deepspeed}"
 echo "Data root:       ${DEFAULT_DATA_ROOT}"
 echo "R2R data path:   ${INTERNAV_R2R_DATA_PATH}"
@@ -192,6 +204,7 @@ echo "Resize:          ${resize_h}x${resize_w}  history=${num_history}  max_len=
 echo "Tune System 2:   vision=True mlp=True llm=False  aug=${data_augmentation}"
 echo "LOW_MEM:         ${LOW_MEM:-False}  HIGH_MEM: ${HIGH_MEM:-False}"
 echo "Output dir:      ${output_dir}"
+echo "Run log:         ${run_log_file}"
 echo "Metrics log:     ${output_dir}/training_metrics.jsonl"
 if [ -n "${MAX_STEPS:-}" ]; then
     echo "Max steps:       ${MAX_STEPS} (smoke test)"
@@ -230,6 +243,7 @@ fi
     --vln_dataset_use "${vln_datasets}" \
     --vln_dataset_custom "${vln_dataset_custom}" \
     --data_flatten False \
+    --remove_unused_columns False \
     --tune_mm_vision False \
     --tune_mm_mlp False \
     --tune_mm_llm False \
@@ -241,7 +255,7 @@ fi
     --sample_step 4 \
     --num_future_steps 4 \
     --predict_step_num 32 \
-    --pixel_goal_only True \
+    --pixel_goal_only "${pixel_goal_only}" \
     --system1 "${system1}" \
     --output_dir "${output_dir}" \
     --num_train_epochs "${num_epochs}" \

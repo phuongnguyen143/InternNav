@@ -61,11 +61,13 @@ def eval_dual():
         dual_sys_output = agent.step(
             image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
         )
+        print("dual_sys_output0", dual_sys_output, "\n")
         if dual_sys_output.output_action is not None and dual_sys_output.output_action == [5]:
             look_down = True
             dual_sys_output = agent.step(
                 image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
             )
+        print("dual_sys_output", dual_sys_output, "\n")
 
         json_output = {}
         if dual_sys_output.output_action is not None:
@@ -82,11 +84,16 @@ def eval_dual():
     return jsonify(json_output)
 
 
+# 1. Go straight and stop at the green plant
+# 2. Turn left. Stop when you are facing left
+# 3. Move straight and stop at the second green plant
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:1")
-    parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1-DualVLN")
+    parser.add_argument("--model_path", type=str, default="checkpoints/dit/290626-only-s1/InternVLA-N1-DualVLN-office-rtx5090-v1")
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
@@ -95,7 +102,7 @@ if __name__ == '__main__':
         "--instruction",
         type=str,
         default=(
-            "Navigate through the office area. Pass between the two rows of computer desks, stay in the center aisle, and stop in front of the green plant."
+            "Go straight and turn left at the green plant on the floor. Stop after 2 meters"
         ),
     )
     args = parser.parse_args()

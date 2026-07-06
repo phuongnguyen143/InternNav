@@ -34,6 +34,8 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
         super().__init__(**kwargs)
         # Extra deployment/training settings (system1 type, n_query, etc.) live here.
         self.model_cfg = kwargs.get('model_cfg', None)
+        self.use_pixel_goal_for_s1 = kwargs.get('use_pixel_goal_for_s1', False)
+        self.s1_pixel_goal_norm_size = kwargs.get('s1_pixel_goal_norm_size', 224.0)
 
     # If transformer version is newer than 4.48.0, use the following code to expose the text_config attributes
     # def __post_init__(self, **kwargs):
@@ -113,6 +115,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_depths: Optional[torch.Tensor] = None,
         video_frame_num: Optional[torch.Tensor] = None,
         traj_poses: Optional[torch.Tensor] = None,
+        pixel_coords_gt: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -265,17 +268,28 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             cache_position=cache_position,
         )
 
-        hidden_states = outputs[0]
+        hidden_states = getattr(outputs, "last_hidden_state", None)
+        if hidden_states is None:
+            hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
         # ------------------------------------------------------------------
         # 4 (training) System 1 trajectory loss.
-        # Requires labels + traj_images/traj_poses. 
+        # Requires labels + traj_images/traj_poses/t_s_pos (pixel_goal_only batches).
         # ------------------------------------------------------------------
         loss = None
-        if labels is not None:
+        has_s1_supervision = (
+            labels is not None
+            and traj_poses is not None
+            and traj_images is not None
+            and t_s_pos is not None
+        )
+        if labels is not None and not has_s1_supervision:
+            raise ValueError("Batch has labels but no S1 traj fields (t_s_pos, traj_images, traj_poses). ")
+        if has_s1_supervision:
             # Pull hidden states at traj-query positions, these encode "where to go".
             # t_s_pos[b] is the start index of the n_query latent tokens for batch item b.
+            
             traj_hidden_states = []
             for b in range(hidden_states.shape[0]):
                 traj_hidden_states.append(hidden_states[b, t_s_pos[b] : t_s_pos[b] + self.config.n_query, :])
@@ -286,8 +300,28 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 traj_images.size(0), traj_images.size(1)
             ) < video_frame_num.unsqueeze(1)
 
+            per_frame_pixel = None
+            pixel_valid_per_frame = None
+            if (
+                'nextdit' in self.get_system1_type()
+                and self.uses_pixel_goal_for_s1()
+                and pixel_coords_gt is not None
+            ):
+                per_frame_pixel = pixel_coords_gt.unsqueeze(1).repeat(1, traj_poses.size(1), 1).flatten(0, 1)
+                pixel_valid = ~torch.isnan(pixel_coords_gt).any(dim=-1)
+                pixel_valid_per_frame = pixel_valid.unsqueeze(1).repeat(1, traj_poses.size(1)).flatten(0, 1)
+
+            run_s1_loss = True
+            if (
+                'nextdit' in self.get_system1_type()
+                and self.uses_pixel_goal_for_s1()
+                and (per_frame_pixel is None or not pixel_valid_per_frame.any())
+            ):
+                # No valid pixel goal in this batch, so we skip S1 loss (e.g. turn/stop-only batch).
+                run_s1_loss = False
+
             # Two S1 backends: NextDiT (flow-matching DiT) or NavDP (DDPM policy).
-            if 'nextdit' in self.get_system1_type():
+            if run_s1_loss and 'nextdit' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
                     # "async" = robot keeps moving while S2 re-plans.
                     # S1 sees TWO frames: the frame where S2 picked the pixel goal,
@@ -320,11 +354,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
                     memory_tokens = self.get_model().rgb_resampler(memory_feat)
 
-                    traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
-                    latents = torch.cat([memory_tokens, traj_hidden_states], dim=1)
+                    goal_tokens = self.build_s1_goal_tokens(traj_hidden_states, per_frame_pixel)
+                    latents = torch.cat([memory_tokens, goal_tokens], dim=1)
                 else:
-                    traj_hidden_states = self.get_model().cond_projector(traj_hidden_states)
-                    latents = traj_hidden_states
+                    goal_tokens = self.build_s1_goal_tokens(traj_hidden_states, per_frame_pixel)
+                    latents = goal_tokens
 
                 # Flow-matching training (like diffusion, but predicts velocity not noise):
                 #   noisy_pose = (1 - sigma) * clean_pose + sigma * random_noise
@@ -354,9 +388,14 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 target = noise - relative_poses  # flow-matching velocity target
                 loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                 mask = loss_mask.flatten(0, 1)[:, None, None]
+                if pixel_valid_per_frame is not None:
+                    mask = mask & pixel_valid_per_frame[:, None, None]
                 masked_loss = loss * mask
-                loss = masked_loss.sum() / mask.sum() / (loss.shape[1] * loss.shape[2])
-            elif 'navdp' in self.get_system1_type():
+                if mask.sum() > 0:
+                    loss = masked_loss.sum() / mask.sum() / (loss.shape[1] * loss.shape[2])
+                else:
+                    loss = None
+            elif run_s1_loss and 'navdp' in self.get_system1_type():
                 if 'async' in self.get_system1_type():
                     cur_images = traj_images.flatten(0, 1)
                     cur_depths = traj_depths.flatten(0, 1)
@@ -374,7 +413,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     masked_loss = pg_action_loss * mask
                     loss = masked_loss.sum() / mask.sum() / (pg_action_loss.shape[1] * pg_action_loss.shape[2])
 
-            else:
+            elif run_s1_loss:
                 raise NotImplementedError
 
         if not return_dict:
@@ -439,6 +478,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         traj_latents,
         images_dp,
         depths_dp=None,
+        pixel_goal=None,
         predict_step_nums=32,
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
@@ -452,11 +492,26 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         """
         if 'nextdit' in self.get_system1_type():
             scheduler = FlowMatchEulerDiscreteScheduler()
-            device = traj_latents.device
-            dtype = traj_latents.dtype
+            # device = traj_latents.device
+            # dtype = traj_latents.dtype
 
-            # Project VLM hidden dim (3584) → NextDiT conditioning dim (768).
-            traj_latents = self.get_model().cond_projector(traj_latents)
+            # # Project VLM hidden dim (3584) → NextDiT conditioning dim (768).
+            # traj_latents = self.get_model().cond_projector(traj_latents)
+            if self.uses_pixel_goal_for_s1():
+                if pixel_goal is None:
+                    raise ValueError("pixel_goal is required when use_pixel_goal_for_s1=True")
+                device = images_dp.device if images_dp is not None else self.get_model().device
+                dtype = next(self.get_model().parameters()).dtype
+                pixel_tensor = torch.as_tensor(pixel_goal, device=device, dtype=dtype)
+                if pixel_tensor.dim() == 1:
+                    pixel_tensor = pixel_tensor.unsqueeze(0)
+                goal_tokens = self.build_s1_goal_tokens(pixel_coords_gt=pixel_tensor)
+            else:
+                if traj_latents is None:
+                    raise ValueError("traj_latents is required when use_pixel_goal_for_s1=False")
+                device = traj_latents.device
+                dtype = traj_latents.dtype
+                goal_tokens = self.build_s1_goal_tokens(traj_hidden_states=traj_latents)
             if 'async' in self.get_system1_type():
                 with torch.no_grad():
                     images_dp = images_dp.permute(0, 1, 4, 2, 3)
@@ -472,16 +527,16 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     )  # [bs*select_size,512,384]
                     memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
                     memory_tokens = self.get_model().rgb_resampler(memory_feat)
-                hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
+                hidden_states = torch.cat([memory_tokens, goal_tokens], dim=1)
             else:
-                hidden_states = traj_latents
-            # Classifier-free guidance (CFG): run the DiT twice per step —
+                hidden_states = goal_tokens
+            # Classifier-free guidance (CFG): run the DiT twice per step 
             # once with zero conditioning (unconditional) and once with real latents.
             # Final prediction = uncond + scale * (cond - uncond). Higher scale = stronger
             # adherence to the VLM's navigation intent.
             hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
             hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
-            batch_size = traj_latents.shape[0]
+            batch_size = goal_tokens.shape[0]
             latent_size = predict_step_nums       # 32 future waypoints
             latent_channels = 3                   # each waypoint is (x, y, z)
 

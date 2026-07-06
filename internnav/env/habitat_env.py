@@ -17,6 +17,7 @@ class HabitatEnv(base.Env):
 
     def __init__(self, env_config: EnvCfg, task_config: TaskCfg = None):
         try:
+            import habitat
             from habitat import Env
         except ImportError as e:
             raise RuntimeError(
@@ -24,7 +25,12 @@ class HabitatEnv(base.Env):
             ) from e
 
         super().__init__(env_config, task_config)
+        self.env_config = env_config
         self.config = env_config.env_settings['habitat_config']
+        local_rank = env_config.env_settings.get('local_rank', 0)
+        habitat_gpu = env_config.env_settings.get('habitat_gpu_device_id', local_rank)
+        with habitat.config.read_write(self.config):
+            self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = habitat_gpu
         self._env = Env(self.config)
 
         self.rank = env_config.env_settings.get('rank', 0)
@@ -74,6 +80,10 @@ class HabitatEnv(base.Env):
                 if (scene_id, episode_id) in done_res:
                     continue
                 all_episodes.append(episode)
+
+        max_episodes = self.env_config.env_settings.get('max_episodes')
+        if max_episodes is not None:
+            all_episodes = all_episodes[: int(max_episodes)]
 
         return all_episodes
 

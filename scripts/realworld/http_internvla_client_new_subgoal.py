@@ -52,9 +52,21 @@ mpc_rw_lock = ReadWriteLock()
 offset_x = 0.0
 offset_y = 0.0
 
+
+DEFAULT_SUBGOALS = [
+    "Go straight and stop at the green plant",
+    "Turn left. Stop when you are facing left",
+    "Move straight and stop at the second green plant",
+]
+subgoals = list(DEFAULT_SUBGOALS)
+all_subgoals_done = False
+
+
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
-    global policy_init, http_idx, first_running_time, last_pixel_goal
+    global policy_init, http_idx, first_running_time, last_pixel_goal, all_subgoals_done
     data = {"reset": policy_init, "idx": http_idx}
+    if policy_init and subgoals:
+        data["subgoals"] = subgoals
     json_data = json.dumps(data)
 
     policy_init = False
@@ -73,6 +85,15 @@ def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0
     response_json = json.loads(response.text)
     if 'pixel_goal' in response_json:
         last_pixel_goal = response_json['pixel_goal']
+    if response_json.get('all_subgoals_done'):
+        all_subgoals_done = True
+    elif response_json.get('subgoal_finished'):
+        subgoal_idx = response_json.get('subgoal_idx', 0)
+        total = response_json.get('total_subgoals', 0)
+        next_instr = response_json.get('next_instruction')
+        print(f"Subgoal {subgoal_idx + 1}/{total} finished.")
+        if next_instr:
+            print(f"Next subgoal: {next_instr}")
 
     return response_json
 
@@ -224,12 +245,16 @@ def control_thread():
 
 
 def planning_thread():
-    global trajs_in_world
+    global trajs_in_world, all_subgoals_done
 
     while True:
         start_time = time.time()
         DESIRED_TIME = 0.3
         time.sleep(0.05)
+
+        if all_subgoals_done:
+            time.sleep(0.1)
+            continue
 
         if not manager.new_image_arrived:
             time.sleep(0.01)
@@ -313,7 +338,14 @@ def planning_thread():
             elif 'discrete_action' in response:
                 actions = response['discrete_action']
                 print("actions log: ", actions)
-                if actions != [5] and actions != [9]:
+                if actions == [0]:
+                    global desired_v, desired_w, mpc
+                    desired_v, desired_w = 0.0, 0.0
+                    manager.move(0.0, 0.0, 0.0)
+                    mpc_rw_lock.acquire_write()
+                    mpc = None
+                    mpc_rw_lock.release_write()
+                elif actions != [5] and actions != [9]:
                     manager.incremental_change_goal(actions)
                     current_control_mode = ControlMode.PID_Mode
         else:
@@ -329,6 +361,12 @@ class Go2Manager(Node):
     def __init__(self):
         super().__init__('go2_manager')
         self.debug_publish_visualization = bool(self.declare_parameter('debug_publish_visualization', True).value)
+
+        global subgoals
+        subgoals_param = self.declare_parameter('subgoals', DEFAULT_SUBGOALS).value
+        if subgoals_param:
+            subgoals = list(subgoals_param)
+            self.get_logger().info(f"Loaded {len(subgoals)} subgoals from ROS param")
 
         qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5, durability=DurabilityPolicy.VOLATILE)
 

@@ -21,8 +21,6 @@ Notes:
   - If you meet the error about the `No module named LongCLIP (or diffusion policy)`, you should run the `git submodule update --init` in the root directory of InternNav. 
 Usage:
   python inference_only.py
-  python inference_only.py --project-root /path/to/InternNav --scene-dir /path/to/scene --depth-dir /path/to/depth --model-path /path/to/checkpoint
-
 
   python inference_only.py  --scene-dir /home/khang/Documents/VR/InternNav/assets/bkhn_data1/rgb --depth-dir /home/khang/Documents/VR/InternNav/assets/bkhn_data1/depth
 """

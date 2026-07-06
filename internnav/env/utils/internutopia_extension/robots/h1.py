@@ -1,14 +1,49 @@
 import numpy as np
 from internutopia.core.config.robot import RobotCfg
+from internutopia.core.robot.isaacsim.articulation import IsaacsimArticulation
 from internutopia.core.robot.robot import BaseRobot
 from internutopia.core.scene.scene import IScene
 from internutopia_extension.robots.h1 import H1Robot
 
 
+def _ensure_physx_articulation_attrs(articulation: IsaacsimArticulation) -> None:
+    """Ensure custom USD assets define Physx articulation attributes before use."""
+    from pxr import PhysxSchema
+    import omni.usd
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(articulation._articulation.prim_path)
+    art_api = PhysxSchema.PhysxArticulationAPI.Apply(prim)
+    if not art_api.GetEnabledSelfCollisionsAttr():
+        art_api.CreateEnabledSelfCollisionsAttr().Set(True)
+    if not art_api.GetSolverPositionIterationCountAttr():
+        art_api.CreateSolverPositionIterationCountAttr()
+    if not art_api.GetSolverVelocityIterationCountAttr():
+        art_api.CreateSolverVelocityIterationCountAttr()
+
+
+def _set_enabled_self_collisions_safe(self_art: IsaacsimArticulation, flag: bool) -> None:
+    """Apply PhysxArticulationAPI when the USD omits enabledSelfCollisions metadata."""
+    try:
+        self_art._articulation.set_enabled_self_collisions(flag=flag)
+    except Exception as e:
+        err = str(e)
+        if 'Empty typeName' not in err and 'enabledSelfCollisions' not in err:
+            raise
+        _ensure_physx_articulation_attrs(self_art)
+        self_art._articulation.set_enabled_self_collisions(flag=flag)
+
+
 @BaseRobot.register('VLNH1Robot')
 class VLNH1Robot(H1Robot):
     def __init__(self, config: RobotCfg, scene: IScene):
-        super().__init__(config, scene)
+        original = IsaacsimArticulation.set_enabled_self_collisions
+        IsaacsimArticulation.set_enabled_self_collisions = _set_enabled_self_collisions_safe
+        try:
+            super().__init__(config, scene)
+        finally:
+            IsaacsimArticulation.set_enabled_self_collisions = original
+        _ensure_physx_articulation_attrs(self.articulation)
         self.current_action = None
 
     def post_reset(self):

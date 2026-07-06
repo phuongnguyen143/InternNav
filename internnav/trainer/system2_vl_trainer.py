@@ -49,7 +49,7 @@ class System2VLTrainer(Trainer):
         num_items_in_batch: Optional[int] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, ModelOutput]]:
         sample_types = inputs.pop("sample_types", None)
-        pixel_coords_gt = inputs.pop("pixel_coords_gt", None)
+        pixel_coords_gt = inputs.get("pixel_coords_gt")
 
         outputs = model(**inputs)
         loss = outputs.loss if isinstance(outputs, ModelOutput) else outputs[0]

@@ -107,6 +107,8 @@ class SceneInstructionAttentionTracker:
         fig_w = max(10, 0.08 * matrix.shape[1])
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
         im = ax.imshow(matrix_norm, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+        ax.set_yticks(np.arange(len(frame_labels)))
+        ax.set_yticklabels(frame_labels)
         ax.set_xlabel("Instruction tokens")
         ax.set_ylabel("S2 re-plan step")
         ax.set_title(
@@ -205,7 +207,7 @@ def _token_offsets(tokenizer: Any, token_ids: list[int]) -> list[tuple[int, int]
     """Return character offsets for each token id in order."""
     text = _decode_ids(tokenizer, token_ids)
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    if enc["input_ids"] == token_ids:
+    if list(enc["input_ids"]) == list(token_ids):
         return enc["offset_mapping"]
 
     offsets: list[tuple[int, int]] = []
@@ -372,6 +374,9 @@ def extract_s2_attentions(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+        # vision: input_ids == image_token_id
+        # text is all others
     text_mask, vision_mask = _build_token_masks(full_ids, image_token_id)
     query_positions = _find_query_positions(full_ids, output_ids, prompt_len, tokenizer, llm_output)
 
@@ -395,9 +400,13 @@ def extract_s2_attentions(
 
     for layer_idx in layer_indices:
         # (batch, heads, seq, seq) -> mean over heads and query positions
+
+        # (seq_len, seq_len)
         layer_attn = (
             selected_attentions[layer_idx][0].mean(dim=0).detach().float().cpu().numpy()
         )
+
+        # (seq_len, )
         query_attn = layer_attn[query_positions].mean(axis=0)
 
         instruction_mass = float(query_attn[instruction_token_mask].sum())

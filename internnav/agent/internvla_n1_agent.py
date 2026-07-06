@@ -334,9 +334,19 @@ class InternVLAN1Agent(Agent):
                         .unsqueeze(-1)
                         .to(self.device)
                     )  # [1, 2, 224, 224, 1]
-                    self.s1_output = self.policy.s1_step_latent(rgbs, depths, self.s2_output.output_latent)
+                    self.s1_output = self.policy.s1_step_latent(
+                        rgbs,
+                        depths,
+                        latent=self.s2_output.output_latent,
+                        pixel_goal=self.s2_output.output_pixel,
+                    )
                 else:
-                    self.s1_output = self.policy.s1_step_latent(rgb, depth * 10000.0, self.s2_output.output_latent)
+                    self.s1_output = self.policy.s1_step_latent(
+                        rgb,
+                        depth * 10000.0,
+                        latent=self.s2_output.output_latent,
+                        pixel_goal=self.s2_output.output_pixel,
+                    )
 
             else:
                 assert False, f"S2 output should be either action or latent, but got neither!  {self.s2_output}"

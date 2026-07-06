@@ -7,14 +7,24 @@ InternVLAN1MetaModel adds System-1 modules on top of Qwen2_5_VLModel:
   - async extras:  DepthAnythingV2 + MemoryEncoder + QFormer for visual memory
 
 config.system1 selects the S1 backend, e.g. "nextdit", "nextdit_async", "navdp_async".
+config.use_pixel_goal_for_s1 (NextDiT only): False = VLM latent (default), True = pixel (x,y).
 """
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 LatentEmbSize = 768  # Projected VLM hidden dim fed to NextDiT cross-attention
 MODEL_PATH_TO = "checkpoints"
+
+
+def build_pixel_goal_projector():
+    return nn.Sequential(
+        nn.Linear(2, LatentEmbSize // 2),
+        nn.GELU(approximate="tanh"),
+        nn.Linear(LatentEmbSize // 2, LatentEmbSize),
+    )
 
 
 def build_navdp(navdp_cfg, memory_size):
@@ -157,6 +167,8 @@ class InternVLAN1MetaModel:
                 self.cond_projector = nn.Sequential(
                     nn.Linear(3584, LatentEmbSize), nn.GELU(approximate="tanh"), nn.Linear(LatentEmbSize, LatentEmbSize)
                 )
+                if getattr(config, 'use_pixel_goal_for_s1', False):
+                    self.pixel_goal_projector = build_pixel_goal_projector()
 
                 if 'async' in config.system1:
                     # Async mode adds goal+current RGB memory alongside VLM latents.
@@ -186,6 +198,8 @@ class InternVLAN1MetaModel:
             self.cond_projector = nn.Sequential(
                 nn.Linear(3584, LatentEmbSize), nn.GELU(approximate="tanh"), nn.Linear(LatentEmbSize, LatentEmbSize)
             )
+            if getattr(model_args, 'use_pixel_goal_for_s1', False):
+                self.pixel_goal_projector = build_pixel_goal_projector()
 
             if 'async' in model_args.system1:
                 self.rgb_model = build_depthanythingv2(model_args)
@@ -199,9 +213,28 @@ class InternVLAN1MetaModel:
 
         self.config.system1 = model_args.system1
         self.config.n_query = model_args.n_query
+        self.config.use_pixel_goal_for_s1 = getattr(model_args, 'use_pixel_goal_for_s1', False)
+        self.config.s1_pixel_goal_norm_size = getattr(model_args, 's1_pixel_goal_norm_size', 224.0)
         if getattr(self, 'latent_queries', None) is None:
             print("random initiation the latent_queries !!!")
             self.latent_queries = nn.Parameter(torch.randn(1, self.config.n_query, self.config.hidden_size))
+
+    def sync_s1_modules_for_training(self, model_args):
+        """syn arg and loaded checkpoint."""
+        if model_args.system1 in (None, "none", ""):
+            return
+
+        self.config.system1 = model_args.system1
+        self.config.n_query = model_args.n_query
+        self.config.use_pixel_goal_for_s1 = getattr(model_args, 'use_pixel_goal_for_s1', False)
+        self.config.s1_pixel_goal_norm_size = getattr(model_args, 's1_pixel_goal_norm_size', 224.0)
+
+        if 'nextdit' not in model_args.system1:
+            return
+
+        if getattr(model_args, 'use_pixel_goal_for_s1', False) and not hasattr(self, 'pixel_goal_projector'):
+            print("Adding pixel_goal_projector (not in checkpoint; required for use_pixel_goal_for_s1=True)")
+            self.pixel_goal_projector = build_pixel_goal_projector()
 
 
 class InternVLAN1MetaForCausalLM(ABC):
@@ -220,6 +253,41 @@ class InternVLAN1MetaForCausalLM(ABC):
 
     def get_system1_type(self):
         return self.get_model().config.system1
+
+    def uses_pixel_goal_for_s1(self) -> bool:
+        cfg = self.get_model().config
+        if getattr(cfg, 'use_pixel_goal_for_s1', False):
+            return True
+        # Backward compatibility with older checkpoints using s1_goal_conditioning string.
+        return getattr(cfg, 's1_goal_conditioning', 'latent') == 'pixel'
+
+    def build_s1_goal_tokens(
+        self,
+        traj_hidden_states: Optional[torch.Tensor] = None,
+        pixel_coords_gt: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build NextDiT cross-attention goal tokens, shape (B, n_query, LatentEmbSize)."""
+        model = self.get_model()
+        if self.uses_pixel_goal_for_s1():
+            if pixel_coords_gt is None:
+                raise ValueError("pixel_coords_gt is required when use_pixel_goal_for_s1=True")
+            if not hasattr(model, 'pixel_goal_projector'):
+                raise RuntimeError(
+                    "use_pixel_goal_for_s1=True but pixel_goal_projector is missing; "
+                    "re-run initialize_vision_modules with use_pixel_goal_for_s1=True."
+                )
+            n_query = self.get_n_query()
+            norm_size = float(getattr(model.config, 's1_pixel_goal_norm_size', 224.0))
+            proj_dtype = next(model.pixel_goal_projector.parameters()).dtype
+            coords = pixel_coords_gt.to(device=pixel_coords_gt.device, dtype=proj_dtype)
+            nan_mask = torch.isnan(coords).any(dim=-1, keepdim=True)
+            coords = torch.where(nan_mask, torch.zeros_like(coords), coords)
+            coords = coords / norm_size
+            token = model.pixel_goal_projector(coords)
+            return token.unsqueeze(1).expand(-1, n_query, -1)
+        if traj_hidden_states is None:
+            raise ValueError("traj_hidden_states is required when use_pixel_goal_for_s1=False (latent mode)")
+        return model.cond_projector(traj_hidden_states)
 
     def get_sigmas(self, timesteps, device, n_dim=4, dtype=torch.float32):
         """

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import sys
@@ -40,6 +41,11 @@ from internnav.habitat_extensions.vln.utils import (
     xyz_yaw_pitch_to_tf_matrix,
 )
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.utils.s2_attention_viz import (
+    SceneInstructionAttentionTracker,
+    extract_s2_attentions,
+    save_attention_visualizations,
+)
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 
 # Import for Habitat registry side effects — do not remove
@@ -108,15 +114,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.vis_debug = bool(getattr(self.model_args, "vis_debug", False))
         self.vis_debug_path = getattr(self.model_args, "vis_debug_path", os.path.join(self.output_path, "vis_debug"))
 
+        ### extract attn
+        self.extract_attention = bool(getattr(self.model_args, "extract_attention", False))
+        self.attn_layers = getattr(self.model_args, "attn_layers", None)
+        attn_implementation = getattr(self.model_args, "attn_implementation", None)
+        if attn_implementation is None:
+            attn_implementation = "eager" if self.extract_attention else "sdpa"
+        ###
+
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
 
-        device = torch.device(f"cuda:{self.local_rank}")
+        model_device_id = getattr(self.model_args, "model_device_id", self.local_rank)
+        device = torch.device(f"cuda:{model_device_id}")
         if self.model_args.mode == 'dual_system':
             model = InternVLAN1ForCausalLM.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 device_map={"": device},
             )
         elif self.model_args.mode == 'system2':
@@ -302,6 +317,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     fps=5,
                 )
 
+            attn_dir = None
+            scene_instruction_tracker = None
+            if self.extract_attention:
+                attn_dir = os.path.join(
+                    self.output_path,
+                    f'attention_maps_{self.epoch}',
+                    f'{scene_id}_{episode_id:04d}',
+                )
+                os.makedirs(attn_dir, exist_ok=True)
+                
+                # comment bc it's longer and mememory consuming
+                # scene_instruction_tracker = SceneInstructionAttentionTracker()
+
             rgb_list = []
             action_seq = []
             input_images = []
@@ -413,20 +441,52 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
+                    is_look_down_replan = action == action_code.LOOKDOWN
                     with torch.no_grad():
-                        output_ids = self.model.generate(
+                        generate_outputs = self.model.generate(
                             **inputs,
                             max_new_tokens=128,
                             do_sample=False,
                             use_cache=True,
                             past_key_values=None,
                             return_dict_in_generate=True,
-                        ).sequences
+                        )
+                    output_ids = generate_outputs.sequences
 
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
                     print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    if self.extract_attention and not is_look_down_replan:
+                        del generate_outputs
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        attention_bundle = extract_s2_attentions(
+                            self.model,
+                            inputs,
+                            output_ids,
+                            self.processor.tokenizer,
+                            llm_outputs,
+                            instruction=episode_instruction,
+                            layers=self.attn_layers,
+                        )
+                        frame_tag = f"step_{step_id:05d}"
+
+                        # comment bc it's longer and mememory consuming
+                        # scene_instruction_tracker.add(step_id, attention_bundle)
+                        save_attention_visualizations(
+                            attention_bundle,
+                            input_images,
+                            attn_dir,
+                            frame_tag,
+                        )
+                    else:
+                        del generate_outputs
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         forward_action = 0
@@ -458,6 +518,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
 
                         action_list = traj_to_actions(dp_actions)
+                        print("action_list", action_list)
                         if len(action_list) < MAX_STEPS:
                             action_list += [0] * (MAX_STEPS - len(action_list))
 
@@ -605,14 +666,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 f.write(json.dumps(result) + "\n")
 
             # save video
-            if self.save_video and metrics['success'] == 1.0:
-                images_to_video(
-                    vis_frames,
-                    os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
-                    f'{episode_id:04d}',
-                    fps=6,
-                    quality=9,
-                )
+            if self.save_video and (metrics['success'] == 1.0 or self.vis_debug):
+                if vis_frames:
+                    images_to_video(
+                        vis_frames,
+                        os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
+                        f'{episode_id:04d}',
+                        fps=6,
+                        quality=9,
+                    )
+            
+            # comment bc it's longer and mememory consuming
+            # if scene_instruction_tracker is not None and attn_dir is not None:
+            #     scene_paths = scene_instruction_tracker.save(attn_dir)
+            #     if scene_paths:
+            #         print("Saved scene-level instruction attention plots:")
+            #         for name, path in scene_paths.items():
+            #             print(f"  {name}: {path}")
+
             vis_frames.clear()
             if vis_writer is not None:
                 vis_writer.close()

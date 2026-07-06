@@ -27,7 +27,7 @@ eval_cfg = EvalCfg(
             'num_frames': 32,
             'num_history': 8,
             'num_future_steps': 4,
-            'device': 'cuda:0',
+            'device': 'cuda:1',
             'predict_step_nums': 32,
             'continuous_traj': True,
             'infer_mode': 'partial_async',  # You can choose "sync" or "partial_async", but for this model, "partial_async" is better.
@@ -40,7 +40,7 @@ eval_cfg = EvalCfg(
         env_type='internutopia',
         env_settings={
             'use_fabric': False,  # Please set use_fabric=False due to the render delay;
-            'headless': True,
+            'headless': False,
         },
     ),
     task=TaskCfg(
@@ -60,7 +60,7 @@ eval_cfg = EvalCfg(
         flash_collision=False,  # If flash_collision is True, the robot will stop when collision detected.
         robot_usd_path='data/Embodiments/vln-pe/h1/h1_internvla.usd',
         camera_resolution=[640, 480],  # (W,H)
-        camera_prim_path='torso_link/h1_1_25_down_30',
+        camera_prim_path='h1_1_25_down_30',
         one_step_stand_still=True,  # For dual-system, please keep this param True.
     ),
     dataset=EvalDatasetCfg(

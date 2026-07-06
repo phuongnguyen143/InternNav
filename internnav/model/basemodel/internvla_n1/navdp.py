@@ -291,21 +291,43 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
     def forward_vlm_traj(
         self, vlm_tokens, input_images, input_depths, tensor_label_actions, tensor_augment_actions=None
     ):
+    # vlm_token: hid state from vlm, latent
+    # input images: frames + memory
+    # tensor_label_actions: gt traj, bs, select_size, predict_size, 3)
         vlm_tokens = self.vlm_embed_mlp(vlm_tokens)
         vlm_embed = self.goal_compressor(vlm_tokens)  # （bs,1,384)
 
-        tensor_label_actions = tensor_label_actions.flatten(0, 1)
+        tensor_label_actions = tensor_label_actions.flatten(0, 1) # bs * select_size
 
         # sample noise and actions
         pg_noise, pg_time_embed, pg_noisy_action_embed = self.sample_noise(tensor_label_actions)
 
         rgbd_embed = self.rgbd_encoder(input_images, input_depths)  # [64, 32, 384]
 
+        # time (1) + goal (1) + rgb (32) with pos embed to mark each slot 
         cond_embed = torch.cat([pg_time_embed, vlm_embed, rgbd_embed], dim=1)
         pg_cond_embeddings = self.drop(cond_embed + self.cond_pos_embed[:, : cond_embed.size(1)])
 
         pg_action_embeddings = self.drop(pg_noisy_action_embed + self.out_pos_embed[:, : self.predict_size, :])
 
+        pg_output = self.decoder(tgt=pg_action_embeddings, memory=pg_cond_embeddings, tgt_mask=self.tgt_mask)
+        pg_output = self.layernorm(pg_output)
+        noise_pred_pg = self.action_head(pg_output)
+        return noise_pred_pg, pg_noise
+
+    def forward_pixel_traj(
+        self, pixel_coords, input_images, input_depths, tensor_label_actions, norm_size=224.0
+    ):
+        # if add: - add code in internvla_n1.py navdp if-else + add forward_pixel_traj in this file + genrate_traj look up?
+        # pixel_coords: (bs, 2) in image pixels, e.g. from pixel_coords_gt
+        coords = pixel_coords / norm_size
+        goal_embed = self.pg_embed_mlp(coords).unsqueeze(1)  # (bs, 1, 384)
+        tensor_label_actions = tensor_label_actions.flatten(0, 1)
+        pg_noise, pg_time_embed, pg_noisy_action_embed = self.sample_noise(tensor_label_actions)
+        rgbd_embed = self.rgbd_encoder(input_images, input_depths)
+        cond_embed = torch.cat([pg_time_embed, goal_embed, rgbd_embed], dim=1)
+        pg_cond_embeddings = self.drop(cond_embed + self.cond_pos_embed[:, : cond_embed.size(1)])
+        pg_action_embeddings = self.drop(pg_noisy_action_embed + self.out_pos_embed[:, : self.predict_size, :])
         pg_output = self.decoder(tgt=pg_action_embeddings, memory=pg_cond_embeddings, tgt_mask=self.tgt_mask)
         pg_output = self.layernorm(pg_output)
         noise_pred_pg = self.action_head(pg_output)

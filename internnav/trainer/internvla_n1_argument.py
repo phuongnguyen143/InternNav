@@ -13,6 +13,24 @@ class ModelArguments:
 
     system1: Optional[str] = field(default='')
     n_query: int = field(default=4)
+    use_pixel_goal_for_s1: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, NextDiT uses S2 pixel goal (x,y) as conditioning. "
+            "If False (default), uses VLM traj-query latent hidden states."
+        },
+    )
+    s1_pixel_goal_norm_size: float = field(
+        default=224.0,
+        metadata={"help": "Divide pixel goal coordinates by this value before the pixel goal projector."},
+    )
+    s1_goal_conditioning: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Deprecated alias for use_pixel_goal_for_s1. Use 'pixel' or 'latent'. "
+            "Prefer --use_pixel_goal_for_s1 True/False."
+        },
+    )
 
 
 @dataclass

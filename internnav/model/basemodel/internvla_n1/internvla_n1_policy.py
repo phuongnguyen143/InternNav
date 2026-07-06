@@ -209,19 +209,22 @@ class InternVLAN1Net(PreTrainedModel):
         print(f"============ output {self.episode_idx}  {self.llm_output}")
         output = S2Output()
 
-        # 4. Route VLM output: numeric coords → S1 latents; symbols → direct actions
+        # 4. Route VLM output: numeric coords -> S1 latents or pixel goal; symbols -> direct actions
+        use_pixel_s1 = getattr(self.model.config, 'use_pixel_goal_for_s1', False) or (
+            getattr(self.model.config, 's1_goal_conditioning', 'latent') == 'pixel'
+        )
         if bool(re.search(r'\d', self.llm_output)):
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
             # VLM outputs (row, col) but downstream expects [y, x] image coordinates.
             pixel_goal = [int(coord[1]), int(coord[0])]
             output.output_pixel = np.array(pixel_goal)
 
-            # One extra forward pass: extract hidden states at learnable traj-query tokens.
-            # These latents condition the S1 diffusion head (see generate_latents).
-            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-            with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
-            output.output_latent = traj_latents
+            if not use_pixel_s1:
+                # One extra forward pass: extract hidden states at learnable traj-query tokens.
+                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+                with torch.no_grad():
+                    traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
+                output.output_latent = traj_latents
 
         else:
             action_seq = self.parse_actions(self.llm_output)
@@ -229,15 +232,17 @@ class InternVLAN1Net(PreTrainedModel):
 
         return output
 
-    def s1_step_latent(self, rgb, depth, latent):
-        """System 1: diffusion trajectory generation from S2 latents.
+    def s1_step_latent(self, rgb, depth, latent=None, pixel_goal=None):
+        """System 1: diffusion trajectory generation from S2 goal conditioning.
 
-        generate_traj backend depends on config.system1 (nextdit vs navdp, sync vs async).
-        Returns up to 4 discrete actions before the agent re-queries S2.
+        Uses VLM latents (default) or pixel (x, y) when config.use_pixel_goal_for_s1=True.
         """
         with torch.no_grad():
             dp_actions = self.model.generate_traj(
-                traj_latents=latent, images_dp=rgb, depths_dp=depth
+                traj_latents=latent,
+                images_dp=rgb,
+                depths_dp=depth,
+                pixel_goal=pixel_goal,
             )
 
         if self.continuous_traj:

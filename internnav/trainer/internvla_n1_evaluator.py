@@ -381,8 +381,8 @@ def my_eval(
 
             batch = move_batch_to_device(batch, device)
             sample_types = batch.pop("sample_types", None)
-            pixel_coords_gt = batch.pop("pixel_coords_gt", None)
-            # Collator metadata — not accepted by InternVLAN1ForCausalLM.forward (see system2_vl_trainer).
+            pixel_coords_gt = batch.get("pixel_coords_gt")
+            # Collator metadata — sample_types is not accepted by forward().
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,

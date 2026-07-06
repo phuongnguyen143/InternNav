@@ -221,15 +221,19 @@ def set_model(model_args, model):
             'action_encoder',
             'action_decoder',
             'traj_dit',
-            'cond_projector',
             'memory_encoder',
             'rgb_resampler',
             'rgb_model',
         ]
+        if getattr(model_args, 'use_pixel_goal_for_s1', False):
+            modules.append('pixel_goal_projector')
+        else:
+            modules.append('cond_projector')
         for n, p in model.model.named_parameters():
             if any(k in n for k in modules):
                 p.requires_grad = True
-        model.model.latent_queries.requires_grad = True
+        if not getattr(model_args, 'use_pixel_goal_for_s1', False):
+            model.model.latent_queries.requires_grad = True
     elif 'navdp' in model_args.system1:
         for n, p in model.model.navdp.named_parameters():
             if "rgb_model" not in n:

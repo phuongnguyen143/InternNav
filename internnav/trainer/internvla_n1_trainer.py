@@ -188,17 +188,26 @@ def set_model(model_args, model):
             'action_encoder',
             'action_decoder',
             'traj_dit',
-            'cond_projector',
             'memory_encoder',
             'rgb_resampler',
             'rgb_model',
         ]
+        if getattr(model_args, 'use_pixel_goal_for_s1', False):
+            if not hasattr(model.model, 'pixel_goal_projector'):
+                raise RuntimeError(
+                    "use_pixel_goal_for_s1=True but model.pixel_goal_projector is missing. "
+                    "Call sync_s1_modules_for_training() after loading the checkpoint."
+                )
+            modules.append('pixel_goal_projector')
+            print("S1 goal conditioning: pixel (x,y)")
+        else:
+            modules.append('cond_projector')
+            print("S1 goal conditioning: VLM latent (default)")
+            print("Training latent queries")
+            model.model.latent_queries.requires_grad = True
         for n, p in model.model.named_parameters():
             if any(k in n for k in modules):
                 p.requires_grad = True
-
-        print("Training latent queries")
-        model.model.latent_queries.requires_grad = True
     elif 'navdp' in model_args.system1:
         for n, p in model.model.navdp.named_parameters():
             if "rgb_model" not in n:
@@ -212,6 +221,17 @@ def train(attn_implementation="sdpa"):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if model_args.s1_goal_conditioning is not None:
+        mode = model_args.s1_goal_conditioning.strip().lower()
+        if mode == "pixel":
+            model_args.use_pixel_goal_for_s1 = True
+        elif mode == "latent":
+            model_args.use_pixel_goal_for_s1 = False
+        else:
+            raise ValueError(
+                f"Invalid s1_goal_conditioning={model_args.s1_goal_conditioning!r}; use 'latent' or 'pixel'."
+            )
 
     print("model_args: ", model_args.system1)
 
@@ -355,9 +375,18 @@ def train(attn_implementation="sdpa"):
         use_fast=False,
     )
 
-    # Lazy-build S1 modules after S2 weights are loaded (skip for full w-NavDP checkpoint).
-    if data_args.model_type == "internvla-n1" and not loaded_full_dual_checkpoint:
-        model.get_model().initialize_vision_modules(model_args=model_args)
+    # Build or patch S1 modules after backbone weights are loaded.
+    if data_args.model_type in ("internvla-n1", "intern-n1-custom") and model_args.system1:
+        if not loaded_full_dual_checkpoint:
+            model.get_model().initialize_vision_modules(model_args=model_args)
+        else:
+            model.get_model().sync_s1_modules_for_training(model_args)
+            # Full dual checkpoints were built at load time; move new modules to model device/dtype.
+            if getattr(model_args, 'use_pixel_goal_for_s1', False) and hasattr(
+                model.get_model(), 'pixel_goal_projector'
+            ):
+                ref_param = next(model.parameters())
+                model.get_model().pixel_goal_projector.to(device=ref_param.device, dtype=ref_param.dtype)
     set_model(model_args, model)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
