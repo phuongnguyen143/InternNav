@@ -384,7 +384,18 @@ class InternVLAN1AsyncAgent:
             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
             # Model outputs (col, row); swap to [row, col] for image indexing.
             pixel_goal = [int(coord[1]), int(coord[0])]
- but an old R590 library is still being found first. R580 is not the problem now; the install is mixed. NVML explicitly reports this as a driver/library RM-version mismatch.  print(f"generate_latents cost: {time.time() - t0:.3f}s")
+
+
+            traj_latents = None
+            if not self.use_pixel_goal_for_s1:
+                # Extra forward pass: traj-query hidden states for latent-conditioned S1.
+                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+                pixel_values = inputs.pixel_values
+                t0 = time.time()
+                with torch.no_grad():
+                    traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                print(f"generate_latents cost: {time.time() - t0:.3f}s")
+
             return None, traj_latents, pixel_goal
 
         else:

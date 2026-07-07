@@ -58,7 +58,7 @@ fi
 total_gpus=$((NPROC_PER_NODE * NNODES))
 TARGET_EFFECTIVE_BATCH="${TARGET_EFFECTIVE_BATCH:-64}"
 
-vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%30}"
+vln_datasets="${VLN_DATASETS:-r2r_125cm_0_30%80}"
 DEFAULT_DATA_ROOT="data/intern_n1/vln_ce"
 export INTERNAV_R2R_DATA_PATH="${INTERNAV_R2R_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/r2r}"
 export INTERNAV_RXR_DATA_PATH="${INTERNAV_RXR_DATA_PATH:-${DEFAULT_DATA_ROOT}/traj_data/rxr}"
@@ -109,7 +109,8 @@ deepspeed="${DEEPSPEED_CONFIG:-${DEEPSPEED:-${_default_deepspeed}}}"
 
 
 # /home/phuongnh/khang/InternNav/checkpoints/dit/260626/only-s1/InternVLA-N1-DualVLN-office-rtx5090-v2
-system2_ckpt="${SYSTEM2_CKPT:-checkpoints/dit/260626/only-s1/InternVLA-N1-DualVLN-office-rtx5090-v2}"
+# /home/phuongnh/khang/InternNav/checkpoints/DualVLN-pixel-goal-v3
+system2_ckpt="${SYSTEM2_CKPT:-checkpoints/DualVLN-pixel-goal-v3}"
 if [[ -d "${system2_ckpt}" ]]; then
     system2_ckpt="$(cd "${system2_ckpt}" && pwd)"
 elif [[ -d "${REPO_ROOT}/${system2_ckpt}" ]]; then
@@ -157,7 +158,7 @@ print_gpu_preflight() {
     echo ""
 }
 
-run_name="${RUN_NAME:-DualVLN-pixel-goal-v3}"
+run_name="${RUN_NAME:-DualVLN-pixel-goal-v4}"
 output_dir="${OUTPUT_DIR:-checkpoints/${run_name}}"
 mkdir -p "${output_dir}"
 run_log_file="${RUN_LOG_FILE:-${output_dir}/train.log}"
@@ -173,8 +174,8 @@ if [ -n "${MAX_STEPS:-}" ]; then
     save_steps=1000000
     report_to="none"
 else
-    num_epochs="${NUM_TRAIN_EPOCHS:-3}"
-    save_steps=10
+    num_epochs="${NUM_TRAIN_EPOCHS:-10}"
+    save_steps=300
     report_to="${REPORT_TO:-tensorboard}"
 fi
 
