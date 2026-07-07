@@ -341,7 +341,7 @@ class Go2Manager(Node):
         self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base_filtered", self.odom_callback, qos_profile)
 
         # publisher
-        self.control_pub = self.create_publisher(Twist, '/cmd_vel/nav', 5)
+        self.control_pub = self.create_publisher(Twist, '/jetson_cmd_vel', 5)
         self.response_trajectory_path_pub = self.create_publisher(PathMsg, '/vln_path', 5)
         self.pixel_goal_image_pub = self.create_publisher(Image, '/internvla_n1/pixel_goal_image', 5)
 
@@ -391,6 +391,7 @@ class Go2Manager(Node):
         image.save(image_bytes, format='JPEG')
         image_bytes.seek(0)
  
+
         raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
         depth_encoding = depth_msg.encoding.upper()
         if depth_encoding == '16UC1':
@@ -403,6 +404,7 @@ class Go2Manager(Node):
             self.get_logger().error(f"Unsupported depth encoding: {depth_msg.encoding}")
             return
  
+
         self.depth_image[~np.isfinite(self.depth_image)] = 0.0
         self.depth_image[self.depth_image < 0.0] = 0.0
         depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
