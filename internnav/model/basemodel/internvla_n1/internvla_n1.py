@@ -63,7 +63,7 @@ class InternVLAN1ForCausalLM(
     def get_model(self):
         return self.model
 
-    def _parse_s2_pixel_goals_from_input_ids(self, input_ids, t_s_pos):
+    def parse_s2_pixel_goals_from_input_ids(self, input_ids, t_s_pos):
         """Parse pixel goals from S2 coordinate text already in the input sequence.
 
         Training data formats the assistant reply as ``"{row} {col}"`` (640x480).
@@ -394,18 +394,27 @@ class InternVLAN1ForCausalLM(
                         [pix_goal_depths, cur_depths], dim=1
                     ).unsqueeze(-1)  # (bs*select_size, 2, 224, 224, 1)
                     pixel_goal = (
-                        self._parse_s2_pixel_goals_from_input_ids(input_ids, t_s_pos)
+                        self.parse_s2_pixel_goals_from_input_ids(input_ids, t_s_pos)
                         .unsqueeze(1)
                         .repeat(1, traj_poses.size(1), 1)
                         .flatten(0, 1)
                         .to(traj_hidden_states.device)
                     )
-                    pred_pg, noise = self.model.navdp.forward_vlm_traj_w_pixelgoal_pg(
-                        traj_hidden_states,
-                        images_dp,
-                        depths_dp,
-                        tensor_label_actions=traj_poses,
-                        pixel_goal=pixel_goal,
+                    # pred_pg, noise = self.model.navdp.forward_vlm_traj_w_pixelgoal_pg(
+                    #     traj_hidden_states,
+                    #     images_dp,
+                    #     depths_dp,
+                    #     tensor_label_actions=traj_poses,
+                    #     pixel_goal=pixel_goal,
+                    # )
+                    pred_pg, noise = (
+                        self.model.navdp.forward_vlm_traj_w_pixelgoal_pg_no_embed(
+                            traj_hidden_states,
+                            images_dp,
+                            depths_dp,
+                            tensor_label_actions=traj_poses,
+                            pixel_goal=pixel_goal,
+                        )
                     )
                     pg_action_loss = (pred_pg - noise).square()
                     mask = loss_mask.flatten(0, 1)[:, None, None]
@@ -572,8 +581,16 @@ class InternVLAN1ForCausalLM(
             traj_latents = traj_latents.to(self.get_model().device)
             if "async" in self.get_system1_type():
                 if pixel_goal is not None:
+                    # all_trajs = (
+                    #     self.model.navdp.predict_pointgoal_action_w_pixelgoal_async(
+                    #         traj_latents,
+                    #         images_dp,
+                    #         depths_dp,
+                    #         pixel_goal=pixel_goal,
+                    #     )
+                    # )
                     all_trajs = (
-                        self.model.navdp.predict_pointgoal_action_w_pixelgoal_async(
+                        self.model.navdp.predict_pointgoal_action_w_pixelgoal_no_embed(
                             traj_latents,
                             images_dp,
                             depths_dp,

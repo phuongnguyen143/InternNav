@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Local torchrun launcher for InternVLA-N1 dual-system (VLN) training.
 
-RUN_NAME="InternVLA-N1-DualVLN-BKHN-finetune-navdp-pixel-goal-only"
+RUN_NAME="InternVLA-N1-DualVLN-BKHN-finetune-navdp-pixel-goal-no-embed"
 OUTPUT_DIR="checkpoints/${RUN_NAME}-local"
 GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"
 NUM_GPUS=""
@@ -16,7 +16,7 @@ MODEL_PATH="/home/lenguyen1/hoangpqn/vln/InternNav/checkpoints/base_model/Intern
 VLN_DATASETS="bkhn_125cm_0_30"
 
 SYSTEM1="navdp_async"
-NAVDP_GOAL_MODE="pixel_only"
+NAVDP_GOAL_MODE="fuse"
 
 LR="1e-4"
 BATCH_SIZE="2"

@@ -77,7 +77,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
 
         self.input_embed = nn.Linear(3, token_dim)
         self.cond_pos_embed = nn.Parameter(
-            torch.zeros((1, memory_size * 16 + 2, token_dim), dtype=self.input_dtype)
+            torch.zeros((1, memory_size * 16 + 3, token_dim), dtype=self.input_dtype)
         )
         self.out_pos_embed = nn.Parameter(
             torch.zeros((1, predict_size, token_dim), dtype=self.input_dtype)
@@ -144,7 +144,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
             )
         self.goal_mode = mode
 
-    def _pixel_goal_embed_only(self, pixel_goal, ref_embed):
+    def pixel_goal_embed_only(self, pixel_goal, ref_embed):
         """Build goal token(s) from pixel coordinates only."""
         batch_size = ref_embed.shape[0]
         if pixel_goal is None:
@@ -173,13 +173,13 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
         pg_embed = pg_embed * valid.view(-1, 1, 1).to(pg_embed.dtype)
         return pg_embed.to(ref_embed.dtype)
 
-    def _build_goal_embed(self, vlm_embed, pixel_goal, goal_mode=None):
+    def build_goal_embed(self, vlm_embed, pixel_goal, goal_mode=None):
         mode = goal_mode or self.goal_mode
         if mode == "pixel_only":
-            return self._pixel_goal_embed_only(pixel_goal, vlm_embed)
+            return self.pixel_goal_embed_only(pixel_goal, vlm_embed)
         if mode == "vlm_only":
             return vlm_embed
-        return self._fuse_vlm_pixel_goal(vlm_embed, pixel_goal)
+        return self.fuse_vlm_pixel_goal(vlm_embed, pixel_goal)
 
     def load_model(self):
         rank0_print(f"Loading navdp model: {self.model_name}")
@@ -246,7 +246,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
         noisy_action_embed = self.input_embed(noisy_action)
         return noise, time_embeds, noisy_action_embed
 
-    def _fuse_vlm_pixel_goal(self, vlm_embed, pixel_goal):
+    def fuse_vlm_pixel_goal(self, vlm_embed, pixel_goal):
         """Fuse VLM goal embedding with explicit pixel goal (training + inference)."""
         if pixel_goal is None:
             return vlm_embed
@@ -287,6 +287,31 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
                 + self.cond_pos_embed[:, :2, :]
             )
 
+        cond_embedding = cond_embedding.repeat(action_embeds.shape[0], 1, 1)
+        input_embedding = action_embeds + self.out_pos_embed[:, : self.predict_size, :]
+
+        output = self.decoder(
+            tgt=input_embedding, memory=cond_embedding, tgt_mask=self.tgt_mask
+        )
+        output = self.layernorm(output)
+        output = self.action_head(output)
+        return output
+
+    def predict_noise_pg_no_embed(
+        self, last_actions, timestep, vlm_embed, pixel_goal_embed, rgbd_embed
+    ):
+        """Inference noise head matching forward_vlm_traj_w_pixelgoal_pg_no_embed."""
+        action_embeds = self.input_embed(last_actions)
+        time_embeds = (
+            self.time_emb(timestep.to(last_actions.device))
+            .unsqueeze(1)
+            .to(dtype=last_actions.dtype)
+        )
+
+        cond_embed = torch.cat(
+            [time_embeds, vlm_embed, pixel_goal_embed, rgbd_embed], dim=1
+        )
+        cond_embedding = cond_embed + self.cond_pos_embed[:, : cond_embed.size(1)]
         cond_embedding = cond_embedding.repeat(action_embeds.shape[0], 1, 1)
         input_embedding = action_embeds + self.out_pos_embed[:, : self.predict_size, :]
 
@@ -456,7 +481,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
                 vlm_ref = vlm_tokens_mlp.mean(dim=1, keepdim=True)
             else:
                 vlm_ref = self.goal_compressor(vlm_tokens_mlp, vlm_mask)
-            fusing_embed = self._build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
+            fusing_embed = self.build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
 
             rgbd_embed = self.rgbd_encoder(input_images, input_depths)
 
@@ -509,7 +534,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
                 vlm_ref = vlm_tokens_mlp.mean(dim=1, keepdim=True)
             else:
                 vlm_ref = torch.mean(vlm_tokens_mlp, dim=1).unsqueeze(1)
-            fusing_embed = self._build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
+            fusing_embed = self.build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
 
             noisy_action = torch.randn(
                 (sample_num * bs, self.predict_size, 3), dtype=fusing_embed.dtype
@@ -521,6 +546,57 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
             )
             for k in self.noise_scheduler.timesteps[:]:
                 noise_pred = self.predict_noise(naction, k.unsqueeze(0), fusing_embed)
+                naction = self.noise_scheduler.step(
+                    model_output=noise_pred, timestep=k, sample=naction
+                ).prev_sample
+
+            return naction
+
+    def predict_pointgoal_action_w_pixelgoal_no_embed(
+        self,
+        vlm_tokens,
+        input_images=None,
+        input_depths=None,
+        vlm_mask=None,
+        pixel_goal=None,
+        sample_num=32,
+    ):
+        """Inference counterpart of forward_vlm_traj_w_pixelgoal_pg_no_embed."""
+        with torch.no_grad():
+            bs = vlm_tokens.shape[0]
+            if bs != 1:
+                vlm_tokens = vlm_tokens[0:1]
+                if vlm_mask is not None:
+                    vlm_mask = vlm_mask[0:1]
+                if pixel_goal is not None and torch.is_tensor(pixel_goal):
+                    pixel_goal = pixel_goal[0:1]
+                bs = 1
+
+            if vlm_mask is not None:
+                vlm_mask_ = vlm_mask.bool()
+                vlm_mask = ~vlm_mask_
+
+            vlm_tokens_mlp = self.vlm_embed_mlp(vlm_tokens)
+            vlm_embed = self.goal_compressor(vlm_tokens_mlp)
+            pixel_goal_embed = self.pixel_goal_embed_only(pixel_goal, vlm_embed)
+            rgbd_embed = self.rgbd_encoder(input_images, input_depths)
+
+            noisy_action = torch.randn(
+                (sample_num * bs, self.predict_size, 3), dtype=vlm_embed.dtype
+            ).to(vlm_embed.device)
+            naction = noisy_action
+
+            self.noise_scheduler.set_timesteps(
+                self.noise_scheduler.config.num_train_timesteps
+            )
+            for k in self.noise_scheduler.timesteps[:]:
+                noise_pred = self.predict_noise_pg_no_embed(
+                    naction,
+                    k.unsqueeze(0),
+                    vlm_embed,
+                    pixel_goal_embed,
+                    rgbd_embed,
+                )
                 naction = self.noise_scheduler.step(
                     model_output=noise_pred, timestep=k, sample=naction
                 ).prev_sample
@@ -580,7 +656,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
             vlm_ref = vlm_tokens_mlp.mean(dim=1, keepdim=True)
         else:
             vlm_ref = self.goal_compressor(vlm_tokens_mlp)
-        fusing_embed = self._build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
+        fusing_embed = self.build_goal_embed(vlm_ref, pixel_goal, goal_mode=mode)
 
         tensor_label_actions = tensor_label_actions.flatten(0, 1)
 
@@ -605,6 +681,7 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
         pg_output = self.layernorm(pg_output)
         noise_pred_pg = self.action_head(pg_output)
         return noise_pred_pg, pg_noise
+
     def forward_vlm_traj_w_pixelgoal_pg_no_embed(
         self,
         vlm_tokens,
@@ -615,11 +692,10 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
         pixel_goal=None,
         goal_mode=None,
     ):
-        mode = goal_mode or self.goal_mode
+        """VLM goal token + separate pixel-goal token (no fusion in one embed)."""
         vlm_tokens_mlp = self.vlm_embed_mlp(vlm_tokens)
         vlm_embed = self.goal_compressor(vlm_tokens_mlp)
-        
-        pixel_goal_embed = self.pg_embed_mlp(pixel_goal / torch.tensor([PIXEL_GOAL_HEIGHT, PIXEL_GOAL_WIDTH]))
+        pixel_goal_embed = self.pixel_goal_embed_only(pixel_goal, vlm_embed)
 
         tensor_label_actions = tensor_label_actions.flatten(0, 1)
 
@@ -629,7 +705,9 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
 
         rgbd_embed = self.rgbd_encoder(input_images, input_depths)  # [64, 32, 384]
 
-        cond_embed = torch.cat([pg_time_embed, vlm_embed, pixel_goal_embed.unsqueeze(1), rgbd_embed], dim=1)
+        cond_embed = torch.cat(
+            [pg_time_embed, vlm_embed, pixel_goal_embed, rgbd_embed], dim=1
+        )
         pg_cond_embeddings = self.drop(
             cond_embed + self.cond_pos_embed[:, : cond_embed.size(1)]
         )
