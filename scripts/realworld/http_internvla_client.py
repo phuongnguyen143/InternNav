@@ -22,7 +22,7 @@ from controllers import Mpc_controller, PID_controller
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from thread_utils import ReadWriteLock
 
 
@@ -48,6 +48,9 @@ rgb_depth_rw_lock = ReadWriteLock()
 odom_rw_lock = ReadWriteLock()
 mpc_rw_lock = ReadWriteLock()
 
+# offset_x = 0.3
+offset_x = 0.0
+offset_y = 0.0
 
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, url='http://127.0.0.1:5801/eval_dual'):
     global policy_init, http_idx, first_running_time, last_pixel_goal
@@ -166,7 +169,7 @@ def draw_topdown_trajectory_label(draw, image_size, trajectory, margin=12):
     draw.text((plot_left, plot_top), "front", fill=(180, 190, 200))
 
 
-def response_trajectory_to_path_msg(trajectory, stamp, frame_id='base_link'):
+def response_trajectory_to_path_msg(trajectory, stamp, frame_id='egocentric_frame'):
     path_msg = PathMsg()
     path_msg.header.stamp = stamp
     path_msg.header.frame_id = frame_id
@@ -326,11 +329,12 @@ class Go2Manager(Node):
         super().__init__('go2_manager')
         self.debug_publish_visualization = bool(self.declare_parameter('debug_publish_visualization', True).value)
 
-        rgb_down_sub = Subscriber(self, Image, "/camera/camera/color/image_raw/raw")
-        depth_down_sub = Subscriber(self, Image, "/camera/camera/aligned_depth_to_color/image_raw/raw_depth")
+        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=5, durability=DurabilityPolicy.VOLATILE)
 
-        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        rgb_down_sub = Subscriber(self, Image, "/camera/waist_front_zed_stream/left/color/rect/image", qos_profile=qos_profile)
+        depth_down_sub = Subscriber(self, Image, "/camera/waist_front_zed_stream/depth/depth_registered", qos_profile=qos_profile)
 
+        
         self.syncronizer = ApproximateTimeSynchronizer([rgb_down_sub, depth_down_sub], 1, 0.1)
         self.syncronizer.registerCallback(self.rgb_depth_down_callback)
         # self.odom_sub = self.create_subscription(Odometry, "/graph_msf/opt_odometry_world_base_filtered", self.odom_callback, qos_profile)
@@ -385,34 +389,43 @@ class Go2Manager(Node):
         image_bytes = io.BytesIO()
         image.save(image_bytes, format='JPEG')
         image_bytes.seek(0)
-
-        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        raw_depth[np.isnan(raw_depth)] = 0
-        raw_depth[np.isinf(raw_depth)] = 0
-        self.depth_image = raw_depth / 1000.0
-        self.depth_image -= 0.0
-        self.depth_image[np.where(self.depth_image < 0)] = 0
+ 
+        raw_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_encoding = depth_msg.encoding.upper()
+        if depth_encoding == '16UC1':
+            # Integer depth images contain millimeters.
+            self.depth_image = raw_depth.astype(np.float32) / 1000.0
+        elif depth_encoding == '32FC1':
+            # Floating-point depth images already contain meters.
+            self.depth_image = raw_depth.astype(np.float32)
+        else:
+            self.get_logger().error(f"Unsupported depth encoding: {depth_msg.encoding}")
+            return
+ 
+        self.depth_image[~np.isfinite(self.depth_image)] = 0.0
+        self.depth_image[self.depth_image < 0.0] = 0.0
         depth = (np.clip(self.depth_image * 10000.0, 0, 65535)).astype(np.uint16)
         depth = PIL_Image.fromarray(depth)
         depth_bytes = io.BytesIO()
         depth.save(depth_bytes, format='PNG')
         depth_bytes.seek(0)
-
+ 
         rgb_depth_rw_lock.acquire_write()
         self.rgb_bytes = image_bytes
-
+ 
         self.rgb_time = rgb_msg.header.stamp.sec + rgb_msg.header.stamp.nanosec / 1.0e9
         self.last_rgb_time = self.rgb_time
-
+ 
         self.depth_bytes = depth_bytes
         self.depth_time = depth_msg.header.stamp.sec + depth_msg.header.stamp.nanosec / 1.0e9
         self.last_depth_time = self.depth_time
-
+ 
         rgb_depth_rw_lock.release_write()
-
+ 
         self.new_vis_image_arrived = True
         self.new_image_arrived = True
-
+ 
+ 
     def odom_callback(self, msg):
         self.odom_cnt += 1
         odom_rw_lock.acquire_write()
@@ -469,7 +482,7 @@ class Go2Manager(Node):
         self.control_pub.publish(request)
 
     def publish_response_trajectory_path(self, trajectory):
-        path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='base_link')
+        path_msg = response_trajectory_to_path_msg(trajectory, self.get_clock().now().to_msg(), frame_id='egocentric_frame')
         if path_msg.poses:
             self.response_trajectory_path_pub.publish(path_msg)
 
