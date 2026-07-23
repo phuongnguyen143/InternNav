@@ -77,6 +77,8 @@ Set `VLN_DATA_ROOT` if your data is not under the default in `utils/configs/base
 
 | File | Role |
 |------|------|
+| `extract_rgb_from_bag.sh` | Extract compressed RGB (+ synced depth) from ROS2 rosbag2 → `tmp/rgb_frames` + `frames.json` |
+| `run_visual_odom_pipeline.sh` | One-shot: extract → DROID-W → `odometry_camera.txt` → `floor_trajectory.txt` |
 | `precompute_floor_trajectory.py` | Estimate floor plane from PCD; project camera odom to floor trajectory |
 | `project_slam_path.py` | Export floor trajectory from SLAM odom (no PCD); optional RGB path overlay |
 | `derive_floor_calibration.py` | Rebuild `floor_calibration.json` from existing `floor_trajectory.txt` |
@@ -88,6 +90,145 @@ Shared logic lives in `scripts/utils/` (`floor_pose`, `trajectory_io`, `image_pr
 ---
 
 ## Quick start
+
+### One-shot automation (RealSense / DROID-W path)
+
+`run_visual_odom_pipeline.sh` chains extract, SLAM, odom convert, and floor export. Keyframes stay separate (`instruction_generator/run_extract_keyframe.sh`).
+
+```bash
+cd vln/InternNav/scripts/process_odom
+./run_visual_odom_pipeline.sh \
+  --bag /home/lenguyen1/Downloads/realsense_20260718_164645 \
+  --extract-stride 3 \
+  --droid-stride 1 \
+  --write-scene-yaml \
+  --gpu 0
+```
+
+| Flag | Role |
+|------|------|
+| `--extract-stride` | Fewer JPGs at bag extract (e.g. `3`) |
+| `--droid-stride` | DROID-W + `convert_poses` stride (use `1` if extract already strided) |
+| `--skip-extract` / `--skip-slam` / … | Resume when outputs exist |
+| `--write-scene-yaml` | Writes `utils/configs/scenes/<scene-id>.yaml` for keyframes |
+| `--droid-config` | Skip auto-generated DROID yaml |
+
+BKHN / PCD floor (`precompute_floor_trajectory.py`) and live keyframe tmux are **not** included in this script.
+
+### RealSense rosbag → DROID-W (WildGS-SLAM)
+
+End-to-end flow for bags like `realsense_20260718_164645` (`/front/camera/...` topics). Uses **two conda envs**: `internnav` for bag extract, `droid-w` for SLAM.
+
+#### 1. Extract RGB (+ depth) from rosbag2
+
+The wrapper sources ROS Humble and calls `scripts/instruction_generator/extract_bag_frames.py`.
+
+```bash
+conda activate internnav   # OpenCV + scripts/utils; rosbag2_py from ROS
+source /opt/ros/humble/setup.bash   # optional if extract_rgb_from_bag.sh sources it
+
+cd vln/InternNav/scripts/process_odom
+./extract_rgb_from_bag.sh \
+  --bag /home/lenguyen1/Downloads/realsense_20260718_164645 \
+  --stride 3
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--bag` | Rosbag2 directory (`metadata.yaml` + `.db3` / `.mcap`) |
+| `--output-dir` | Default: `extract_out/<bag_basename>/` |
+| `--stride N` | Save every **Nth** synchronized RGB/depth pair (default `1` = all) |
+| `--no-trim` | Full bag (default); use `--trim` for 20s head/tail skip |
+
+Example output (stride 3 on a ~5k-frame bag → ~1718 JPGs):
+
+- `extract_out/realsense_20260718_164645/tmp/rgb_frames/frame_XXXXXX.jpg`
+- `extract_out/realsense_20260718_164645/tmp/depth_frames/frame_XXXXXX.png`
+- `extract_out/realsense_20260718_164645/frames.json`
+
+Run `./extract_rgb_from_bag.sh --help` for topics, storage, sync-slop, etc.
+
+**Stride rule (do not double-subsample):**
+
+| Where you subsample | DROID-W config `stride` |
+|---------------------|-------------------------|
+| Extract `--stride 3` | Set **`stride: 1`** |
+| Extract default (all frames) | Use e.g. **`stride: 3`** in YAML |
+
+#### 2. Point DROID-W at the extract folder
+
+Edit or copy `mapping/DROID-W/configs/custom_realsense_20260718_164645.yaml`:
+
+```yaml
+data:
+  input_folder: /path/to/process_odom/extract_out/realsense_20260718_164645/tmp/rgb_frames
+  output: ./output/realsense_20260718_164645
+
+stride: 1   # if extract used --stride 3
+cam:
+  H: 480
+  W: 640
+  # RealSense intrinsics …
+```
+
+#### 3. Run WildGS-SLAM
+
+`run.py` must run in the **`droid-w`** env (not `internnav`). From `mapping/DROID-W`:
+
+```bash
+conda activate droid-w
+cd vln/InternNav/scripts/process_odom/mapping/DROID-W
+
+python run.py --config ./configs/custom_realsense_20260718_164645.yaml
+```
+
+On success you should see `INFO: <N> images got!`, tracking to 100%, then outputs under:
+
+`./output/realsense_20260718_164645/realsense_20260718_164645/` (e.g. `video.npz`, trajectory under `traj/`).
+
+Use a **free GPU** (one job per GPU):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run.py --config ./configs/custom_realsense_20260718_164645.yaml
+```
+
+#### 4. After SLAM → floor / InternNav
+
+Convert poses if needed, then export floor trajectory (see [Office / DROID-W SLAM](#office--droid-w-slam-no-pcd) below):
+
+```bash
+conda activate internnav
+cd vln/InternNav/scripts/process_odom
+python convert_poses_to_odom_droidw.py \
+  --poses ./mapping/DROID-W/output/.../traj/est_poses_full.txt \
+  --frames-json ./extract_out/realsense_.../frames.json \
+  --output ./extract_out/realsense_.../odometry_camera.txt \
+  --stride 1
+```
+
+Use the same effective stride as during SLAM (usually `1` if extract already used `--stride`).
+
+#### Troubleshooting (extract + SLAM)
+
+| Symptom | Fix |
+|---------|-----|
+| `ModuleNotFoundError: munch` on `run.py` | `conda activate droid-w` before SLAM |
+| `can't open file .../DROID-W/scripts/instruction_generator/extract_bag_frames.py` | Run extract from `process_odom` via `./extract_rgb_from_bag.sh`, or use `scripts/instruction_generator/extract_bag_frames.py` under `InternNav/scripts/` |
+| `INFO: 859 images` but extract wrote ~1718 files | DROID-W `stride: 2` (or higher) on an already strided folder — set **`stride: 1`** |
+| `CUDA out of memory` during tracking | Free GPU (`nvidia-smi`); keep `tracking.buffer: 350` (avoid huge values like 1500); lower `tracking.frontend.max_factors` / `window`; increase extract or YAML stride |
+| Extract needs ROS | `source /opt/ros/humble/setup.bash` or let the shell wrapper source it |
+
+DROID-W install and dependencies: [`mapping/DROID-W/README.md`](mapping/DROID-W/README.md).
+
+### Extract only (reference)
+
+Minimal extract without SLAM:
+
+```bash
+conda activate internnav
+cd vln/InternNav/scripts/process_odom
+./extract_rgb_from_bag.sh --bag /path/to/rosbag2_dir
+```
 
 ### BKHN / LiDAR (PCD-based floor)
 
